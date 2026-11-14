@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+
+# pstack is installed at environment setup by .cursor/install-pstack.sh
+.cursor/skills/
+.cursor/agents/
