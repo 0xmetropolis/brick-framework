@@ -235,6 +235,34 @@ class AdapterExperienceTests(Fixture):
         self.assertError("Sources several bricks share")
 
 
+class CopyDriftTests(Fixture):
+    def marked(self, brick: Path, name: str, version: int, body: str = "x = 1\n") -> Path:
+        path = brick / "input" / f"{name}.py"
+        path.write_text(f"# BOILERPLATE: {name}@{version}\n{body}", encoding="utf-8")
+        return path
+
+    def test_identical_copies_are_clean(self) -> None:
+        self.marked(self.brick("a"), "shared", 1)
+        self.marked(self.brick("b"), "shared", 1)
+        self.assertClean()
+
+    def test_same_version_with_different_content_warns(self) -> None:
+        self.marked(self.brick("a"), "shared", 1)
+        self.marked(self.brick("b"), "shared", 1, "x = 2\n")
+        self.assertTrue(any("copy of 'shared'@1 differs" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_different_versions_name_the_older_copy(self) -> None:
+        self.marked(self.brick("a"), "shared", 2)
+        self.marked(self.brick("b"), "shared", 1, "x = 2\n")
+        self.assertTrue(any("bricks/b/input/shared.py: copy of 'shared' is at @1" in w for w in self.warnings()))
+
+    def test_unmarked_files_are_not_compared(self) -> None:
+        (self.brick("a") / "input/loose.py").write_text("x = 1\n", encoding="utf-8")
+        (self.brick("b") / "input/loose.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertClean()
+
+
 class DeterminismTests(Fixture):
     def test_template_declares_determinism(self) -> None:
         self.assertIn("DETERMINISTIC = True", (ROOT / "bricks/example_brick/contract.py").read_text(encoding="utf-8"))
