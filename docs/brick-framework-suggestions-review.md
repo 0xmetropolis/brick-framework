@@ -5,6 +5,8 @@ cursor:
 
 # Experience improvements from a downstream port
 
+> **Historical record.** This document describes the framework as it was when these fixes were made. The names it uses (lane, strict, pure, workflow, saved examples, evidence, `save`, run records, Live Adapter, mode passing) were replaced when the framework moved to ports, shapes, tapes and the ledger; see the README for the current vocabulary and `tools/convert_ports.py` for the mapping.
+
 Source: an agent ported a game-automation harness onto this framework and wrote ten suggestions (`internal/brick-framework-suggestions.md` in that project's store, written against `main` at `004ef44`). An adversarial review kept three fixes as proposed and rejected the other designs. John's direction: the rejected designs are not a friction log. Each one points at a real agent or developer experience (AX/DX) problem, and each problem is solved here in the form that fits it best: **code** (a lint, helper or runner change), **docs** (guidance a reader needs), or **prompt** (agent-facing instructions in `AGENTS.md`). The fixes do not copy the suggested designs. They keep the framework's principles: one `run` per brick, lanes, acyclic siblings, owned state, replay by default, lint-enforced guarantees, stdlib only.
 
 Base: the fork's `main` (`0a2067b`). Nothing is taken from other branches. `evaluation-system` and `workflow-orchestrated-modes` are cited only as prior art.
