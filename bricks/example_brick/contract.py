@@ -42,7 +42,7 @@ PORTS: dict[str, dict] = {
 }
 
 # Stable identifiers for application state owned exclusively by this brick.
-# Brick-local takes under input/tapes and runner/runs are owned implicitly.
+# Brick-local takes under input/tapes and entries under runner/ledger are owned implicitly.
 OWNED_STATE: tuple[str, ...] = ()
 
 

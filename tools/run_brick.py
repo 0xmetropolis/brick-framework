@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", default="-", help="JSON file with the brick input, or - for stdin (default)")
     parser.add_argument("--fresh", nargs="*", metavar="PORT", help="call the real sources (all of them, or the named ports); takes are not changed")
     parser.add_argument("--record", nargs="*", metavar="PORT", help="call the real sources and replace their takes (all, or the named ports); implies fresh")
-    parser.add_argument("--test", action="store_true", help="write the run record as a local test record (BRICK_RUN_KIND=test)")
+    parser.add_argument("--test", action="store_true", help="write a local ledger entry even for a fresh or failing run (BRICK_TEST=1)")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--traceback", action="store_true", help="show the stack on failure")
     args = parser.parse_args(argv)
@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read the JSON input: {exc}", file=sys.stderr)
         return 2
     if args.test:
-        os.environ["BRICK_RUN_KIND"] = "test"
+        os.environ["BRICK_TEST"] = "1"
     sys.path.insert(0, str(root))
     try:
         run = importlib.import_module(f"bricks.{args.brick}").run

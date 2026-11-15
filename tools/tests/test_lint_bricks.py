@@ -775,23 +775,46 @@ class TakeLintTests(Fixture):
         self.assertError("take is not in schema 2 (the old format?); run python3 tools/convert_ports.py once")
 
 
-class RunRecordTests(Fixture):
-    def test_test_records_do_not_count_toward_retention(self) -> None:
+class LedgerTests(Fixture):
+    def entry(self, brick: Path, name: str, **fields: object) -> Path:
+        import json
+
+        path = brick / "runner/ledger" / name
+        path.write_text(json.dumps({"fresh": ["example_source"], "followed": [], "record": [], **fields}) + "\n", encoding="utf-8")
+        return path
+
+    def test_local_entries_do_not_count_toward_retention(self) -> None:
         brick = self.brick()
-        runs = brick / "runner/runs"
         for index in range(12):
-            (runs / f"20260101-0000{index:02d}.test.json").write_text("{}\n", encoding="utf-8")
+            (brick / "runner/ledger" / f"20260101-0000{index:02d}.local.json").write_text("{}\n", encoding="utf-8")
         self.assertClean()
 
-    def test_tracked_records_still_have_a_limit(self) -> None:
+    def test_tracked_entries_still_have_a_limit(self) -> None:
         brick = self.brick()
-        runs = brick / "runner/runs"
         for index in range(12):
-            (runs / f"20260101-0000{index:02d}.json").write_text("{}\n", encoding="utf-8")
-        self.assertError("too many retained run records")
+            self.entry(brick, f"20260101-0000{index:02d}.json")
+        self.assertError("too many retained ledger entries")
 
-    def test_the_template_runs_folder_ignores_test_records(self) -> None:
-        self.assertIn("*.test.json", (ROOT / "bricks/example_brick/runner/runs/.gitignore").read_text(encoding="utf-8"))
+    def test_an_entry_over_its_limit_is_an_error(self) -> None:
+        brick = self.brick()
+        self.entry(brick, "20260101-000000.json", pad="x" * 130_000)
+        self.assertError("ledger entry exceeds max_entry_bytes")
+
+    def test_a_tracked_entry_must_be_for_a_fresh_recorded_or_failed_run(self) -> None:
+        brick = self.brick()
+        self.entry(brick, "20260101-000000.json", fresh=[])
+        self.assertError("a tracked ledger entry is for a run that went fresh, recorded or failed")
+        self.entry(brick, "20260101-000001.json", fresh=[], error={"type": "X"})
+        self.entry(brick, "20260101-000002.json", fresh=[], followed=["game.source"])
+        self.assertEqual(len([e for e in self.errors() if "tracked ledger entry" in e]), 1)
+
+    def test_the_old_runs_folder_points_at_the_converter(self) -> None:
+        brick = self.brick()
+        (brick / "runner/runs").mkdir()
+        self.assertError("runner/runs: old path of the previous format; run python3 tools/convert_ports.py once")
+
+    def test_the_template_ledger_folder_ignores_local_entries(self) -> None:
+        self.assertIn("*.local.json", (ROOT / "bricks/example_brick/runner/ledger/.gitignore").read_text(encoding="utf-8"))
 
 
 class CopyDriftTests(Fixture):
@@ -969,7 +992,7 @@ SMOKE = (
     "import os\nimport unittest\nfrom unittest import mock\n\nfrom bricks.example_brick import run\n\n\n"
     "class SmokeTest(unittest.TestCase):\n"
     "    def setUp(self) -> None:\n"
-    "        patcher = mock.patch.dict(os.environ, {'BRICK_RUN_KIND': 'test'})\n"
+    "        patcher = mock.patch.dict(os.environ, {'BRICK_TEST': '1'})\n"
     "        patcher.start()\n"
     "        self.addCleanup(patcher.stop)\n\n"
     "    def test_run(self) -> None:\n"
@@ -1033,8 +1056,8 @@ class WorkflowLaneTests(Fixture):
         brick = self.workflow_brick()
         self.smoke(brick)
         text = (brick / "runner/tests/test_smoke.py").read_text(encoding="utf-8")
-        (brick / "runner/tests/test_smoke.py").write_text(text.replace("BRICK_RUN_KIND", "OTHER"), encoding="utf-8")
-        self.assertTrue(any("does not set BRICK_RUN_KIND=test" in w for w in self.warnings()))
+        (brick / "runner/tests/test_smoke.py").write_text(text.replace("BRICK_TEST", "OTHER"), encoding="utf-8")
+        self.assertTrue(any("does not set BRICK_TEST=1" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
 
     def test_strict_brick_may_not_carry_smoke_tests(self) -> None:

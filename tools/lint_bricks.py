@@ -28,14 +28,14 @@ REQUIRED = (
     "runner/__init__.py",
     "runner/rng.py",
     "runner/run.py",
-    "runner/runs",
+    "runner/ledger",
     "src/AGENTS.md",
 )
 CONFIG_DEFAULTS = {
-    "runs": 10,
+    "entries": 10,
     "takes_per_tape": 3,
     "max_take_bytes": 122_880,
-    "max_run_record_bytes": 122_880,
+    "max_entry_bytes": 122_880,
 }
 DIRECT_IO = {
     "asyncio", "boto3", "builtins", "ctypes", "fcntl", "fileinput", "ftplib", "glob", "http", "httpx",
@@ -73,6 +73,7 @@ JOINT_FIELDS = {"kind", "policy", "pin", "follow"}
 # Declarations that PORTS replaced; a manifest that still has one is in the old format.
 OLD_DECLARATIONS = ("SIBLING_DEPENDENCIES", "LIVE_ADAPTER", "MODE_PASSING")
 CONVERTER = "tools/convert_ports.py"
+LOCAL_SUFFIX = ".local.json"
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
     "headers", "password", "refresh_token", "secret", "set-cookie", "token", "x-api-key",
@@ -565,6 +566,7 @@ def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: 
     for old, advice in (
         ("input/data", "takes now live in input/tapes"),
         ("input/evidence.py", "the loader is now input/tape.py"),
+        ("runner/runs", "run records are now ledger entries in runner/ledger"),
     ):
         if (brick / old).exists():
             lint.add(brick / old, f"old path of the previous format; run python3 {CONVERTER} once ({advice})")
@@ -631,15 +633,25 @@ def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: 
                 "retention.takes_per_tape in config.yml deliberately and say why",
             )
 
-    runs = sorted((brick / "runner/runs").glob("*.json"))
-    # Test runs (BRICK_RUN_KIND=test) are local, untracked and bounded on their own.
-    tracked = [path for path in runs if not path.name.endswith(".test.json")]
-    if len(tracked) > limits["runs"]:
-        lint.add(brick / "runner/runs", "too many retained run records")
-    for path in runs:
-        if path.stat().st_size > limits["max_run_record_bytes"]:
-            lint.add(path, "run record exceeds max_run_record_bytes")
-        read_json(path, lint)
+    entries = sorted((brick / "runner/ledger").glob("*.json"))
+    # Local entries (replay-only runs and test runs) are untracked and bounded on their own.
+    tracked = [path for path in entries if not path.name.endswith(LOCAL_SUFFIX)]
+    if len(tracked) > limits["entries"]:
+        lint.add(brick / "runner/ledger", "too many retained ledger entries")
+    for path in entries:
+        if path.stat().st_size > limits["max_entry_bytes"]:
+            lint.add(path, "ledger entry exceeds max_entry_bytes")
+        entry = read_json(path, lint)
+        if (
+            path in tracked
+            and isinstance(entry, dict)
+            and not (entry.get("fresh") or entry.get("followed") or "error" in entry)
+        ):
+            lint.add(
+                path,
+                "a tracked ledger entry is for a run that went fresh, recorded or failed; "
+                "a replay-only run writes a local .local.json entry",
+            )
 
 
 def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -662,10 +674,10 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
             for node in ast.walk(tree)
         ):
             lint.add(path, "contains a skipped smoke test; it proves no integration", warning=True)
-        if "BRICK_RUN_KIND" not in path.read_text(encoding="utf-8"):
+        if "BRICK_TEST" not in path.read_text(encoding="utf-8"):
             lint.add(
                 path,
-                "smoke test does not set BRICK_RUN_KIND=test, so its run records land in tracked history; "
+                "smoke test does not set BRICK_TEST=1, so a fresh or failing run lands in tracked ledger history; "
                 "set it in setUp with os.environ and restore it in a cleanup",
                 warning=True,
             )
@@ -738,7 +750,7 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
     ban every ``src/`` already carries widens to the whole brick, joined by
     ``random`` and ``time``, and by the clock calls the ``src/`` contract has
     always forbidden in prose. ``runner/`` is the one exemption: it writes
-    run records and owns ``rng.py``, so it keeps the filesystem and
+    ledger entries and owns ``rng.py``, so it keeps the filesystem and
     randomness the rest of the brick gives up. ``datetime`` stays importable:
     arithmetic on a caller-supplied time is pure; reading ``now()`` is not.
     """

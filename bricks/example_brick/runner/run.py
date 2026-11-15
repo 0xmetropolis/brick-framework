@@ -4,7 +4,7 @@
 A working runner, copied with the brick like ``input/tape.py``: it creates
 the run ID, reads ``input/config.yml``, turns ``fresh`` and ``record`` into the
 run's plan, builds the plain run context, calls ``src``, closes whatever the run
-left open, records the run and prunes old records. Only the imports from the
+left open, writes the run's ledger entry and prunes old entries. Only the imports from the
 brick tree change per brick (``execute`` and the contract), which is why copies
 of it stay identical.
 """
@@ -25,10 +25,10 @@ from ..src.logic import execute
 from .rng import create_run_id
 
 BRICK = Path(__file__).resolve().parents[1]
-RUNS = BRICK / "runner" / "runs"
+LEDGER = BRICK / "runner" / "ledger"
 CONFIG = BRICK / "input" / "config.yml"
-KIND_ENV = "BRICK_RUN_KIND"
-TEST_SUFFIX = ".test.json"
+TEST_ENV = "BRICK_TEST"
+LOCAL_SUFFIX = ".local.json"
 
 
 def load_config(path: Path = CONFIG) -> dict[str, Any]:
@@ -77,15 +77,15 @@ def run(inputs: BrickInput, *, fresh: Any = False, record: Any = False) -> Brick
     source without changing tracked takes; ``record`` implies fresh for the same
     names and replaces the reviewed takes. Everything not named replays. Neither
     option reaches a sibling brick except through a joint's declared ``follow``.
-    Set ``BRICK_RUN_KIND=test`` (smoke tests do) and the record is a local
-    ``*.test.json`` instead of tracked history.
+    The run's ledger entry is tracked only when the run touched a source fresh,
+    recorded, or failed; every other run (and every run with ``BRICK_TEST=1``,
+    which smoke tests set) writes a local, gitignored entry.
     """
     plan = make_plan(fresh, record)
     run_id = create_run_id()
     config = load_config()
     entry: dict[str, Any] = {
         "run_id": run_id,
-        "kind": "test" if os.environ.get(KIND_ENV) == "test" else "run",
         "fresh": sorted(name for name in plan["fresh"] if "." not in name),
         "record": sorted(name for name in plan["record"] if "." not in name),
         "followed": sorted(name for name in plan["fresh"] if "." in name),
@@ -99,16 +99,16 @@ def run(inputs: BrickInput, *, fresh: Any = False, record: Any = False) -> Brick
         failed = False
     except Exception as exc:
         entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
-        _record(entry, config)
+        _write_entry(entry, config)
         raise
     finally:
         problems = _close(context, failed)
     if problems:
         entry["error"] = {"type": type(problems[0]).__name__, "message": str(problems[0])}
-        _record(entry, config)
+        _write_entry(entry, config)
         raise problems[0]
     entry["output"] = output
-    _record(entry, config)
+    _write_entry(entry, config)
     return output
 
 
@@ -160,24 +160,27 @@ def _close(context: dict[str, Any], failed: bool) -> list[Exception]:
     return problems
 
 
-def _record(record: dict[str, Any], config: dict[str, Any]) -> None:
-    limit = int(config.get("limits", {}).get("max_run_record_bytes", 122_880))
-    retained = int(config.get("retention", {}).get("runs", 10))
-    payload = _bounded(record, limit)
-    suffix = TEST_SUFFIX if record["kind"] == "test" else ".json"
-    RUNS.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".run-", dir=RUNS)
+def _write_entry(entry: dict[str, Any], config: dict[str, Any]) -> None:
+    """Write the run's ledger entry: tracked if it touched a source fresh or failed, else local."""
+    limit = int(config.get("limits", {}).get("max_entry_bytes", 122_880))
+    retained = int(config.get("retention", {}).get("entries", 10))
+    touched = bool(entry["fresh"] or entry["followed"] or "error" in entry)
+    tracked = touched and os.environ.get(TEST_ENV) != "1"
+    suffix = ".json" if tracked else LOCAL_SUFFIX
+    payload = _bounded(entry, limit)
+    LEDGER.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".entry-", dir=LEDGER)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
-        os.replace(temporary, RUNS / f"{record['run_id']}{suffix}")
+        os.replace(temporary, LEDGER / f"{entry['run_id']}{suffix}")
     finally:
         Path(temporary).unlink(missing_ok=True)
     mine = sorted(
-        path for path in RUNS.glob("*.json") if path.name.endswith(TEST_SUFFIX) == (suffix == TEST_SUFFIX)
+        path for path in LEDGER.glob("*.json") if path.name.endswith(LOCAL_SUFFIX) == (suffix == LOCAL_SUFFIX)
     )
     for old in mine[:-retained]:
-        # Another thread's run may have pruned the same record already.
+        # Another thread's run may have pruned the same entry already.
         old.unlink(missing_ok=True)
 
 
@@ -209,11 +212,11 @@ def _summarize(value: Any, threshold: int) -> Any:
     return value
 
 
-def _bounded(record: dict[str, Any], limit: int) -> bytes:
+def _bounded(entry: dict[str, Any], limit: int) -> bytes:
     """Serialize canonically within ``limit``, summarizing instead of dropping.
 
     Long strings and lists are replaced by their size, a digest and a head, so
-    the record still shows the shape of what went in and came out. Only if that
+    the entry still shows the shape of what went in and came out. Only if that
     is not enough is a whole field reduced to its top-level keys and size. Fields
     that were changed are listed under ``summarized``.
     """
@@ -221,27 +224,27 @@ def _bounded(record: dict[str, Any], limit: int) -> bytes:
     def encode(value: dict[str, Any]) -> bytes:
         return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
-    record = _plain(record)
-    payload = encode(record)
+    entry = _plain(entry)
+    payload = encode(entry)
     changed: list[str] = []
     for threshold in (2000, 500, 120, 40):
         if len(payload) <= limit:
             return payload
         for field in ("output", "input"):
-            if field in record:
-                shrunk = _summarize(record[field], threshold)
-                if shrunk != record[field]:
-                    record = {**record, field: shrunk}
+            if field in entry:
+                shrunk = _summarize(entry[field], threshold)
+                if shrunk != entry[field]:
+                    entry = {**entry, field: shrunk}
                     if field not in changed:
                         changed.append(field)
-        payload = encode({**record, "summarized": changed})
+        payload = encode({**entry, "summarized": changed})
     for field in ("output", "input"):
         if len(payload) <= limit:
             break
-        if field in record:
-            value = record[field]
-            record = {**record, field: {"omitted_bytes": len(json.dumps(value)), "keys": sorted(value)[:20] if isinstance(value, dict) else None}}
+        if field in entry:
+            value = entry[field]
+            entry = {**entry, field: {"omitted_bytes": len(json.dumps(value)), "keys": sorted(value)[:20] if isinstance(value, dict) else None}}
             if field not in changed:
                 changed.append(field)
-            payload = encode({**record, "summarized": changed})
+            payload = encode({**entry, "summarized": changed})
     return payload

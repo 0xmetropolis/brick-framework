@@ -119,14 +119,14 @@ class PortsEndToEnd(unittest.TestCase):
     def go(self, option: dict, **env: str) -> dict:
         done = subprocess.run(
             [sys.executable, "-c", SCENARIO, json.dumps(option)], cwd=self.root, capture_output=True, text=True, check=False,
-            env={**os.environ, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1", "BRICK_RUN_KIND": "test", **env},
+            env={**os.environ, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1", "BRICK_TEST": "1", **env},
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         return json.loads(done.stdout.strip().splitlines()[-1])
 
     def records(self, brick: str) -> list[dict]:
-        folder = self.root / "bricks" / brick / "runner/runs"
-        return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(folder.glob("*.test.json"))]
+        folder = self.root / "bricks" / brick / "runner/ledger"
+        return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(folder.glob("*.local.json"))]
 
     def take(self) -> Path:
         return self.root / "bricks/game/input/tapes/source/run-w0.json"

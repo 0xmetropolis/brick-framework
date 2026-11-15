@@ -1,11 +1,11 @@
 brick: example_brick
 
 retention:
-  runs: 10
+  entries: 10
   takes_per_tape: 3
 
 limits:
   max_take_bytes: 122880  # 120 KiB
-  max_run_record_bytes: 122880  # 120 KiB
+  max_entry_bytes: 122880  # 120 KiB
 
 # Add brick-specific configuration below.

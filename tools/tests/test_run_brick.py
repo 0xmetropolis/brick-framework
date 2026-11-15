@@ -69,10 +69,19 @@ class RunBrickTests(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("unrecognized arguments: --save", done.stderr)
 
-    def test_test_flag_writes_a_local_test_record(self) -> None:
-        self.run_tool("demo", "--test")
-        self.assertEqual(len(list((self.root / "bricks/demo/runner/runs").glob("*.test.json"))), 1)
-        self.assertEqual(list((self.root / "bricks/demo/runner/runs").glob("[0-9]*[0-9a-f].json")), [])
+    def test_a_replay_run_writes_a_local_entry_and_a_fresh_one_a_tracked_entry(self) -> None:
+        ledger = self.root / "bricks/demo/runner/ledger"
+        self.run_tool("demo")
+        self.assertEqual(len(list(ledger.glob("*.local.json"))), 1)
+        self.assertEqual([path for path in ledger.glob("*.json") if not path.name.endswith(".local.json")], [])
+        self.run_tool("demo", "--fresh")
+        self.assertEqual(len([path for path in ledger.glob("*.json") if not path.name.endswith(".local.json")]), 1)
+
+    def test_test_flag_keeps_even_a_fresh_run_local(self) -> None:
+        ledger = self.root / "bricks/demo/runner/ledger"
+        self.run_tool("demo", "--fresh", "--test")
+        self.assertEqual(len(list(ledger.glob("*.local.json"))), 1)
+        self.assertEqual([path for path in ledger.glob("*.json") if not path.name.endswith(".local.json")], [])
 
     def test_bytes_in_the_output_are_kept_as_base64(self) -> None:
         out = json.loads(self.run_tool("demo", stdin='{"bytes": true}').stdout)
