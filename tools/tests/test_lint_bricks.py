@@ -116,6 +116,29 @@ class LaneTests(Fixture):
         self.assertError("LANE must be one of")
 
 
+class ModeReadTests(Fixture):
+    def test_src_reading_the_mode_warns_and_does_not_fail(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def decide(ctx):\n    return ctx['mode'] == 'saved' or ctx.get('mode')\n", encoding="utf-8"
+        )
+        warnings = [item for item in self.warnings() if "src/logic.py: src reads the run mode" in item]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(self.errors(), [])
+
+    def test_adapter_reading_the_mode_is_its_job(self) -> None:
+        self.brick()
+        self.assertClean()
+
+    def test_src_reading_a_mode_field_of_its_input_does_not_warn(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def decide(inputs, ctx):\n    return inputs['mode'], ctx['config'], ctx['run_id']\n",
+            encoding="utf-8",
+        )
+        self.assertClean()
+
+
 class PureLaneTests(Fixture):
     def test_pure_brick_lints_clean(self) -> None:
         self.pure_brick()

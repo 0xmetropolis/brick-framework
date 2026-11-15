@@ -39,6 +39,8 @@ DIRECT_IO = {
     "boto3", "ftplib", "httpx", "os", "pathlib", "psycopg", "requests",
     "shutil", "smtplib", "socket", "sqlite3", "subprocess", "urllib",
 }
+# Names a run context goes by in src/ and adapters.
+CONTEXT_NAMES = {"ctx", "context", "run_context"}
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
     "headers", "password", "refresh_token", "secret", "set-cookie", "token", "x-api-key",
@@ -105,6 +107,22 @@ def annotation_name(node: ast.expr | None) -> str:
     if isinstance(node, ast.Attribute):
         return node.attr
     return ""
+
+
+def mode_read(node: ast.AST) -> bool:
+    """True when ``node`` reads ``mode`` from a run context: ``ctx["mode"]`` or ``ctx.get("mode")``."""
+    if isinstance(node, ast.Subscript):
+        target, key = node.value, node.slice
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args:
+        target, key = node.func.value, node.args[0]
+    else:
+        return False
+    return (
+        isinstance(target, ast.Name)
+        and target.id in CONTEXT_NAMES
+        and isinstance(key, ast.Constant)
+        and key.value == "mode"
+    )
 
 
 def assigned_literal(tree: ast.Module, name: str) -> Any:
@@ -240,6 +258,13 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, "sibling adapter may import only run")
                         if parts[1] not in contract.dependencies:
                             lint.add(path, f"sibling dependency {parts[1]!r} is not declared")
+            if role == "src" and mode_read(node):
+                lint.add(
+                    path,
+                    "src reads the run mode; each adapter owns saved, fresh and save behavior, "
+                    "so label recorded data by what the adapter returned (input/AGENTS.md, Recorded data)",
+                    warning=True,
+                )
             if role == "src" and isinstance(node, ast.Call) and called_name(node) == "open":
                 lint.add(path, "src filesystem access must use an adapter")
             if adapter and isinstance(node, ast.Call) and called_name(node) == "run":
