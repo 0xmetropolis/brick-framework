@@ -1,4 +1,4 @@
-# BOILERPLATE: evidence@2
+# BOILERPLATE: evidence@3
 """Small, Git-stable saved-example storage for this brick.
 
 Copy this file with the brick boilerplate. It deliberately has no dependency
@@ -157,6 +157,30 @@ def provenance(record: dict[str, Any] | None = None) -> dict[str, Any]:
     if record is None:
         return {"recorded": False, "capture_run_id": None}
     return {"recorded": True, "capture_run_id": record["capture_run_id"]}
+
+
+def pass_mode(run_context: dict[str, Any], sibling: str) -> dict[str, bool]:
+    """Mode passing: turn this brick's mode into the ``fresh`` and ``save`` flags for one sibling.
+
+    A workflow adapter calls the sibling like this and nothing else is allowed to
+    supply those two keywords (the linter checks)::
+
+        flags = pass_mode(run_context, "game_client")
+        run(inputs, fresh=flags["fresh"], save=flags["save"])
+
+    saved gives (False, False), fresh gives (True, False), save gives (True, True).
+    When the sibling will run fresh its name is added to ``run_context["fresh_siblings"]``,
+    which the runner copies into this brick's run record: a plain list for record-keeping,
+    never read by ``src``. The sibling must declare ``LIVE_ADAPTER = True`` in its
+    contract and this brick must list it in ``MODE_PASSING``.
+    """
+    mode = run_context["mode"]
+    flags = {"fresh": mode in ("fresh", "save"), "save": mode == "save"}
+    if flags["fresh"]:
+        listed = run_context.setdefault("fresh_siblings", [])
+        if sibling not in listed:
+            listed.append(sibling)
+    return flags
 
 
 def _max_bytes(run_context: dict[str, Any]) -> int:

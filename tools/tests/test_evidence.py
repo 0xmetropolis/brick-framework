@@ -211,5 +211,28 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(list(evidence.DATA_DIR.glob("game/*.json")), [])
 
 
+class PassModeTests(unittest.TestCase):
+    def test_saved_passes_nothing_and_lists_nothing(self) -> None:
+        context = {"mode": "saved"}
+        self.assertEqual(evidence.pass_mode(context, "game"), {"fresh": False, "save": False})
+        self.assertNotIn("fresh_siblings", context)
+
+    def test_fresh_passes_fresh_only_and_lists_the_sibling(self) -> None:
+        context = {"mode": "fresh"}
+        self.assertEqual(evidence.pass_mode(context, "game"), {"fresh": True, "save": False})
+        self.assertEqual(context["fresh_siblings"], ["game"])
+
+    def test_save_implies_fresh(self) -> None:
+        context = {"mode": "save"}
+        self.assertEqual(evidence.pass_mode(context, "game"), {"fresh": True, "save": True})
+        self.assertEqual(context["fresh_siblings"], ["game"])
+
+    def test_each_sibling_is_listed_once(self) -> None:
+        context = {"mode": "fresh"}
+        for name in ("game", "model", "game"):
+            evidence.pass_mode(context, name)
+        self.assertEqual(context["fresh_siblings"], ["game", "model"])
+
+
 if __name__ == "__main__":
     unittest.main()
