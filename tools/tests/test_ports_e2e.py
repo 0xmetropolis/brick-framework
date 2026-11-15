@@ -92,6 +92,7 @@ class PortsEndToEnd(unittest.TestCase):
             shutil.copytree(template, self.root / "bricks" / name, ignore=shutil.ignore_patterns("__pycache__"))
         game, flow = self.root / "bricks/game", self.root / "bricks/flow"
         (game / "input/adapters/example_source.py").unlink()
+        shutil.rmtree(game / "input/tapes/example_source")
         (game / "input/adapters/source.py").write_text(SOURCE_ADAPTER, encoding="utf-8")
         (game / "src/logic.py").write_text(
             "from ..input.adapters import source\n\n\ndef execute(inputs, run_context):\n    return source.step(run_context, inputs['days'])\n",

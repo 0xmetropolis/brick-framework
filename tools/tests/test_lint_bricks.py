@@ -32,6 +32,7 @@ class Fixture(unittest.TestCase):
     def brick(self, name: str = "example_brick") -> Path:
         target = self.root / "bricks" / name
         shutil.copytree(ROOT / "bricks/example_brick", target, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.rmtree(target / "input/tapes/example_source")
         return target
 
     def contract(self, brick: Path, **values: str) -> None:
