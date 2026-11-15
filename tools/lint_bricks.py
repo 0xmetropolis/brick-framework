@@ -23,23 +23,19 @@ REQUIRED = (
     "__init__.py",
     "contract.py",
     "input/AGENTS.md",
-    "input/adapters",
     "input/config.yml",
-    "input/data",
     "runner/AGENTS.md",
     "runner/__init__.py",
     "runner/rng.py",
     "runner/run.py",
-    "runner/runs",
+    "runner/ledger",
     "src/AGENTS.md",
 )
-# Required paths a lane may leave out, because the lane forbids what they hold.
-LANE_OPTIONAL = {"pure": ("input/adapters",)}
 CONFIG_DEFAULTS = {
-    "runs": 10,
-    "saved_examples_per_adapter": 3,
-    "max_evidence_bytes": 122_880,
-    "max_run_record_bytes": 122_880,
+    "entries": 10,
+    "takes_per_tape": 3,
+    "max_take_bytes": 122_880,
+    "max_entry_bytes": 122_880,
 }
 DIRECT_IO = {
     "asyncio", "boto3", "builtins", "ctypes", "fcntl", "fileinput", "ftplib", "glob", "http", "httpx",
@@ -51,24 +47,33 @@ DIRECT_IO = {
 DIRECT_IO_DOTTED = {"logging.handlers", "logging.config"}
 # Ways to reach a banned module without importing it by name.
 ESCAPE_CALLS = {"__import__", "eval", "exec"}
-# The standard-library modules a pure brick may import: no I/O, clock, randomness, threads or process state.
-PURE_STDLIB = {
+# The standard-library modules a sealed brick may import: no I/O, clock, randomness, threads or process state.
+SEALED_STDLIB = {
     "__future__", "abc", "array", "ast", "base64", "binascii", "bisect", "calendar", "cmath", "codecs",
     "collections", "colorsys", "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "difflib",
     "enum", "fnmatch", "fractions", "functools", "graphlib", "hashlib", "heapq", "hmac", "html", "io",
     "ipaddress", "itertools", "json", "keyword", "math", "numbers", "operator", "pprint", "re", "reprlib",
     "shlex", "statistics", "string", "struct", "textwrap", "types", "typing", "unicodedata", "warnings", "zlib",
 }
-# Calls in evidence.py that give an adapter its saved mode.
-SAVED_MODE_CALLS = {"load_example", "through", "Transcript"}
+# Calls in tape.py that give an adapter its replay.
+REPLAY_CALLS = {"load", "once", "session"}
+# Where the source name sits among the arguments of a tape call.
+SOURCE_ARGUMENT = {"once": 1, "session": 1, "load": 0, "write": 0}
 # A BrickInput field with one of these names selects an operation: the split signal.
 DISPATCH_FIELDS = {"op", "flow", "action", "operation", "kind"}
 OPTIONAL_FIELD_LIMIT = 6
 # Names a run context goes by in src/ and adapters.
 CONTEXT_NAMES = {"ctx", "context", "run_context"}
 # An environment variable that switches behavior is a mode the run does not record.
-ENV_SWITCH = re.compile(r"(?i)replay|fresh|save|mode|live|offline|record")
+ENV_SWITCH = re.compile(r"(?i)replay|fresh|record|mode|live|offline")
 IN_MEMORY = {"BytesIO", "StringIO"}
+PORT_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+SOURCE_FIELDS = {"kind", "epoch", "label", "followable"}
+JOINT_FIELDS = {"kind", "policy", "pin", "follow"}
+# Declarations that PORTS replaced; a manifest that still has one is in the old format.
+OLD_DECLARATIONS = ("SIBLING_DEPENDENCIES", "LIVE_ADAPTER", "MODE_PASSING", "LANE")
+MIGRATION = "see the README, 'Moving a project to this version'"
+LOCAL_SUFFIX = ".local.json"
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
     "headers", "password", "refresh_token", "secret", "set-cookie", "token", "x-api-key",
@@ -78,12 +83,23 @@ SENSITIVE = {
 @dataclass
 class Contract:
     version: int = 0
-    dependencies: dict[str, str] = field(default_factory=dict)
+    ports: dict[str, dict[str, Any]] = field(default_factory=dict)
     owned_state: tuple[str, ...] = ()
-    lane: str = "strict"
     deterministic: bool | None = None
-    live_adapter: bool | None = None
-    mode_passing: tuple[str, ...] = ()
+    declared: bool = True
+
+    @property
+    def sealed(self) -> bool:
+        """No ports: the brick reaches nothing outside itself."""
+        return self.declared and not self.ports
+
+    @property
+    def joints(self) -> dict[str, dict[str, Any]]:
+        return {name: port for name, port in self.ports.items() if port.get("kind") == "joint"}
+
+    @property
+    def sources(self) -> dict[str, dict[str, Any]]:
+        return {name: port for name, port in self.ports.items() if port.get("kind") == "source"}
 
 
 class Lint:
@@ -145,8 +161,8 @@ def escape_hatches(path: Path, tree: ast.Module, lint: Lint, label: str) -> None
             lint.add(path, f"{label} may not use __builtins__; it reaches open() and __import__ unseen")
 
 
-def mode_override(node: ast.AST) -> bool:
-    """True for ``dict(ctx, mode=...)``: src building a context with another mode."""
+def plan_override(node: ast.AST) -> bool:
+    """True for ``dict(ctx, plan=...)``: src building a context with another plan."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -154,7 +170,7 @@ def mode_override(node: ast.AST) -> bool:
         and bool(node.args)
         and isinstance(node.args[0], ast.Name)
         and node.args[0].id in CONTEXT_NAMES
-        and any(keyword.arg == "mode" for keyword in node.keywords)
+        and any(keyword.arg == "plan" for keyword in node.keywords)
     )
 
 
@@ -207,8 +223,8 @@ def annotation_name(node: ast.expr | None) -> str:
     return ""
 
 
-def mode_read(node: ast.AST) -> bool:
-    """True when ``node`` reads ``mode`` from a run context: ``ctx["mode"]`` or ``ctx.get("mode")``."""
+def plan_read(node: ast.AST) -> bool:
+    """True when ``node`` reads ``plan`` from a run context: ``ctx["plan"]`` or ``ctx.get("plan")``."""
     if isinstance(node, ast.Subscript):
         target, key = node.value, node.slice
     elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args:
@@ -219,7 +235,7 @@ def mode_read(node: ast.AST) -> bool:
         isinstance(target, ast.Name)
         and target.id in CONTEXT_NAMES
         and isinstance(key, ast.Constant)
-        and key.value == "mode"
+        and key.value == "plan"
     )
 
 
@@ -230,25 +246,27 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         return Contract()
 
     version = assigned_literal(tree, "CONTRACT_VERSION")
-    dependencies = assigned_literal(tree, "SIBLING_DEPENDENCIES")
     owned_state = assigned_literal(tree, "OWNED_STATE")
-    lane = assigned_literal(tree, "LANE")
     deterministic = assigned_literal(tree, "DETERMINISTIC")
-    live_adapter = assigned_literal(tree, "LIVE_ADAPTER")
-    mode_passing = assigned_literal(tree, "MODE_PASSING")
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         lint.add(path, "CONTRACT_VERSION must be a positive integer")
         version = 0
-    if not isinstance(dependencies, dict) or not all(
-        isinstance(name, str)
-        and isinstance(mode, str)
-        and mode in {"eventual", "orchestrated"}
-        for name, mode in (dependencies.items() if isinstance(dependencies, dict) else ())
-    ):
-        lint.add(path, "SIBLING_DEPENDENCIES must map names to eventual or orchestrated")
-        dependencies = {}
+    old = [name for name in OLD_DECLARATIONS if any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(isinstance(t, ast.Name) and t.id == name for t in (node.targets if isinstance(node, ast.Assign) else [node.target]))
+        for node in tree.body
+    )]
+    if old:
+        lint.add(
+            path,
+            f"{', '.join(old)} belong to the old manifest format. The manifest now declares every source and "
+            "joint in PORTS (a dict of port name to declaration) and the shape (sealed, entry or open) is computed "
+            f"from the ports and the files, never declared; {MIGRATION}",
+        )
+    ports = lint_ports(path, tree, lint)
+    declared = ports is not None
     if not isinstance(owned_state, (tuple, list)) or not all(
         isinstance(item, str) and item for item in owned_state
     ):
@@ -257,14 +275,6 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     if deterministic is not None and not isinstance(deterministic, bool):
         lint.add(path, "DETERMINISTIC must be True or False")
         deterministic = None
-    if live_adapter is not None and not isinstance(live_adapter, bool):
-        lint.add(path, "LIVE_ADAPTER must be True or False")
-        live_adapter = None
-    if mode_passing is None:
-        mode_passing = ()
-    elif not isinstance(mode_passing, (tuple, list)) or not all(isinstance(item, str) and item for item in mode_passing):
-        lint.add(path, "MODE_PASSING must list sibling brick names")
-        mode_passing = ()
     for class_name in ("BrickInput", "BrickOutput"):
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
@@ -303,17 +313,70 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
                     "use a base64 string or a manifest (input/AGENTS.md, Recorded data)",
                     warning=True,
                 )
-    if lane is None:
-        lane = "strict"
-    elif lane not in LANES:
-        lint.add(path, f"LANE must be one of {', '.join(sorted(LANES))}")
-        lane = "strict"
-    if live_adapter and lane != "strict":
-        lint.add(path, "a Live Adapter brick is in the strict lane: a pure brick has no sources and a workflow is never depended on")
-    if mode_passing and lane != "workflow":
-        lint.add(path, "only a workflow may pass its mode to a sibling (MODE_PASSING)")
+    return Contract(version, ports or {}, tuple(owned_state), deterministic, declared)
 
-    return Contract(version, dict(dependencies), tuple(owned_state), lane, deterministic, live_adapter, tuple(mode_passing))
+
+def json_safe(value: Any) -> bool:
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def lint_ports(path: Path, tree: ast.Module, lint: Lint) -> dict[str, dict[str, Any]] | None:
+    """Validate ``PORTS`` and return the well-formed ports, or None when they are not declared as a dict."""
+    declared = assigned_literal(tree, "PORTS")
+    if not any(
+        (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PORTS" for t in node.targets))
+        or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "PORTS")
+        for node in tree.body
+    ):
+        lint.add(path, "PORTS is not declared; declare every source and joint (PORTS = {} for a brick with none)")
+        return None
+    if not isinstance(declared, dict):
+        lint.add(path, "PORTS must be a dict literal mapping port names to declarations")
+        return None
+    ports: dict[str, dict[str, Any]] = {}
+    for name, port in declared.items():
+        if not isinstance(name, str) or not PORT_NAME.fullmatch(name):
+            lint.add(path, f"port name {name!r} must be lowercase letters, digits and underscores")
+            continue
+        if not isinstance(port, dict) or port.get("kind") not in {"source", "joint"}:
+            lint.add(path, f"port {name!r} needs kind 'source' or 'joint'")
+            continue
+        kind = port["kind"]
+        allowed = SOURCE_FIELDS if kind == "source" else JOINT_FIELDS
+        for key in sorted(set(port) - allowed, key=str):
+            lint.add(path, f"port {name!r} has field {key!r}, which a {kind} port does not take")
+        if kind == "source":
+            epoch = port.get("epoch")
+            if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1:
+                lint.add(path, f"source {name!r} needs epoch: a positive integer, bumped when the adapter's request or response meaning changes")
+            label = port.get("label")
+            if "label" in port and (
+                not isinstance(label, dict)
+                or not label
+                or not all(isinstance(key, str) for key in label)
+                or not json_safe(label)
+            ):
+                lint.add(path, f"source {name!r} label must be a non-empty dict of what the source is (a version, a build, a protocol)")
+            if "followable" in port and not isinstance(port["followable"], bool):
+                lint.add(path, f"source {name!r} followable must be True or False")
+        else:
+            if port.get("policy") not in {"eventual", "orchestrated"}:
+                lint.add(path, f"joint {name!r} needs policy 'eventual' or 'orchestrated'")
+            pin = port.get("pin")
+            if not isinstance(pin, int) or isinstance(pin, bool) or pin < 1:
+                lint.add(path, f"joint {name!r} needs pin: the integer CONTRACT_VERSION of {name!r} it was written against")
+            follows = port.get("follow")
+            if "follow" in port:
+                if not isinstance(follows, (tuple, list)) or not follows or not all(isinstance(item, str) and item for item in follows):
+                    lint.add(path, f"joint {name!r} follow must list the sibling's followable source names")
+                elif port.get("policy") != "orchestrated":
+                    lint.add(path, f"joint {name!r} follows sources, so its policy must be 'orchestrated'")
+        ports[name] = port
+    return ports
 
 
 def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -346,8 +409,8 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
             None,
         )
         options = {arg.arg for arg in function.args.kwonlyargs} if function else set()
-        if not {"fresh", "save"}.issubset(options):
-            lint.add(brick / "runner/run.py", "run needs keyword-only fresh and save options")
+        if not {"fresh", "record"}.issubset(options):
+            lint.add(brick / "runner/run.py", "run needs keyword-only fresh and record options")
         if function:
             input_type = annotation_name(function.args.args[0].annotation) if function.args.args else ""
             if input_type != "BrickInput" or annotation_name(function.returns) != "BrickOutput":
@@ -364,7 +427,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
         calls: set[str] = set()
         imports_sibling = False
         sibling_runs: dict[str, str] = {}
-        pass_mode_flags: dict[str, str] = {}
+        follow_flags: dict[str, str] = {}
         if adapter:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("bricks.") and node.level == 0:
@@ -372,9 +435,11 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                         if alias.name == "run":
                             sibling_runs[alias.asname or alias.name] = node.module.split(".")[1]
                 if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                    named = pass_mode_sibling(node.value)
+                    named = follow_joint(node.value)
                     if named:
-                        pass_mode_flags[node.targets[0].id] = named
+                        follow_flags[node.targets[0].id] = named
+            if len(relative) == 3 and path.name != "__init__.py" and path.stem not in contract.ports:
+                lint.add(path, f"adapter {path.name} has no port {path.stem!r} in PORTS; one adapter file implements one declared port")
         if role == "src":
             escape_hatches(path, tree, lint, "src")
         elif role != "runner" and any(
@@ -416,20 +481,22 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             or [n.name for n in node.names] != ["run"]
                         ):
                             lint.add(path, "sibling adapter may import only run")
-                        if parts[1] not in contract.dependencies:
-                            lint.add(path, f"sibling dependency {parts[1]!r} is not declared")
-            if role == "src" and mode_read(node):
+                        if parts[1] not in contract.joints:
+                            lint.add(path, f"joint {parts[1]!r} is not declared in PORTS")
+                        elif adapter and path.stem != parts[1]:
+                            lint.add(path, f"the adapter for joint {parts[1]!r} must be named {parts[1]}.py")
+            if role == "src" and plan_read(node):
                 lint.add(
                     path,
-                    "src reads the run mode; each adapter owns saved, fresh and save behavior, "
+                    "src reads the run plan; each adapter owns replay, fresh and record behavior, "
                     "so label recorded data by what the adapter returned (input/AGENTS.md, Recorded data)",
                     warning=True,
                 )
-            if role == "src" and mode_override(node):
+            if role == "src" and plan_override(node):
                 lint.add(
                     path,
-                    "src overrides the run mode; the mode belongs to the run and its adapters. To use a "
-                    "source live or recorded independently, make it its own sibling brick "
+                    "src overrides the run plan; the plan belongs to the run and its adapters. Ask for a "
+                    "source fresh or recorded by naming its port in run(..., fresh=...) "
                     "(input/AGENTS.md, Recorded data)",
                     warning=True,
                 )
@@ -437,7 +504,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(
                     path,
                     f"adapter switches behavior on environment variable {env_switch(node)!r}; that is a mode "
-                    "no run record shows. Put the source in its own sibling brick (it replays unless it is a Live Adapter its workflow passes the mode to), or "
+                    "no ledger entry shows. Ask for the source fresh by naming its port in run(..., fresh=...), or "
                     "pass the choice in the brick input",
                     warning=True,
                 )
@@ -447,40 +514,22 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                     "src filesystem access must use an adapter (in memory is fine: "
                     "x.open(io.BytesIO(data)) is allowed when the buffer is built in the call)",
                 )
-            if adapter and isinstance(node, ast.Call) and called_name(node) == "Transcript":
-                if not any(keyword.arg == "fingerprint" for keyword in node.keywords):
-                    lint.add(
-                        path,
-                        "Transcript is created without fingerprint=; name what the source is (game version, "
-                        "build, protocol) so a recording made against another version is found stale",
-                        warning=True,
-                    )
             if adapter and isinstance(node, ast.Call):
-                lint_mode_passing_call(path, node, contract, sibling_runs, pass_mode_flags, lint)
-        if adapter and not imports_sibling and not calls & SAVED_MODE_CALLS:
+                lint_tape_call(path, node, contract, lint)
+                lint_follow_call(path, node, contract, sibling_runs, follow_flags, lint)
+        if adapter and not imports_sibling and not calls & REPLAY_CALLS:
             lint.add(
                 path,
-                "adapter never calls load_example, through or Transcript, so it has no saved mode; a file or tool adapter "
-                "replays a recorded manifest (input/AGENTS.md, Recorded data)",
+                f"adapter for source {path.stem!r} never plays a tape (tape.once or tape.session), so it has no replay; "
+                "a file or tool adapter replays a recorded manifest (input/AGENTS.md, Recorded data)",
                 warning=True,
             )
 
-    if contract.live_adapter:
-        recorded = False
-        for path in sorted((brick / "input/adapters").glob("*.py")):
-            tree = lint.tree(path)
-            if tree and any(
-                isinstance(node, ast.Call) and called_name(node) in {"through", "Transcript"} for node in ast.walk(tree)
-            ):
-                recorded = True
-        if not recorded:
-            lint.add(
-                brick / "contract.py",
-                "LIVE_ADAPTER = True, but no adapter records through Transcript or through(); "
-                "a Live Adapter records what it drives and replays by default",
-            )
-    for dependency in contract.dependencies.keys() - actual_dependencies:
-        lint.add(brick / "contract.py", f"declared dependency {dependency!r} has no static adapter import", warning=True)
+    for name in sorted(contract.ports):
+        if not (brick / "input/adapters" / f"{name}.py").is_file():
+            lint.add(brick / "contract.py", f"port {name!r} has no adapter file input/adapters/{name}.py")
+    for joint in contract.joints.keys() - actual_dependencies:
+        lint.add(brick / "contract.py", f"declared joint {joint!r} has no static adapter import", warning=True)
 
 
 def read_json(path: Path, lint: Lint) -> Any:
@@ -502,66 +551,111 @@ def check_secrets(path: Path, value: Any, lint: Lint) -> None:
             check_secrets(path, item, lint)
 
 
-def lint_records(brick: Path, limits: dict[str, int], lint: Lint) -> None:
-    data = brick / "input/data"
+def label_differences(recorded: Any, wanted: Any) -> list[str]:
+    """Which keys of a take's label differ from the port's, as ``key: recorded X, port Y``."""
+    recorded = recorded if isinstance(recorded, dict) else {}
+    wanted = wanted if isinstance(wanted, dict) else {}
+    return [
+        f"{key}: recorded {json.dumps(recorded.get(key, 'nothing'))}, port {json.dumps(wanted.get(key, 'nothing'))}"
+        for key in sorted(recorded.keys() | wanted.keys())
+        if recorded.get(key, "\0") != wanted.get(key, "\0")
+    ]
+
+
+def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: Lint) -> None:
+    for old, advice in (
+        ("input/data", "the old takes folder: takes now live in input/tapes/<source>/<take>.json (schema 2)"),
+        ("input/evidence.py", "the old take loader: the loader is now input/tape.py, copied from bricks/example_brick"),
+        ("runner/runs", "the old run-record folder: ledger entries now live in runner/ledger"),
+    ):
+        if (brick / old).exists():
+            lint.add(brick / old, f"{advice}; {MIGRATION}")
+    tapes = brick / "input/tapes"
     counts: dict[str, int] = {}
-    for path in sorted(data.rglob("*.json")):
-        relative = path.relative_to(data)
+    for path in sorted(tapes.rglob("*.json")):
+        relative = path.relative_to(tapes)
         if len(relative.parts) != 2:
-            lint.add(path, "evidence path must be <adapter>/<case>.json")
+            lint.add(path, "a take path must be <source>/<take>.json")
             continue
-        adapter, filename = relative.parts
-        case = Path(filename).stem
-        counts[adapter] = counts.get(adapter, 0) + 1
+        source, filename = relative.parts
+        take = Path(filename).stem
+        counts[source] = counts.get(source, 0) + 1
+        port = contract.sources.get(source)
+        if port is None:
+            lint.add(path, f"tape folder {source!r} has no source port in PORTS; declare the port or delete the take")
         size = path.stat().st_size
-        if size > limits["max_evidence_bytes"]:
-            lint.add(path, "evidence exceeds max_evidence_bytes; store a projection or split it into cases")
-        elif size * 5 > limits["max_evidence_bytes"] * 4:
+        if size > limits["max_take_bytes"]:
+            lint.add(path, "take exceeds max_take_bytes; store a projection or split the session into more takes")
+        elif size * 5 > limits["max_take_bytes"] * 4:
             lint.add(
                 path,
-                f"evidence is {size * 100 // limits['max_evidence_bytes']}% of max_evidence_bytes; "
-                "store a projection of the response or split a session into cases per window "
+                f"take is {size * 100 // limits['max_take_bytes']}% of max_take_bytes; "
+                "store a projection of the response or split a session into takes per window "
                 "before the next re-record fails",
                 warning=True,
             )
         record = read_json(path, lint)
         if not isinstance(record, dict):
             continue
-        required = {
-            "schema_version",
-            "contract_version",
-            "adapter",
-            "case",
-            "capture_run_id",
-            "request",
-        }
+        required = {"schema_version", "source", "take", "epoch", "recorded_in", "request"}
+        if record.get("schema_version") != 2:
+            lint.add(
+                path,
+                "take is not in schema 2. A take has schema_version 2, source, take, epoch, recorded_in, request and "
+                f"exactly one of response or error; {MIGRATION}",
+            )
+            continue
         if required - record.keys():
-            lint.add(path, "evidence is missing required fields")
-        if record.get("adapter") != adapter or record.get("case") != case:
-            lint.add(path, "adapter and case must match the path")
+            lint.add(path, "take is missing required fields")
+        if record.get("source") != source or record.get("take") != take:
+            lint.add(path, "source and take must match the path")
         if ("response" in record) == ("error" in record):
-            lint.add(path, "evidence needs exactly one of response or error")
+            lint.add(path, "a take needs exactly one of response or error")
         canonical = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
         if path.read_bytes() != canonical:
-            lint.add(path, "evidence JSON is not canonical")
+            lint.add(path, "take JSON is not canonical")
         check_secrets(path, record, lint)
-    for adapter, count in counts.items():
-        if count > limits["saved_examples_per_adapter"]:
+        if port is not None and isinstance(port.get("epoch"), int) and record.get("epoch") != port["epoch"]:
             lint.add(
-                data / adapter,
-                "too many saved examples; a case per window or per instance is fine, but raise "
-                "retention.saved_examples_per_adapter in config.yml deliberately and say why",
+                path,
+                f"take recorded at epoch {record.get('epoch')}, port {source!r} is at epoch {port['epoch']}; re-record it",
+            )
+        if port is not None:
+            request = record.get("request")
+            recorded_label = request.get("label") if isinstance(request, dict) else None
+            differences = label_differences(recorded_label, port.get("label"))
+            if differences:
+                lint.add(
+                    path,
+                    f"take label differs from port {source!r} ({'; '.join(differences)}); re-record it",
+                )
+    for source, count in counts.items():
+        if count > limits["takes_per_tape"]:
+            lint.add(
+                tapes / source,
+                "too many takes; a take per window or per instance is fine, but raise "
+                "retention.takes_per_tape in config.yml deliberately and say why",
             )
 
-    runs = sorted((brick / "runner/runs").glob("*.json"))
-    # Test runs (BRICK_RUN_KIND=test) are local, untracked and bounded on their own.
-    tracked = [path for path in runs if not path.name.endswith(".test.json")]
-    if len(tracked) > limits["runs"]:
-        lint.add(brick / "runner/runs", "too many retained run records")
-    for path in runs:
-        if path.stat().st_size > limits["max_run_record_bytes"]:
-            lint.add(path, "run record exceeds max_run_record_bytes")
-        read_json(path, lint)
+    entries = sorted((brick / "runner/ledger").glob("*.json"))
+    # Local entries (replay-only runs and test runs) are untracked and bounded on their own.
+    tracked = [path for path in entries if not path.name.endswith(LOCAL_SUFFIX)]
+    if len(tracked) > limits["entries"]:
+        lint.add(brick / "runner/ledger", "too many retained ledger entries")
+    for path in entries:
+        if path.stat().st_size > limits["max_entry_bytes"]:
+            lint.add(path, "ledger entry exceeds max_entry_bytes")
+        entry = read_json(path, lint)
+        if (
+            path in tracked
+            and isinstance(entry, dict)
+            and not (entry.get("fresh") or entry.get("followed") or "error" in entry)
+        ):
+            lint.add(
+                path,
+                "a tracked ledger entry is for a run that went fresh, recorded or failed; "
+                "a replay-only run writes a local .local.json entry",
+            )
 
 
 def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -571,10 +665,10 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
         return
     if not (tests_dir / "__init__.py").is_file():
         lint.add(tests_dir / "__init__.py", "smoke-test package marker is missing")
-    if contract.lane != "workflow":
-        lint.add(tests_dir, "smoke tests belong only to workflow bricks")
+    if not (brick / "__main__.py").is_file():
+        lint.add(tests_dir, "smoke tests belong only to entry bricks (a brick with a __main__.py)")
     if len(tests) > 3:
-        lint.add(tests_dir, "a workflow may have at most three smoke-test files")
+        lint.add(tests_dir, "an entry brick may have at most three smoke-test files")
     for path in tests:
         tree = lint.tree(path)
         if not tree:
@@ -584,10 +678,10 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
             for node in ast.walk(tree)
         ):
             lint.add(path, "contains a skipped smoke test; it proves no integration", warning=True)
-        if "BRICK_RUN_KIND" not in path.read_text(encoding="utf-8"):
+        if "BRICK_TEST" not in path.read_text(encoding="utf-8"):
             lint.add(
                 path,
-                "smoke test does not set BRICK_RUN_KIND=test, so its run records land in tracked history; "
+                "smoke test does not set BRICK_TEST=1, so a fresh or failing run lands in tracked ledger history; "
                 "set it in setUp with os.environ and restore it in a cleanup",
                 warning=True,
             )
@@ -606,11 +700,7 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(path, "smoke test must use from bricks.<name> import run")
 
 
-def lint_strict(brick: Path, contract: Contract, lint: Lint) -> None:
-    """The regular lane. Every rule above already applies; this adds none."""
-
-
-PURE_FORBIDDEN = DIRECT_IO | {"random", "time"}
+SEALED_FORBIDDEN = DIRECT_IO | {"random", "time"}
 CLOCK_CALLS = {"now", "today", "utcnow"}
 # What a brick that declares DETERMINISTIC = True keeps out of src/.
 NONDETERMINISTIC_MODULES = {
@@ -624,11 +714,11 @@ def lint_deterministic(brick: Path, contract: Contract, lint: Lint) -> None:
     A brick that says nothing makes no promise and gets no check. A brick that
     declares ``True`` may not reach for the clock, randomness, threads or
     generated IDs in ``src/`` (adapters are where such things enter, as inputs).
-    The pure lane already holds its whole brick to this, so it may not say ``False``.
+    A sealed brick is held to this across the whole brick, so it may not say ``False``.
     """
-    if contract.lane == "pure" and contract.deterministic is False:
-        lint.add(brick / "contract.py", "a pure brick is deterministic by definition; remove DETERMINISTIC = False")
-    if contract.deterministic is not True or contract.lane == "pure":
+    if contract.sealed and contract.deterministic is False:
+        lint.add(brick / "contract.py", "a sealed brick is deterministic by definition; remove DETERMINISTIC = False")
+    if contract.deterministic is not True or contract.sealed:
         return
     for path in sorted((brick / "src").rglob("*.py")):
         tree = lint.tree(path)
@@ -652,23 +742,22 @@ def lint_deterministic(brick: Path, contract: Contract, lint: Lint) -> None:
                 )
 
 
-def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
-    """A pure brick's output is a function of its input and nothing else.
+def lint_sealed(brick: Path, contract: Contract, lint: Lint) -> None:
+    """A sealed brick has no ports, so its output is a function of its input and nothing else.
 
-    Adapters are the only sanctioned channel to the outside, so a pure brick
-    has none, and therefore no sibling dependencies either. The direct-I/O
+    Ports are the only sanctioned channel to the outside, so a sealed brick has
+    no adapters and no tapes. The direct-I/O
     ban every ``src/`` already carries widens to the whole brick, joined by
     ``random`` and ``time``, and by the clock calls the ``src/`` contract has
     always forbidden in prose. ``runner/`` is the one exemption: it writes
-    run records and owns ``rng.py``, so it keeps the filesystem and
+    ledger entries and owns ``rng.py``, so it keeps the filesystem and
     randomness the rest of the brick gives up. ``datetime`` stays importable:
-    arithmetic on a caller-supplied time is pure; reading ``now()`` is not.
+    arithmetic on a caller-supplied time is allowed; reading ``now()`` is not.
     """
-    adapters = sorted((brick / "input/adapters").glob("*.py"))
-    for path in adapters:
-        lint.add(path, "pure brick may not have adapters")
-    if contract.dependencies:
-        lint.add(brick / "contract.py", "pure brick may not declare sibling dependencies")
+    for folder, what in (("input/adapters", "adapters"), ("input/tapes", "tapes")):
+        for path in sorted((brick / folder).rglob("*")) if (brick / folder).is_dir() else ():
+            if path.is_file() and path.name != ".gitkeep":
+                lint.add(path, f"sealed brick may not have {what}: it has no ports")
     stdlib = stdlib_names()
     for path in brick.rglob("*.py"):
         relative = path.relative_to(brick).parts
@@ -678,7 +767,7 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
         if not tree:
             continue
         if relative[0] != "src":
-            escape_hatches(path, tree, lint, "pure brick")
+            escape_hatches(path, tree, lint, "sealed brick")
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for module in imported_modules(node):
@@ -686,46 +775,38 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
                     if (
                         stdlib is not None
                         and name in stdlib
-                        and name not in PURE_STDLIB
-                        and name not in PURE_FORBIDDEN
+                        and name not in SEALED_STDLIB
+                        and name not in SEALED_FORBIDDEN
                     ):
-                        lint.add(path, f"pure brick imports standard-library module {name!r}, which is not on the pure allowlist")
+                        lint.add(path, f"sealed brick imports standard-library module {name!r}, which is not on the sealed allowlist")
                     if ".".join(module.lstrip(".").split(".")[:2]) in DIRECT_IO_DOTTED and relative[0] != "src":
-                        lint.add(path, f"pure brick imports {'.'.join(module.split('.')[:2])!r} outside runner/")
+                        lint.add(path, f"sealed brick imports {'.'.join(module.split('.')[:2])!r} outside runner/")
                     # src/ already reports DIRECT_IO under the rule every brick gets.
-                    if name in PURE_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
+                    if name in SEALED_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
                         hint = (
-                            "; a pure brick has no saved evidence, so delete input/evidence.py"
-                            if relative == ("input", "evidence.py")
+                            "; a sealed brick has no ports, so delete input/tape.py"
+                            if relative == ("input", "tape.py")
                             else ""
                         )
-                        lint.add(path, f"pure brick imports {name!r} outside runner/{hint}")
+                        lint.add(path, f"sealed brick imports {name!r} outside runner/{hint}")
             if isinstance(node, ast.Call) and called_name(node) in CLOCK_CALLS:
-                lint.add(path, f"pure brick reads the clock with {called_name(node)}()")
+                lint.add(path, f"sealed brick reads the clock with {called_name(node)}()")
 
 
-# A lane is a declared enforcement class: the rules above plus the ones its
-# enforcer adds. A lane may only add rules, never relax one (AGENTS.md:
-# "may not relax a parent rule"), and it may not exist without an enforcer,
-# which is why the table maps each name to a function rather than listing
-# names. A contract with no LANE is in the strict lane.
-def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
-    """A workflow is invoked as a whole operation, never imported for its parts.
+def lint_entry(brick: Path, contract: Contract, lint: Lint) -> None:
+    """An entry brick is invoked as a whole operation, never imported for its parts.
 
-    Two consequences, one enforced here and one in the graph. Here: it is the
-    only kind of brick that may carry a process door, ``__main__.py``, and
-    that door may import nothing from the brick tree except the brick's own
-    ``run`` -- the same rule a sibling adapter lives under, applied to the
-    outside world. In the graph: no contract may list a workflow as a sibling
-    dependency. Smoke tests, which prove integration through ``run``, belong
-    only here; before lanes that was derived from the graph (a brick nothing
-    depended on) and now the brick says so.
+    Two consequences, one enforced here and one in the graph. Here: its
+    ``__main__.py`` may import nothing from the brick tree except the brick's
+    own ``run`` -- the same rule a joint adapter lives under, applied to the
+    outside world. In the graph: no joint may point at an entry brick. Smoke
+    tests, which prove integration through ``run``, belong only here.
     """
-    door = lint.tree(brick / "__main__.py")
-    if not door:
+    main = lint.tree(brick / "__main__.py")
+    if not main:
         return
     own_run = {".", ".runner.run", f"bricks.{brick.name}"}
-    for node in ast.walk(door):
+    for node in ast.walk(main):
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
         for module in imported_modules(node):
@@ -735,7 +816,7 @@ def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
                 if top in DIRECT_IO - {"os", "pathlib"}:
                     lint.add(
                         brick / "__main__.py",
-                        f"__main__ imports direct-I/O module {top!r}; a door parses arguments, calls run and "
+                        f"__main__ imports direct-I/O module {top!r}; it parses arguments, calls run and "
                         "prints or writes what run returned; effects belong in an adapter",
                         warning=True,
                     )
@@ -745,31 +826,27 @@ def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(brick / "__main__.py", "__main__ may import only this brick's run")
 
 
-LANES = {
-    "strict": lint_strict,
-    "pure": lint_pure,
-    "workflow": lint_workflow,
-}
-
-
 def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
-    for relative in REQUIRED:
-        # A pure brick has no adapters, and Git cannot track the empty folder.
-        if relative in LANE_OPTIONAL.get(contract.lane, ()):
-            continue
+    required = list(REQUIRED)
+    if contract.ports:
+        required.append("input/adapters")
+    if contract.sources:
+        required.append("input/tapes")
+    for relative in required:
         if not (brick / relative).exists():
             lint.add(brick / relative, "required brick path is missing")
     config_path = brick / "input/config.yml"
     config = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
     limits = {key: config_number(config, key, lint, config_path) for key in CONFIG_DEFAULTS}
     lint_python(brick, contract, lint)
-    lint_records(brick, limits, lint)
+    lint_records(brick, contract, limits, lint)
     lint_smokes(brick, contract, lint)
-    if contract.lane != "workflow" and (brick / "__main__.py").exists():
-        lint.add(brick / "__main__.py", "only a workflow brick may have __main__.py")
     lint_adapter_functions(brick, lint)
     lint_deterministic(brick, contract, lint)
-    LANES[contract.lane](brick, contract, lint)
+    if contract.sealed:
+        lint_sealed(brick, contract, lint)
+    if (brick / "__main__.py").is_file():
+        lint_entry(brick, contract, lint)
 
 
 COPY_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
@@ -778,7 +855,7 @@ COPY_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
 def lint_copies(bricks: list[Path], lint: Lint) -> None:
     """Warn when copies of one boilerplate file have drifted apart.
 
-    Some files are copied into every brick on purpose (``input/evidence.py``,
+    Some files are copied into every brick on purpose (``input/tape.py``,
     the runner files). A copy carries ``# BOILERPLATE: <id>@<n>`` in its first
     lines. Copies with the same id and version must be byte-identical; copies
     with different versions say which brick is behind. A deliberate fork bumps
@@ -815,11 +892,38 @@ def lint_copies(bricks: list[Path], lint: Lint) -> None:
                 )
 
 
-def pass_mode_sibling(node: ast.AST) -> str:
-    """The sibling name when ``node`` is ``pass_mode(<context>, "<sibling>")``, else ''."""
+def tape_source(node: ast.Call) -> str:
+    """The source port a tape call names with a literal, else ''."""
+    position = SOURCE_ARGUMENT.get(called_name(node))
+    if position is None or len(node.args) <= position:
+        return ""
+    argument = node.args[position]
+    return argument.value if isinstance(argument, ast.Constant) and isinstance(argument.value, str) else ""
+
+
+def lint_tape_call(path: Path, node: ast.Call, contract: Contract, lint: Lint) -> None:
+    """One adapter file is one source port: its tape calls name that port, and a session needs a label."""
+    stem = path.stem
+    named = tape_source(node)
+    if named and stem in contract.sources and named != stem:
+        lint.add(
+            path,
+            f"adapter {path.name} uses the tape of source {named!r}; one adapter file implements one port, so use {stem!r}",
+        )
+    if called_name(node) == "session" and stem in contract.sources and not contract.sources[stem].get("label"):
+        lint.add(
+            path,
+            f"adapter {path.name} opens a session but source {stem!r} has no label in PORTS; name what the source is "
+            "(a game version, a build, a protocol) so takes recorded against another version are found stale",
+            warning=True,
+        )
+
+
+def follow_joint(node: ast.AST) -> str:
+    """The joint name when ``node`` is ``follow(<context>, "<joint>")``, else ''."""
     if (
         isinstance(node, ast.Call)
-        and called_name(node) == "pass_mode"
+        and called_name(node) == "follow"
         and len(node.args) == 2
         and isinstance(node.args[1], ast.Constant)
         and isinstance(node.args[1].value, str)
@@ -828,16 +932,16 @@ def pass_mode_sibling(node: ast.AST) -> str:
     return ""
 
 
-def passes_mode_from_helper(value: ast.AST, key: str, sibling: str, flags: dict[str, str]) -> bool:
-    """True for ``pass_mode(ctx, "<sibling>")["<key>"]`` or ``<name>["<key>"]`` where name came from that call."""
+def passes_flags_from_helper(value: ast.AST, key: str, joint: str, flags: dict[str, str]) -> bool:
+    """True for ``follow(ctx, "<joint>")["<key>"]`` or ``<name>["<key>"]`` where name came from that call."""
     if not (isinstance(value, ast.Subscript) and isinstance(value.slice, ast.Constant) and value.slice.value == key):
         return False
-    if pass_mode_sibling(value.value) == sibling:
+    if follow_joint(value.value) == joint:
         return True
-    return isinstance(value.value, ast.Name) and flags.get(value.value.id) == sibling
+    return isinstance(value.value, ast.Name) and flags.get(value.value.id) == joint
 
 
-def lint_mode_passing_call(
+def lint_follow_call(
     path: Path,
     node: ast.Call,
     contract: Contract,
@@ -845,44 +949,43 @@ def lint_mode_passing_call(
     flags: dict[str, str],
     lint: Lint,
 ) -> None:
-    """Mode passing: only a declared, helper-fed call may give a sibling fresh or save."""
-    named = pass_mode_sibling(node)
-    if called_name(node) == "pass_mode" and len(node.args) == 2 and isinstance(node.args[1], ast.Constant):
-        if node.args[1].value not in contract.mode_passing:
-            lint.add(path, f"pass_mode for {node.args[1].value!r}, which is not listed in MODE_PASSING in contract.py")
+    """Following: only a declared, helper-fed call may give a sibling fresh or record."""
+    if called_name(node) == "follow" and len(node.args) == 2 and isinstance(node.args[1], ast.Constant):
+        joint = node.args[1].value
+        if not contract.joints.get(joint, {}).get("follow"):
+            lint.add(path, f"follow for {joint!r}, which has no follow list in PORTS (contract.py)")
         return
     target = sibling_runs.get(node.func.id) if isinstance(node.func, ast.Name) else None
-    is_run = target is not None or called_name(node) == "run"
-    if not is_run:
+    if target is None and called_name(node) != "run":
         return
-    forwarded = {word.arg for word in node.keywords} & {"fresh", "save"}
+    forwarded = {word.arg for word in node.keywords} & {"fresh", "record"}
     spread = any(word.arg is None for word in node.keywords)
-    if target is not None and target in contract.mode_passing:
+    if target is not None and contract.joints.get(target, {}).get("follow"):
         if spread:
-            lint.add(path, "a sibling run that gets the mode may not receive expanded keyword arguments")
-        if forwarded != {"fresh", "save"}:
-            lint.add(path, f"mode passing to {target!r} must give both fresh and save, from pass_mode(ctx, {target!r})")
+            lint.add(path, "a sibling run that is followed may not receive expanded keyword arguments")
+        if forwarded != {"fresh", "record"}:
+            lint.add(path, f"following {target!r} must give both fresh and record, from follow(ctx, {target!r})")
         for word in node.keywords:
-            if word.arg in {"fresh", "save"} and not passes_mode_from_helper(word.value, word.arg, target, flags):
+            if word.arg in {"fresh", "record"} and not passes_flags_from_helper(word.value, word.arg, target, flags):
                 lint.add(
                     path,
-                    f"{word.arg}= for {target!r} must be pass_mode(ctx, {target!r})[{word.arg!r}], "
+                    f"{word.arg}= for {target!r} must be follow(ctx, {target!r})[{word.arg!r}], "
                     "not a value written here",
                 )
         return
-    if forwarded:
+    if forwarded or {word.arg for word in node.keywords} & {"save"}:
         lint.add(
             path,
-            "sibling run may not receive fresh or save unless the sibling declares LIVE_ADAPTER = True and "
-            "this workflow lists it in MODE_PASSING and takes the flags from pass_mode (README: Live Adapters)",
+            "a sibling run may not receive fresh or record unless its joint lists follow in PORTS "
+            "and the flags come from follow(ctx, <joint>) (README: Source ports)",
         )
 
 
 def lint_adapter_functions(brick: Path, lint: Lint) -> None:
     """Warn on an adapter function that does I/O, takes no run context, and is called from outside its file.
 
-    Such a function cannot see the mode, so it behaves the same in saved,
-    fresh and save: a saved run reads the real disk or network. Helpers used
+    Such a function cannot see the plan, so it behaves the same in replay,
+    fresh and record: a replayed run reads the real disk or network. Helpers used
     only inside their own adapter are not flagged.
     """
     adapters = sorted((brick / "input/adapters").glob("*.py"))
@@ -930,7 +1033,7 @@ def lint_adapter_functions(brick: Path, lint: Lint) -> None:
                 lint.add(
                     path,
                     f"{name}() does I/O and takes no run context, so it behaves the same in every mode; "
-                    "take ctx and answer from a saved example in saved mode",
+                    "take ctx and answer from a take in replay",
                     warning=True,
                 )
 
@@ -946,29 +1049,31 @@ def lint_graph(
         return next(brick for brick in bricks if brick.name == name) / "contract.py"
 
     for name, contract in contracts.items():
-        for dependency in contract.dependencies:
+        for dependency, port in contract.joints.items():
             if dependency == name:
-                lint.add(next(brick for brick in bricks if brick.name == name) / "contract.py", "brick may not depend on itself")
+                lint.add(where(name), "brick may not depend on itself")
             elif dependency not in names:
-                lint.add(next(brick for brick in bricks if brick.name == name) / "contract.py", f"unknown sibling dependency {dependency!r}")
+                lint.add(where(name), f"joint {dependency!r} names a brick that does not exist")
             else:
-                if contracts[dependency].lane == "workflow":
+                if (where(dependency).parent / "__main__.py").is_file():
                     lint.add(
-                        next(brick for brick in bricks if brick.name == name) / "contract.py",
-                        f"sibling dependency {dependency!r} is a workflow brick; a workflow is invoked as a whole, not depended on",
+                        where(name),
+                        f"joint {dependency!r} is an entry brick; an entry brick is invoked as a whole, not depended on",
                     )
+                pin, version = port.get("pin"), contracts[dependency].version
+                if isinstance(pin, int) and version and pin != version:
+                    lint.add(
+                        where(name),
+                        f"joint {dependency!r} pins version {pin}, but {dependency!r} is at version {version}; "
+                        "update the adapter and the pin together",
+                    )
+                for source in port.get("follow") or ():
+                    if not contracts[dependency].sources.get(source, {}).get("followable"):
+                        lint.add(
+                            where(name),
+                            f"joint {dependency!r} follows {source!r}, which is not a followable source of {dependency!r}",
+                        )
                 graph[name].add(dependency)
-        for target_name in contract.mode_passing:
-            if target_name not in contract.dependencies:
-                lint.add(where(name), f"MODE_PASSING names {target_name!r}, which is not a sibling dependency")
-            elif contract.dependencies[target_name] != "orchestrated":
-                lint.add(where(name), f"MODE_PASSING names {target_name!r}, which must be an orchestrated dependency")
-            elif target_name in contracts and contracts[target_name].live_adapter is not True:
-                lint.add(
-                    where(name),
-                    f"MODE_PASSING names {target_name!r}, which does not declare LIVE_ADAPTER = True; "
-                    "a sibling opts in to receiving a mode",
-                )
         for resource in contract.owned_state:
             if resource in owners:
                 lint.add(
@@ -984,7 +1089,7 @@ def lint_graph(
     def visit(name: str, trail: tuple[str, ...]) -> None:
         if name in visiting:
             cycle = " -> ".join((*trail, name))
-            lint.add(lint.root / "bricks", f"sibling dependency cycle: {cycle}")
+            lint.add(lint.root / "bricks", f"joint cycle: {cycle}")
             return
         if name in visited:
             return

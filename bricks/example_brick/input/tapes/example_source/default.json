@@ -1,0 +1,13 @@
+{
+  "epoch": 1,
+  "recorded_in": "20260101-000000-000000-ab12",
+  "request": {
+    "purpose": "example"
+  },
+  "response": {
+    "value": 1
+  },
+  "schema_version": 2,
+  "source": "example_source",
+  "take": "default"
+}

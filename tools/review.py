@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Judge one pull request's diff, one lane at a time.
+"""Judge one pull request's diff, one shape at a time.
 
 `tools/lint_bricks.py` decides everything an integer can decide. This is the
-other half of a lane: a language model reads the diff a lane claims and
-raises findings about what a parser cannot see -- whether an adapter really
-translates, whether a `pure` brick has a hidden input, whether a workflow's
-runner computes instead of composes. `review/<lane>.md` states each lane's
-criteria and is the authority; this file is plumbing. It decides which lane
-sees which paths, hands each lane exactly the context its prompt describes,
-and turns the verdict into an exit code.
+other half: a language model reads the diff a shape claims and raises findings
+about what a parser cannot see -- whether an adapter really translates, whether
+a `sealed` brick has a hidden input, whether an `entry` brick's runner computes
+instead of composes. `review/<shape>.md` states each shape's criteria and is the
+authority; this file is plumbing. It decides which shape sees which paths, hands
+each shape exactly the context its prompt describes, and turns the verdict into
+an exit code.
 
 ROUTING IS DERIVED, NOT DECLARED. A path's brick is `bricks/<name>/` and the
-brick's lane is `LANE` in its `contract.py`, parsed and never imported. Paths
-outside `bricks/` are printed as NOT REVIEWED rather than passing quietly.
+brick's shape is computed from its `contract.py` (ports, parsed and never
+imported) and its files: `entry` if it has a `__main__.py`, else `sealed` if it
+has no ports, else `open`. Paths outside `bricks/` are printed as NOT REVIEWED
+rather than passing quietly.
 
 THE REVIEWED TREE IS NOT THIS TREE. This file lives in the framework and
 judges a repository built on it: the current directory, or `REVIEW_ROOT`.
-Prompts come from that repository's `review/` when it has one, else from
-the framework's; a lane is any name with a prompt in either place. That is
-how a repository adds a lane of its own without forking this file.
+Prompts come from that repository's `review/` when it has one, else from the
+framework's. A repository may override the prompt of a shape; it cannot add a
+shape, because a shape is computed, not declared.
 
-A FINDING IS NOT A VERDICT. Each finding carries a severity and a lane blocks
+A FINDING IS NOT A VERDICT. Each finding carries a severity and a shape blocks
 exactly when it raised at least one `block` finding. Which criteria may block
 is written in each prompt, not here.
 
@@ -28,7 +30,7 @@ A REVIEW THAT COULD NOT BE TAKEN IS NOT A PASS. A refusal, an API error, or a
 missing key exits with a distinct code rather than falling through to a green
 check: a gate that fails open reads as evidence.
 
-MEMORY, NOT CONTEXT. Each round re-reviews the whole diff, so a lane is handed
+MEMORY, NOT CONTEXT. Each round re-reviews the whole diff, so a shape is handed
 its own verdict from the previous round on the same pull request and told not
 to block the implementation of its own last suggestion. CI restores it from a
 per-PR artifact; round one, local runs and an expired artifact all mean no
@@ -37,7 +39,6 @@ memory, which is the state round one is defined by.
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 from pathlib import Path
@@ -53,11 +54,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     anthropic = None
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from brick_contract import SHAPES, brick_shape  # type: ignore[no-redef]
+else:
+    from .brick_contract import SHAPES, brick_shape
+
 FRAMEWORK = Path(__file__).resolve().parents[1]
 PROMPTS = "review"
 COMMON_PROMPT = "common.md"
-# The default lane: what a brick is when its contract declares nothing.
-STRICT = "strict"
 CONTEXT_DOCS = ("AGENTS.md", "bricks/AGENTS.md")
 
 MODEL = "claude-sonnet-5"
@@ -97,7 +102,7 @@ VERDICT_SCHEMA = {
 
 
 def blocks(verdict: dict) -> bool:
-    """The whole decision rule: a lane blocks iff it raised a block finding."""
+    """The whole decision rule: a shape blocks iff it raised a block finding."""
     return any(f["severity"] == "block" for f in verdict["findings"])
 
 
@@ -109,58 +114,26 @@ def brick_of(path: str) -> str | None:
     return None
 
 
-def prompt_path(root: Path, lane: str) -> Path:
-    """The prompt for a lane: the reviewed repository's own if it has one,
+def prompt_path(root: Path, shape: str) -> Path:
+    """The prompt for a shape: the reviewed repository's own if it has one,
     else the framework's. Either file may be `common.md`."""
-    own = root / PROMPTS / f"{lane}.md"
-    return own if own.is_file() else FRAMEWORK / PROMPTS / f"{lane}.md"
+    own = root / PROMPTS / f"{shape}.md"
+    return own if own.is_file() else FRAMEWORK / PROMPTS / f"{shape}.md"
 
 
-def lanes(root: Path) -> tuple[str, ...]:
-    """Every lane with a prompt, strict first, the rest by name. A name in
-    the reviewed repository's `review/` is a lane of that repository's own."""
-    found = {
-        path.stem
-        for folder in (FRAMEWORK / PROMPTS, root / PROMPTS)
-        if folder.is_dir()
-        for path in folder.glob("*.md")
-        if path.name != COMMON_PROMPT
-    }
-    return (STRICT, *sorted(found - {STRICT}))
-
-
-def lane_of(root: Path, brick: str) -> str:
-    """The lane a brick declares with `LANE` in its contract. The contract is
-    parsed, never imported. Missing, unparseable, or unknown reads as strict:
-    routing must not fail on the very file a change may have broken, and the
-    linter is the place that rejects a bad declaration."""
-    contract = root / "bricks" / brick / "contract.py"
-    try:
-        tree = ast.parse(contract.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError):
-        return STRICT
-    known = lanes(root)
-    lane = STRICT
-    # The last assignment wins, as it would if the module ran.
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "LANE" for t in node.targets
-        ):
-            try:
-                value = ast.literal_eval(node.value)
-            except ValueError:
-                value = None
-            lane = value if value in known else STRICT
-    return lane
+def shape_of(root: Path, brick: str) -> str:
+    """The shape of one brick of the reviewed repository, computed from its
+    contract and its files, never declared."""
+    return brick_shape(root / "bricks" / brick)
 
 
 def route(root: Path, files: list[str]) -> tuple[dict[str, list[str]], list[str]]:
-    """Split changed files into per-lane lists, plus the ones no lane claims.
+    """Split changed files into per-shape lists, plus the ones no shape claims.
 
-    Lanes come out in `lanes()` order, every lane present even when
+    Shapes come out in the fixed `SHAPES` order, every shape present even when
     it claims nothing, so callers iterate one fixed sequence.
     """
-    by_lane: dict[str, list[str]] = {lane: [] for lane in lanes(root)}
+    by_shape: dict[str, list[str]] = {shape: [] for shape in SHAPES}
     unrouted: list[str] = []
     known: dict[str, str] = {}
     for path in files:
@@ -169,13 +142,13 @@ def route(root: Path, files: list[str]) -> tuple[dict[str, list[str]], list[str]
             unrouted.append(path)
             continue
         if brick not in known:
-            known[brick] = lane_of(root, brick)
-        by_lane[known[brick]].append(path)
-    return by_lane, unrouted
+            known[brick] = shape_of(root, brick)
+        by_shape[known[brick]].append(path)
+    return by_shape, unrouted
 
 
 def brick_docs(root: Path, files: list[str]) -> list[Path]:
-    """The AGENTS.md chain below `bricks/` for every brick a lane's files
+    """The AGENTS.md chain below `bricks/` for every brick a shape's files
     touch: the brick's own, if any, and its input/runner/src contracts."""
     found: list[Path] = []
     for brick in sorted({b for b in map(brick_of, files) if b}):
@@ -208,7 +181,7 @@ def untracked(root: Path) -> list[str]:
 
 
 def diff_for(root: Path, rng: list[str], files: list[str]) -> str:
-    """One lane's share of the diff: git itself cuts it to the routed files,
+    """One shape's share of the diff: git itself cuts it to the routed files,
     so the diff and the routing cannot disagree about who owns a path."""
     return git(root, "diff", *rng, "--", *files)
 
@@ -226,7 +199,7 @@ def ci_misconfigured(env: dict[str, str]) -> str | None:
         if not (base and head):
             return "BASE_SHA and HEAD_SHA must both be set in CI"
         if not env.get("ANTHROPIC_API_KEY"):
-            return ("ANTHROPIC_API_KEY is not set in CI, so no lane ran. Reported as "
+            return ("ANTHROPIC_API_KEY is not set in CI, so no shape ran. Reported as "
                     "a failure rather than a pass: a review that could not be taken "
                     "is not a review.")
     return None
@@ -237,24 +210,24 @@ def carried_forward(root: Path, previous: dict, head: str | None) -> bool:
 
     Each round re-reviews the whole PR diff, so a docs-only push used to spend
     a full model call re-judging an unchanged brick diff. If the delta since
-    the previous round's head touches nothing a lane claims, that verdict is
+    the previous round's head touches nothing a shape claims, that verdict is
     still exact -- blocked status included. Any doubt (no memory, unknown sha,
     shallow clone) falls through to a full review: the cheap path must never
     be the default on doubt.
     """
     prev_head = previous.get("head")
-    if not (head and prev_head and prev_head != head and previous.get("lanes")):
+    if not (head and prev_head and prev_head != head and previous.get("shapes")):
         return False
     try:
         delta = changed_files(root, [f"{prev_head}..{head}"])
     except subprocess.CalledProcessError:
         return False
-    lanes, _ = route(root, delta)
-    return not any(lanes.values())
+    shapes, _ = route(root, delta)
+    return not any(shapes.values())
 
 
-def report(lane: str, verdict: dict) -> None:
-    print(f"\n=== {lane} lane: {'BLOCK' if blocks(verdict) else 'PASS'} ===")
+def report(shape: str, verdict: dict) -> None:
+    print(f"\n=== {shape} shape: {'BLOCK' if blocks(verdict) else 'PASS'} ===")
     for f in verdict["findings"]:
         print(f"  {f['file']}  [{f['severity']}]")
         print(f"    issue:      {f['issue']}")
@@ -292,22 +265,22 @@ def _tagged(root: Path, path: Path) -> str:
     return f"<{name}>\n{path.read_text(encoding='utf-8')}\n</{name}>"
 
 
-def judge(client, root: Path, lane: str, files: list[str], diff: str,
+def judge(client, root: Path, shape: str, files: list[str], diff: str,
           elsewhere: list[str], unreviewed: list[str], previous: dict | None) -> dict:
-    """One lane, one diff, one verdict. Raises on anything that is not a verdict.
+    """One shape, one diff, one verdict. Raises on anything that is not a verdict.
 
     THE SHARED DOCUMENTS COME FIRST, BECAUSE CACHING IS A PREFIX MATCH. The
-    repository contracts and the common prompt are one prefix every lane
-    shares; the lane's own prompt sits behind its own breakpoint; only the
+    repository contracts and the common prompt are one prefix every shape
+    shares; the shape's own prompt sits behind its own breakpoint; only the
     touched bricks' contracts, the diff and the round memory are new tokens.
-    Billing structure, not context structure: the lane still sees exactly the
+    Billing structure, not context structure: the shape still sees exactly the
     documents and diff its prompt describes.
     """
     shared = "\n\n".join(
         [_tagged(root, root / doc) for doc in CONTEXT_DOCS]
         + [prompt_path(root, COMMON_PROMPT[:-3]).read_text(encoding="utf-8")]
     )
-    prompt = prompt_path(root, lane).read_text(encoding="utf-8")
+    prompt = prompt_path(root, shape).read_text(encoding="utf-8")
     payload = (
         "The documents above, the brick contracts and the diff below are the "
         "whole of your context, as your instructions describe. The diff is the "
@@ -318,13 +291,13 @@ def judge(client, root: Path, lane: str, files: list[str], diff: str,
     )
     if unreviewed:
         payload += (
-            "\n\nAlso changed in this same commit and reviewed by NO lane:\n  "
+            "\n\nAlso changed in this same commit and reviewed by NO shape:\n  "
             + "\n  ".join(unreviewed)
             + "\nYou cannot see these. Do not raise a finding that assumes what "
               "they do or do not contain -- including that a test is absent.")
     if elsewhere:
         payload += (
-            "\n\nAlso changed in this same commit, and reviewed by ANOTHER lane "
+            "\n\nAlso changed in this same commit, and reviewed by ANOTHER shape "
             "rather than withheld from you:\n  "
             + "\n  ".join(elsewhere)
             + "\nTheir absence from the diff above is routing. Do not raise a "
@@ -360,7 +333,7 @@ def judge(client, root: Path, lane: str, files: list[str], diff: str,
     # The bill, in the CI log: every lever on this gate's cost is tuned
     # against these numbers. `input_tokens` is the uncached remainder only.
     u = message.usage
-    print(f"  [{lane}] tokens: input={u.input_tokens} "
+    print(f"  [{shape}] tokens: input={u.input_tokens} "
           f"cache_read={u.cache_read_input_tokens} "
           f"cache_write={u.cache_creation_input_tokens} output={u.output_tokens}")
 
@@ -368,10 +341,10 @@ def judge(client, root: Path, lane: str, files: list[str], diff: str,
     # an empty or partial body, and indexing it would turn a non-answer into one.
     if message.stop_reason == "refusal":
         category = getattr(message.stop_details, "category", None)
-        raise RuntimeError(f"the {lane} lane was refused (category: {category})")
+        raise RuntimeError(f"the {shape} shape was refused (category: {category})")
     text = next((b.text for b in message.content if b.type == "text"), None)
     if text is None:
-        raise RuntimeError(f"the {lane} lane returned no text block")
+        raise RuntimeError(f"the {shape} shape returned no text block")
     return json.loads(text)
 
 
@@ -385,8 +358,8 @@ def main() -> int:
     rng = diff_range(base, head)
     if rng == ["HEAD"]:
         print("local run: comparing the working tree against HEAD")
-        lanes, _ = route(root, untracked(root))
-        if loose := [f for files in lanes.values() for f in files]:
+        shapes, _ = route(root, untracked(root))
+        if loose := [f for files in shapes.values() for f in files]:
             print("NOT REVIEWED -- untracked, so `git diff` cannot see them:")
             for f in loose:
                 print(f"  {f}")
@@ -401,24 +374,24 @@ def main() -> int:
         previous = json.loads(Path(prev_path).read_text(encoding="utf-8"))
         print(f"previous round loaded from {prev_path}")
 
-    lanes, unrouted = route(root, files)
+    shapes, unrouted = route(root, files)
     if unrouted:
-        print("NOT REVIEWED -- no lane claims these paths:")
+        print("NOT REVIEWED -- no shape claims these paths:")
         for f in unrouted:
             print(f"  {f}")
 
     def save(verdicts: dict[str, dict]) -> None:
         if out := env.get("VERDICTS_OUT"):
-            Path(out).write_text(json.dumps({"head": head, "lanes": verdicts}, indent=2),
+            Path(out).write_text(json.dumps({"head": head, "shapes": verdicts}, indent=2),
                                  encoding="utf-8")
 
     if carried_forward(root, previous, head):
         print(f"\nVERDICT CARRIED FORWARD from {previous['head'][:12]}: the delta "
-              "since it touches nothing a lane claims")
-        for lane, verdict in previous["lanes"].items():
-            report(lane, verdict)
-        save(previous["lanes"])
-        return EXIT_BLOCKED if any(map(blocks, previous["lanes"].values())) else EXIT_OK
+              "since it touches nothing a shape claims")
+        for shape, verdict in previous["shapes"].items():
+            report(shape, verdict)
+        save(previous["shapes"])
+        return EXIT_BLOCKED if any(map(blocks, previous["shapes"].values())) else EXIT_OK
 
     if anthropic is None:
         print("the anthropic package is not installed; nothing was reviewed",
@@ -426,30 +399,30 @@ def main() -> int:
         return EXIT_NOT_REVIEWED
     client = anthropic.Anthropic()
     verdicts: dict[str, dict] = {}
-    for lane, claimed in lanes.items():
+    for shape, claimed in shapes.items():
         if not claimed:
             continue
         diff = diff_for(root, rng, claimed)
         if not diff.strip():
             continue
-        elsewhere = [f for other, more in lanes.items() if other != lane for f in more]
+        elsewhere = [f for other, more in shapes.items() if other != shape for f in more]
         try:
-            verdict = _judge_with_retry(client, root, lane, claimed, diff, elsewhere,
-                                        unrouted, previous.get("lanes", {}).get(lane))
+            verdict = _judge_with_retry(client, root, shape, claimed, diff, elsewhere,
+                                        unrouted, previous.get("shapes", {}).get(shape))
         except Exception as exc:  # noqa: BLE001 -- any failure here is "not reviewed"
-            print(f"\n=== {lane} lane: NOT REVIEWED ===\n  {exc}", file=sys.stderr)
+            print(f"\n=== {shape} shape: NOT REVIEWED ===\n  {exc}", file=sys.stderr)
             if isinstance(exc, anthropic.AuthenticationError):
                 print("  No usable credentials. Export ANTHROPIC_API_KEY, or log in "
                       "with the Anthropic CLI; the SDK reads that profile with no "
                       "env var set.", file=sys.stderr)
             return EXIT_NOT_REVIEWED
-        report(lane, verdict)
-        verdicts[lane] = verdict
+        report(shape, verdict)
+        verdicts[shape] = verdict
 
     if not verdicts:
-        print("\nno lane ran: the diff touches no reviewed path")
+        print("\nno shape ran: the diff touches no reviewed path")
         return EXIT_OK
-    # Written only when a lane judged something: an empty round leaves no
+    # Written only when a shape judged something: an empty round leaves no
     # memory to mislead the next one.
     save(verdicts)
     return EXIT_BLOCKED if any(map(blocks, verdicts.values())) else EXIT_OK

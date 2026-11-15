@@ -1,43 +1,14 @@
-"""Replace with an adapter for one external source."""
+"""Replace with an adapter for one source port: this file implements ``example_source``."""
 
-from ..evidence import load_example, save_example
+from ..tape import once
 
 
-def fetch(request: dict, run_context: dict, *, case: str = "default") -> dict:
-    """Fetch data using this brick's saved, fresh, or save mode."""
-    mode = run_context["mode"]
-    if mode == "saved":
-        example = load_example("example_source", case, request)
-        if "error" in example:
-            raise RuntimeError(f"saved adapter error: {example['error']}")
-        return example["response"]
-
-    try:
-        response = _fetch_live(request)
-    except Exception as exc:
-        if mode == "save":
-            save_example(
-                "example_source",
-                case,
-                run_context["run_id"],
-                request,
-                error={"type": type(exc).__name__},
-                max_bytes=run_context["config"]["limits"]["max_evidence_bytes"],
-            )
-        raise
-
-    if mode == "save":
-        save_example(
-            "example_source",
-            case,
-            run_context["run_id"],
-            request,
-            response=response,
-            max_bytes=run_context["config"]["limits"]["max_evidence_bytes"],
-        )
+def fetch(request: dict, run_context: dict, *, take: str = "default") -> dict:
+    """Fetch data on this port's tape: replayed by default, fresh or recorded when the run asks."""
+    response, _ = once(run_context, "example_source", take, request, lambda: _call(request))
     return response
 
 
-def _fetch_live(request: dict) -> dict:
-    """Replace with the real external call."""
+def _call(request: dict) -> dict:
+    """Replace with the real call to the outside source."""
     raise NotImplementedError

@@ -3,13 +3,9 @@
 from typing import TypedDict
 
 
+# The interface version: bump it when BrickInput or BrickOutput changes meaning.
+# Joints in other bricks pin the version they were written against.
 CONTRACT_VERSION = 1
-
-# The enforcement class this brick declares for itself: "strict" (the regular
-# brick), "pure" (output is a function of input alone), or "workflow" (invoked
-# as a whole, never depended on). A lane only adds rules. Omitting it means
-# "strict".
-LANE = "strict"
 
 # Meaning: the same input and the same adapter answers give the same output.
 # What an adapter returns (a game state, a model answer) is an input to src/, so a
@@ -20,21 +16,29 @@ LANE = "strict"
 # comment. Omit it and the brick makes no promise and gets no check.
 DETERMINISTIC = True
 
-# True when this brick is a Live Adapter: it drives a live source over a session,
-# records it through Transcript or through(), and replays by default. Only such a
-# brick may receive a workflow's mode (strict lane; see README, Live Adapters).
-LIVE_ADAPTER = False
-
-# A workflow only: the Live Adapter siblings it passes its mode to. Each must be an
-# orchestrated dependency that declares LIVE_ADAPTER = True, and the adapter must
-# take the flags from pass_mode(). Everything else a workflow calls replays.
-MODE_PASSING: tuple[str, ...] = ()
-
-# Map sibling brick names to "eventual" or "orchestrated".
-SIBLING_DEPENDENCIES: dict[str, str] = {}
+# Every crossing of the brick boundary, declared once and implemented by one file
+# of the same name under input/adapters/. Nothing else says what kind of brick this
+# is: the tools compute its shape from these ports and its files. No ports (PORTS = {},
+# no input/adapters/ or input/tapes/) is a sealed brick; a __main__.py makes an entry
+# brick; everything else is open.
+#
+# A source port reaches an outside system.
+#   epoch      bumped when the adapter's request or response meaning changes; takes
+#              recorded at another epoch are stale
+#   label      optional: what the source is (a version, a build, a protocol), merged
+#              into every take's request and checked on connect; a session needs one
+#   followable optional: a caller may ask this source to go fresh
+# A joint port reaches a sibling brick. It is named for the sibling.
+#   policy     "eventual" or "orchestrated"
+#   pin        the sibling's CONTRACT_VERSION this brick was written against
+#   follow     optional, orchestrated only: the sibling's followable sources that this
+#              brick's fresh and record reach
+PORTS: dict[str, dict] = {
+    "example_source": {"kind": "source", "epoch": 1},
+}
 
 # Stable identifiers for application state owned exclusively by this brick.
-# Brick-local evidence under input/data and runner/runs is owned implicitly.
+# Brick-local takes under input/tapes and entries under runner/ledger are owned implicitly.
 OWNED_STATE: tuple[str, ...] = ()
 
 
