@@ -59,6 +59,9 @@ PURE_STDLIB = {
     "ipaddress", "itertools", "json", "keyword", "math", "numbers", "operator", "pprint", "re", "reprlib",
     "shlex", "statistics", "string", "struct", "textwrap", "types", "typing", "unicodedata", "warnings", "zlib",
 }
+# A BrickInput field with one of these names selects an operation: the split signal.
+DISPATCH_FIELDS = {"op", "flow", "action", "operation", "kind"}
+OPTIONAL_FIELD_LIMIT = 6
 # Names a run context goes by in src/ and adapters.
 CONTEXT_NAMES = {"ctx", "context", "run_context"}
 # An environment variable that switches behavior is a mode the run does not record.
@@ -252,6 +255,28 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
             lint.add(path, f"{class_name} must be declared as a TypedDict")
+    declaration = classes.get("BrickInput")
+    if declaration:
+        fields = [m.target.id for m in declaration.body if isinstance(m, ast.AnnAssign) and isinstance(m.target, ast.Name)]
+        for field_name in fields:
+            if field_name in DISPATCH_FIELDS:
+                lint.add(
+                    path,
+                    f"BrickInput.{field_name} selects an operation; one run is one operation, so split the "
+                    "brick (bricks/AGENTS.md: split when run becomes a dispatcher)",
+                    warning=True,
+                )
+        optional = any(
+            keyword.arg == "total" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+            for keyword in declaration.keywords
+        )
+        if optional and len(fields) > OPTIONAL_FIELD_LIMIT:
+            lint.add(
+                path,
+                f"BrickInput has {len(fields)} fields and all are optional, so the type promises almost nothing; "
+                "make the required fields required, or split the brick",
+                warning=True,
+            )
     for class_name in ("BrickInput", "BrickOutput"):
         declaration = classes.get(class_name)
         for member in declaration.body if declaration else ():

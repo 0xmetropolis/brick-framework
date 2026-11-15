@@ -39,6 +39,8 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 - Do not import another brick's `src/`, `runner/`, configuration, or saved data.
 - Do not package bricks for, or expose them to, consumers outside this repository.
 
+A `BrickInput` field named `op`, `flow`, `action`, `operation` or `kind` is the split signal: one run is one operation, so each value becomes its own brick (a pure brick included). The linter warns on such a field, and on a `total=False` input with more than six fields.
+
 A `pure` brick has no adapters, so it omits `input/adapters/`; every other lane requires the folder.
 
 ## Adding a brick

@@ -148,6 +148,45 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
+class DispatcherTests(Fixture):
+    def input_class(self, brick: Path, header: str, fields: list[str]) -> None:
+        path = brick / "contract.py"
+        text = path.read_text(encoding="utf-8")
+        body = "".join(f"    {name}: str\n" for name in fields) or '    """x"""\n'
+        text = text.replace('class BrickInput(TypedDict):\n    """Input accepted by run(). Replace with domain fields."""\n', f"{header}\n{body}")
+        path.write_text(text, encoding="utf-8")
+
+    def test_dispatcher_field_warns(self) -> None:
+        for name in ("op", "flow", "action", "operation", "kind"):
+            with self.subTest(name=name):
+                brick = self.brick(f"b_{name}")
+                self.input_class(brick, "class BrickInput(TypedDict):", [name])
+        warnings = [w for w in self.warnings() if "selects an operation" in w]
+        self.assertEqual(len(warnings), 5)
+        self.assertEqual(self.errors(), [])
+
+    def test_pure_brick_is_held_to_it_too(self) -> None:
+        brick = self.pure_brick()
+        self.input_class(brick, "class BrickInput(TypedDict, total=False):", ["op", "text"])
+        self.assertTrue(any("BrickInput.op selects an operation" in w for w in self.warnings()))
+
+    def test_many_optional_fields_warn(self) -> None:
+        brick = self.brick()
+        self.input_class(brick, "class BrickInput(TypedDict, total=False):", [f"f{i}" for i in range(7)])
+        self.assertTrue(any("7 fields and all are optional" in w for w in self.warnings()))
+
+    def test_six_optional_fields_or_many_required_ones_do_not(self) -> None:
+        brick = self.brick("six")
+        self.input_class(brick, "class BrickInput(TypedDict, total=False):", [f"f{i}" for i in range(6)])
+        brick = self.brick("many")
+        self.input_class(brick, "class BrickInput(TypedDict):", [f"g{i}" for i in range(9)])
+        self.assertClean()
+
+    def test_template_input_is_clean(self) -> None:
+        self.brick()
+        self.assertClean()
+
+
 class ModeBlindFunctionTests(Fixture):
     ADAPTER = (
         "from pathlib import Path\nfrom ..evidence import load_example\n\n\n"
