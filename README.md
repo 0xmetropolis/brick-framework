@@ -161,13 +161,23 @@ Check brick shape, import direction, public exports, ports, takes and limits wit
 python3 tools/lint_bricks.py
 ```
 
-Render the declared ports as Mermaid with:
+### The diagram
+
+Draw any brick project, its own or yours, with one command:
 
 ```sh
-python3 tools/graph_bricks.py
+python3 tools/graph_bricks.py --root <project> [--format mermaid|dot] [--output FILE]
 ```
 
-Bricks are boxes, source ports are cylinders labelled with their epoch, and an arrow is a joint: solid for `orchestrated`, dashed for `eventual`, thick when it follows sources. An entry or sealed brick says so in its label; each node lists the state its brick owns and says `nondeterministic` when the brick declares `DETERMINISTIC = False`. Bricks that no sibling depends on are drawn with a thicker border; those are the top-level flows that may carry smoke tests.
+It prints Mermaid (which GitHub renders in a Markdown file) by default, or Graphviz DOT with `--format dot`. It reads only each brick's `contract.py` (parsed, never imported or run) and the names of its files: no execution, no network, no timestamp, no path of this machine. Bricks, ports and edges are sorted, so **the same project always gives the same bytes**; a test runs the tool repeatedly over a multi-brick project and fails on any byte difference.
+
+- Every brick is a box labelled with its computed shape: `sealed`, `entry` or `open`, followed by the state it owns and `nondeterministic` when it declares `DETERMINISTIC = False`.
+- Every source port is a cylinder with its epoch, its label (as sorted `key=value` pairs) and `followable` when it is.
+- A joint is an arrow to the sibling labelled with its policy and pin: solid for `orchestrated`, dashed for `eventual`.
+- A follow is a thick arrow from the brick to each source its joint follows.
+- Bricks that no sibling depends on get a thicker border: those are the top-level flows. A joint to a brick that does not exist is drawn as a dashed `missing` box.
+
+Names and labels are escaped for Mermaid, and ids are prefixed and cleaned, so a brick called `end` or `a-b.c` cannot break the diagram.
 
 `tools/brick_contract.py` reads a brick's `contract.py` without importing it and computes its shape; repo-local checks should use `contract_value(brick, "NAME")`, `brick_ports(brick)` and `brick_shape(brick)` rather than a regular expression. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
 
