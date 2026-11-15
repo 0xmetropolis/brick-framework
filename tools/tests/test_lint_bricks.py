@@ -62,6 +62,8 @@ class Fixture(unittest.TestCase):
         if name not in brick_contract.brick_ports(brick):
             if kind == "joint":
                 fields = {"policy": "eventual", "pin": 1, **fields}
+            else:
+                fields = {"epoch": 1, **fields}
             self.declare(brick, name, kind, **fields)
 
     def joint(self, brick: Path, name: str, policy: str = "eventual", pin: int = 1) -> None:
@@ -73,10 +75,10 @@ class Fixture(unittest.TestCase):
         )
 
     def pure_brick(self, name: str = "example_brick") -> Path:
-        """The template with its one adapter and the evidence loader removed."""
+        """The template with its one adapter and the tape loader removed."""
         brick = self.brick(name)
         (brick / "input/adapters/example_source.py").unlink()
-        (brick / "input/evidence.py").unlink()
+        (brick / "input/tape.py").unlink()
         self.contract(brick, LANE='"pure"', PORTS="{}")
         return brick
 
@@ -142,23 +144,23 @@ class LaneTests(Fixture):
 
 
 class ModeReadTests(Fixture):
-    def test_src_reading_the_mode_warns_and_does_not_fail(self) -> None:
+    def test_src_reading_the_plan_warns_and_does_not_fail(self) -> None:
         brick = self.brick()
         (brick / "src/logic.py").write_text(
-            "def decide(ctx):\n    return ctx['mode'] == 'saved' or ctx.get('mode')\n", encoding="utf-8"
+            "def decide(ctx):\n    return ctx['plan'] == () or ctx.get('plan')\n", encoding="utf-8"
         )
-        warnings = [item for item in self.warnings() if "src/logic.py: src reads the run mode" in item]
+        warnings = [item for item in self.warnings() if "src/logic.py: src reads the run plan" in item]
         self.assertEqual(len(warnings), 2)
         self.assertEqual(self.errors(), [])
 
-    def test_adapter_reading_the_mode_is_its_job(self) -> None:
+    def test_adapter_reading_the_plan_is_its_job(self) -> None:
         self.brick()
         self.assertClean()
 
-    def test_src_reading_a_mode_field_of_its_input_does_not_warn(self) -> None:
+    def test_src_reading_a_plan_field_of_its_input_does_not_warn(self) -> None:
         brick = self.brick()
         (brick / "src/logic.py").write_text(
-            "def decide(inputs, ctx):\n    return inputs['mode'], ctx['config'], ctx['run_id']\n",
+            "def decide(inputs, ctx):\n    return inputs['plan'], ctx['config'], ctx['run_id']\n",
             encoding="utf-8",
         )
         self.assertClean()
@@ -167,31 +169,130 @@ class ModeReadTests(Fixture):
 SIBLING_ADAPTER = (
     "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request)\n"
 )
-ADAPTER_WITH_SAVED_MODE = (
-    "from ..evidence import load_example\n\n\n"
-    "def fetch(request, ctx):\n{body}    return load_example('feed', 'default', request)['response']\n"
+ADAPTER_WITH_REPLAY = (
+    "from ..tape import load\n\n\n"
+    "def fetch(request, ctx):\n{body}    return load('feed', 'default', request)['response']\n"
 )
 
 
 
 
-class FingerprintLintTests(Fixture):
-    def test_a_transcript_without_a_fingerprint_warns(self) -> None:
+SESSION_ADAPTER = (
+    "from ..tape import session\n\n\ndef open_session(ctx):\n    return session(ctx, 'game', 'year')\n"
+)
+
+
+class LabelLintTests(Fixture):
+    def test_a_session_on_a_source_with_no_label_warns(self) -> None:
         brick = self.brick()
-        self.adapter(brick, "game", "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c')\n")
-        self.assertTrue(any("game.py: Transcript is created without fingerprint=" in w for w in self.warnings()))
+        self.adapter(brick, "game", SESSION_ADAPTER, epoch=1)
+        self.assertTrue(any("game.py opens a session but source 'game' has no label in PORTS" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
 
-    def test_a_transcript_with_one_is_clean(self) -> None:
+    def test_a_session_on_a_labelled_source_is_clean(self) -> None:
         brick = self.brick()
-        self.adapter(brick, "game", "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n")
+        self.adapter(brick, "game", SESSION_ADAPTER, epoch=1, label={"version": "1"})
         self.assertClean()
+
+    def test_a_label_must_be_a_non_empty_dict(self) -> None:
+        brick = self.brick()
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": {}}}')
+        self.assertError("source 'example_source' label must be a non-empty dict")
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": "v2"}}')
+        self.assertError("source 'example_source' label must be a non-empty dict")
+
+    def test_a_source_needs_an_epoch(self) -> None:
+        self.contract(self.brick(), PORTS='{"example_source": {"kind": "source"}}')
+        self.assertError("source 'example_source' needs epoch")
+        self.contract(self.brick("b"), PORTS='{"example_source": {"kind": "source", "epoch": 0}}')
+        self.assertError("bricks/b/contract.py: source 'example_source' needs epoch")
+
+    def test_followable_must_be_a_bool(self) -> None:
+        self.contract(self.brick(), PORTS='{"example_source": {"kind": "source", "epoch": 1, "followable": "yes"}}')
+        self.assertError("source 'example_source' followable must be True or False")
+
+
+class FollowLintTests(Fixture):
+    FOLLOWING = (
+        "from bricks.game import run\nfrom ..tape import follow\n\n\n"
+        "def step(ctx, request):\n    flags = follow(ctx, 'game')\n"
+        "    return run(request, fresh=flags['fresh'], record=flags['record'])\n"
+    )
+
+    def pair(self, *, adapter: str | None = None, policy: str = "orchestrated", followable: bool = True, follows: tuple = ("feed",)) -> tuple[Path, Path]:
+        game = self.brick("game")
+        self.adapter(game, "feed", ADAPTER_WITH_REPLAY.format(body=""), epoch=1, followable=followable)
+        flow = self.brick("flow")
+        self.adapter(flow, "game", adapter or self.FOLLOWING, "joint", policy=policy, pin=1, **({"follow": follows} if follows else {}))
+        return flow, game
+
+    def test_a_declared_helper_fed_call_lints_clean(self) -> None:
+        self.pair()
+        self.assertClean()
+
+    def test_the_helper_can_be_called_inline(self) -> None:
+        self.pair(adapter=self.FOLLOWING.replace("    flags = follow(ctx, 'game')\n", "").replace("flags['fresh']", "follow(ctx, 'game')['fresh']").replace("flags['record']", "follow(ctx, 'game')['record']"))
+        self.assertClean()
+
+    def test_a_hard_coded_flag_is_an_error(self) -> None:
+        self.pair(adapter=self.FOLLOWING.replace("fresh=flags['fresh']", "fresh=True"))
+        self.assertError("fresh= for 'game' must be follow(ctx, 'game')['fresh'], not a value written here")
+
+    def test_expanded_keyword_arguments_are_an_error(self) -> None:
+        self.pair(adapter=self.FOLLOWING.replace("fresh=flags['fresh'], record=flags['record']", "**flags"))
+        self.assertError("may not receive expanded keyword arguments")
+        self.assertError("must give both fresh and record")
+
+    def test_giving_only_one_flag_is_an_error(self) -> None:
+        self.pair(adapter=self.FOLLOWING.replace(", record=flags['record']", ""))
+        self.assertError("following 'game' must give both fresh and record")
+
+    def test_flags_made_for_another_joint_are_an_error(self) -> None:
+        self.pair(adapter=self.FOLLOWING.replace("follow(ctx, 'game')", "follow(ctx, 'other')"))
+        self.assertError("follow for 'other', which has no follow list in PORTS")
+        self.assertError("fresh= for 'game' must be follow(ctx, 'game')['fresh']")
+
+    def test_following_a_source_that_is_not_followable_is_an_error(self) -> None:
+        self.pair(followable=False)
+        self.assertError("joint 'game' follows 'feed', which is not a followable source of 'game'")
+
+    def test_following_an_unknown_source_is_an_error(self) -> None:
+        self.pair(follows=("nothing",))
+        self.assertError("joint 'game' follows 'nothing', which is not a followable source of 'game'")
+
+    def test_follow_needs_an_orchestrated_joint(self) -> None:
+        self.pair(policy="eventual")
+        self.assertError("joint 'game' follows sources, so its policy must be 'orchestrated'")
+
+    def test_follow_must_list_names(self) -> None:
+        flow = self.brick("flow")
+        self.brick("game")
+        self.adapter(flow, "game", SIBLING_ADAPTER.replace("other", "game"), "joint", policy="orchestrated", pin=1, follow=())
+        self.assertError("joint 'game' follow must list the sibling's followable source names")
+
+    def test_a_joint_with_no_follow_gives_the_sibling_no_flags(self) -> None:
+        self.pair(follows=())
+        self.assertError("a sibling run may not receive fresh or record unless its joint lists follow in PORTS")
+
+    def test_an_ordinary_sibling_still_gets_no_flags(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(
+            brick, "other",
+            "from bricks.other import run\n\n\ndef f(request):\n    return run(request, fresh=True)\n",
+            "joint", policy="eventual", pin=1,
+        )
+        self.assertError("a sibling run may not receive fresh or record unless its joint lists follow")
+
+    def test_the_old_save_flag_is_never_accepted(self) -> None:
+        self.pair(adapter=self.FOLLOWING.replace("record=flags['record']", "save=flags['record']"))
+        self.assertError("must give both fresh and record")
 
 
 class PortTests(Fixture):
     def test_the_template_declares_its_one_source_port(self) -> None:
         brick = self.brick()
-        self.assertEqual(brick_contract.brick_ports(brick), {"example_source": {"kind": "source"}})
+        self.assertEqual(brick_contract.brick_ports(brick), {"example_source": {"kind": "source", "epoch": 1}})
         self.assertClean()
 
     def test_ports_must_be_declared(self) -> None:
@@ -207,20 +308,20 @@ class PortTests(Fixture):
 
     def test_a_port_needs_a_valid_kind_and_name(self) -> None:
         brick = self.brick()
-        self.contract(brick, PORTS='{"Bad-Name": {"kind": "source"}, "other": {"kind": "door"}, "third": 3}')
+        self.contract(brick, PORTS='{"Bad-Name": {"kind": "source", "epoch": 1}, "other": {"kind": "door"}, "third": 3}')
         self.assertError("port name 'Bad-Name' must be lowercase letters")
         self.assertError("port 'other' needs kind 'source' or 'joint'")
         self.assertError("port 'third' needs kind 'source' or 'joint'")
 
     def test_a_port_takes_only_its_own_fields(self) -> None:
         brick = self.brick()
-        self.contract(brick, PORTS='{"example_source": {"kind": "source", "policy": "eventual"}}')
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "policy": "eventual"}}')
         self.assertError("port 'example_source' has field 'policy', which a source port does not take")
 
     def test_a_joint_needs_a_policy_and_a_pin(self) -> None:
         self.brick("other")
         brick = self.brick()
-        self.contract(brick, PORTS='{"example_source": {"kind": "source"}, "other": {"kind": "joint"}}')
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1}, "other": {"kind": "joint"}}')
         self.assertError("joint 'other' needs policy 'eventual' or 'orchestrated'")
         self.assertError("joint 'other' needs pin")
 
@@ -236,7 +337,7 @@ class PortTests(Fixture):
 
     def test_a_declared_port_needs_its_adapter_file(self) -> None:
         brick = self.brick()
-        self.declare(brick, "feed")
+        self.declare(brick, "feed", epoch=1)
         self.assertError("port 'feed' has no adapter file input/adapters/feed.py")
 
     def test_a_joint_adapter_must_be_named_for_its_joint(self) -> None:
@@ -250,7 +351,7 @@ class PortTests(Fixture):
     def test_an_undeclared_joint_is_an_error(self) -> None:
         self.brick("other")
         brick = self.brick()
-        self.adapter(brick, "other", SIBLING_ADAPTER)
+        self.adapter(brick, "other", SIBLING_ADAPTER, epoch=1)
         self.assertError("joint 'other' is not declared in PORTS")
 
     def test_a_joint_may_not_name_a_missing_brick_or_itself(self) -> None:
@@ -276,7 +377,7 @@ class PortTests(Fixture):
             "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request, fresh=True)\n",
             "joint", policy="eventual", pin=1,
         )
-        self.assertError("a sibling run may not receive fresh or save")
+        self.assertError("a sibling run may not receive fresh or record")
 
     def test_a_declared_joint_with_no_import_warns(self) -> None:
         self.brick("other")
@@ -292,7 +393,7 @@ class PortTests(Fixture):
 
     def test_a_pure_brick_may_not_declare_ports(self) -> None:
         brick = self.pure_brick()
-        self.contract(brick, PORTS='{"feed": {"kind": "source"}}')
+        self.contract(brick, PORTS='{"feed": {"kind": "source", "epoch": 1}}')
         self.assertError("pure brick may not declare ports")
 
 
@@ -337,9 +438,9 @@ class DispatcherTests(Fixture):
 
 class ModeBlindFunctionTests(Fixture):
     ADAPTER = (
-        "from pathlib import Path\nfrom ..evidence import load_example\n\n\n"
+        "from pathlib import Path\nfrom ..tape import load\n\n\n"
         "def exists(template_dir, seed):\n    return (Path(template_dir) / f'seed-{seed}.save').is_file()\n\n\n"
-        "def store(ctx, template_dir, seed):\n    return load_example('t', 'c', {})\n\n\n"
+        "def store(ctx, template_dir, seed):\n    return load('template_files', 'c', {})\n\n\n"
         "def stats(pid):\n    return Path(f'/proc/{pid}').exists()\n"
     )
 
@@ -437,7 +538,7 @@ class IoBanTests(Fixture):
 
     def test_importlib_in_an_adapter_is_a_hidden_dependency(self) -> None:
         brick = self.brick()
-        self.adapter(brick, "dyn", "import importlib\nfrom ..evidence import load_example\n\n\ndef f(ctx):\n    load_example('a', 'b', {})\n    return importlib.import_module('bricks.other')\n",
+        self.adapter(brick, "dyn", "import importlib\nfrom ..tape import load\n\n\ndef f(ctx):\n    load('dyn', 'b', {})\n    return importlib.import_module('bricks.other')\n",
             encoding="utf-8",
         )
         self.assertError("dyn.py: dynamic imports hide brick boundaries")
@@ -487,8 +588,8 @@ class AdapterExperienceTests(Fixture):
         brick = self.brick()
         self.adapter(
             brick, "feed",
-            ADAPTER_WITH_SAVED_MODE.format(body="    if os.environ.get('FEED_REPLAY'):\n        pass\n")
-            .replace("from ..evidence", "import os\nfrom ..evidence"),
+            ADAPTER_WITH_REPLAY.format(body="    if os.environ.get('FEED_REPLAY'):\n        pass\n")
+            .replace("from ..tape", "import os\nfrom ..tape"),
         )
         self.assertTrue(any("environment variable 'FEED_REPLAY'" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
@@ -497,9 +598,9 @@ class AdapterExperienceTests(Fixture):
         brick = self.brick()
         self.adapter(
             brick, "feed",
-            "import os\nfrom ..evidence import load_example\n\n\ndef fetch(request, ctx):\n"
+            "import os\nfrom ..tape import load\n\n\ndef fetch(request, ctx):\n"
             "    a = os.getenv('FEED_LIVE')\n    b = os.environ['FEED_OFFLINE']\n"
-            "    return load_example('feed', 'default', request)\n",
+            "    return load('feed', 'default', request)\n",
         )
         hits = [w for w in self.warnings() if "environment variable" in w]
         self.assertEqual(len(hits), 2)
@@ -508,34 +609,39 @@ class AdapterExperienceTests(Fixture):
         brick = self.brick()
         self.adapter(
             brick, "feed",
-            "import os\nfrom ..evidence import load_example\n\n\ndef fetch(request, ctx):\n"
+            "import os\nfrom ..tape import load\n\n\ndef fetch(request, ctx):\n"
             "    token = os.environ.get('FEED_TOKEN')\n    root = os.getenv('FEED_ROOT')\n"
-            "    return load_example('feed', 'default', request)\n",
+            "    return load('feed', 'default', request)\n",
         )
         self.assertTrue(all("environment variable" not in w for w in self.warnings()))
 
     def test_adapter_with_no_saved_mode_warns(self) -> None:
         brick = self.brick()
         self.adapter(brick, "tool", "import subprocess\n\n\ndef encode(request, ctx):\n    return {}\n")
-        self.assertTrue(any("tool.py: adapter never calls load_example" in w for w in self.warnings()))
+        self.assertTrue(any("tool.py: adapter for source 'tool' never plays a tape" in w for w in self.warnings()))
 
-    def test_through_and_transcript_count_as_a_saved_mode(self) -> None:
+    def test_once_and_session_count_as_a_replay(self) -> None:
         brick = self.brick()
-        self.adapter(brick, "a", "from ..evidence import through\n\n\ndef f(ctx):\n    return through(ctx, 'a', 'c', {}, dict)\n")
-        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c', fingerprint={'v': 1})\n")
-        self.assertTrue(all("never calls" not in w for w in self.warnings()))
+        self.adapter(brick, "a", "from ..tape import once\n\n\ndef f(ctx):\n    return once(ctx, 'a', 'c', {}, dict)\n")
+        self.adapter(brick, "b", "from ..tape import session\n\n\ndef f(ctx):\n    return session(ctx, 'b', 'c')\n", label={"v": 1})
+        self.assertTrue(all("never plays a tape" not in w for w in self.warnings()))
+
+    def test_an_adapter_may_only_use_the_tape_of_its_own_port(self) -> None:
+        brick = self.brick()
+        self.adapter(brick, "a", "from ..tape import once\n\n\ndef f(ctx):\n    return once(ctx, 'b', 'c', {}, dict)\n")
+        self.assertError("adapter a.py uses the tape of source 'b'; one adapter file implements one port, so use 'a'")
 
     def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
         self.brick("other")
         self.joint(self.brick(), "other")
-        self.assertTrue(all("never calls load_example" not in w for w in self.warnings()))
+        self.assertTrue(all("never plays a tape" not in w for w in self.warnings()))
 
-    def test_src_overriding_the_mode_warns(self) -> None:
+    def test_src_overriding_the_plan_warns(self) -> None:
         brick = self.brick()
         (brick / "src/logic.py").write_text(
-            "def second(ctx):\n    return dict(ctx, mode='fresh')\n", encoding="utf-8"
+            "def second(ctx):\n    return dict(ctx, plan={'fresh': ('x',)})\n", encoding="utf-8"
         )
-        self.assertTrue(any("src overrides the run mode" in w for w in self.warnings()))
+        self.assertTrue(any("src overrides the run plan" in w for w in self.warnings()))
 
     def test_in_memory_open_is_allowed_in_src(self) -> None:
         brick = self.brick()
@@ -559,41 +665,114 @@ class AdapterExperienceTests(Fixture):
         self.assertEqual(len(hits), 4)
 
 
-class EvidenceSizeTests(Fixture):
-    def evidence(self, brick: Path, case: str, padding: int) -> Path:
+class TakeLintTests(Fixture):
+    def take(self, brick: Path, name: str, padding: int = 10, source: str = "example_source", **changes: object) -> Path:
         import json
 
         record = {
-            "adapter": "feed", "capture_run_id": "r1", "case": case, "contract_version": 1,
-            "request": {}, "response": {"pad": "x" * padding}, "schema_version": 1,
+            "epoch": 1, "recorded_in": "r1", "request": {}, "response": {"pad": "x" * padding},
+            "schema_version": 2, "source": source, "take": name,
         }
-        folder = brick / "input/data/feed"
+        record.update(changes)
+        folder = brick / "input/tapes" / source
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{case}.json"
+        path = folder / f"{name}.json"
         path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return path
 
-    def test_evidence_near_the_limit_warns(self) -> None:
+    def test_a_take_near_the_limit_warns(self) -> None:
         brick = self.brick()
-        self.evidence(brick, "big", 105_000)
-        self.assertTrue(any("big.json: evidence is 8" in w and "% of max_evidence_bytes" in w for w in self.warnings()))
+        self.take(brick, "big", 105_000)
+        self.assertTrue(any("big.json: take is 8" in w and "% of max_take_bytes" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
 
-    def test_small_evidence_is_quiet(self) -> None:
-        brick = self.brick()
-        self.evidence(brick, "small", 1_000)
+    def test_a_small_take_is_quiet(self) -> None:
+        self.take(self.brick(), "small", 1_000)
         self.assertClean()
 
-    def test_evidence_over_the_limit_is_an_error_with_a_hint(self) -> None:
-        brick = self.brick()
-        self.evidence(brick, "huge", 130_000)
-        self.assertError("evidence exceeds max_evidence_bytes; store a projection or split it into cases")
+    def test_a_take_over_the_limit_is_an_error_with_a_hint(self) -> None:
+        self.take(self.brick(), "huge", 130_000)
+        self.assertError("take exceeds max_take_bytes; store a projection or split the session into more takes")
 
-    def test_too_many_cases_says_it_is_a_deliberate_choice(self) -> None:
+    def test_too_many_takes_says_it_is_a_deliberate_choice(self) -> None:
         brick = self.brick()
         for index in range(4):
-            self.evidence(brick, f"w{index}", 10)
-        self.assertError("raise retention.saved_examples_per_adapter in config.yml deliberately")
+            self.take(brick, f"w{index}")
+        self.assertError("raise retention.takes_per_tape in config.yml deliberately")
+
+    def test_a_take_needs_its_fields_and_a_matching_path(self) -> None:
+        brick = self.brick()
+        path = self.take(brick, "w0")
+        import json
+
+        record = json.loads(path.read_text(encoding="utf-8"))
+        del record["recorded_in"]
+        record["take"] = "other"
+        path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.assertError("take is missing required fields")
+        self.assertError("source and take must match the path")
+
+    def test_a_take_needs_a_response_or_an_error(self) -> None:
+        brick = self.brick()
+        self.take(brick, "both", error={"type": "X"})
+        self.assertError("a take needs exactly one of response or error")
+
+    def test_a_take_must_be_canonical_and_free_of_secrets(self) -> None:
+        brick = self.brick()
+        path = self.take(brick, "w0", request={"token": "abc"})
+        self.assertError("sensitive field 'token' is not redacted")
+        path.write_text(path.read_text(encoding="utf-8").replace('  "', ' "', 1), encoding="utf-8")
+        self.assertError("take JSON is not canonical")
+
+    def test_a_take_path_must_be_source_slash_take(self) -> None:
+        brick = self.brick()
+        (brick / "input/tapes/loose.json").write_text("{}\n", encoding="utf-8")
+        self.assertError("a take path must be <source>/<take>.json")
+
+    def test_a_tape_folder_with_no_source_port_is_an_error(self) -> None:
+        brick = self.brick()
+        self.take(brick, "w0", source="ghost")
+        self.assertError("tape folder 'ghost' has no source port in PORTS")
+
+    def test_a_take_at_another_epoch_is_stale_without_running_anything(self) -> None:
+        brick = self.brick()
+        self.take(brick, "w0", epoch=1)
+        self.assertClean()
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 2}}')
+        self.assertError("take recorded at epoch 1, port 'example_source' is at epoch 2; re-record it")
+
+    def test_a_take_with_another_label_is_stale_and_names_the_field(self) -> None:
+        brick = self.brick()
+        self.take(brick, "w0", request={"label": {"api": "v2"}, "q": 1})
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": {"api": "v3"}}}')
+        self.assertError("take label differs from port 'example_source' (api: recorded \"v2\", port \"v3\"); re-record it")
+
+    def test_a_matching_label_is_clean_and_a_label_the_port_lacks_is_not(self) -> None:
+        brick = self.brick()
+        self.take(brick, "w0", request={"label": {"api": "v2"}})
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": {"api": "v2"}}}')
+        self.assertClean()
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1}}')
+        self.assertError("take label differs from port 'example_source' (api: recorded \"v2\", port \"nothing\")")
+
+    def test_an_unlabelled_take_under_a_labelled_port_is_stale(self) -> None:
+        brick = self.brick()
+        self.take(brick, "w0")
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": {"api": "v2"}}}')
+        self.assertError("take label differs from port 'example_source' (api: recorded \"nothing\", port \"v2\")")
+
+    def test_the_old_take_format_and_paths_point_at_the_converter(self) -> None:
+        brick = self.brick()
+        old = brick / "input/data/example_source"
+        old.mkdir(parents=True)
+        (old / "default.json").write_text('{"schema_version": 1}\n', encoding="utf-8")
+        self.assertError("input/data: old path of the previous format; run python3 tools/convert_ports.py once")
+        (brick / "input/evidence.py").write_text("x = 1\n", encoding="utf-8")
+        self.assertError("input/evidence.py: old path of the previous format")
+        schema_one = brick / "input/tapes/example_source"
+        schema_one.mkdir(parents=True, exist_ok=True)
+        (schema_one / "default.json").write_text('{"schema_version": 1}\n', encoding="utf-8")
+        self.assertError("take is not in schema 2 (the old format?); run python3 tools/convert_ports.py once")
 
 
 class RunRecordTests(Fixture):
@@ -699,17 +878,21 @@ class PureLaneTests(Fixture):
         shutil.rmtree(brick / "input/adapters")
         self.assertClean()
 
-    def test_strict_brick_still_needs_adapters_folder(self) -> None:
-        brick = self.pure_brick()
-        self.contract(brick, LANE='"strict"')
+    def test_a_brick_with_ports_needs_the_adapters_and_tapes_folders(self) -> None:
+        brick = self.brick()
         shutil.rmtree(brick / "input/adapters")
+        shutil.rmtree(brick / "input/tapes")
         self.assertError("input/adapters: required brick path is missing")
+        self.assertError("input/tapes: required brick path is missing")
 
-    def test_workflow_brick_still_needs_adapters_folder(self) -> None:
-        brick = self.pure_brick()
-        self.contract(brick, LANE='"workflow"')
-        shutil.rmtree(brick / "input/adapters")
-        self.assertError("input/adapters: required brick path is missing")
+    def test_a_brick_with_only_joints_needs_no_tapes_folder(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        (brick / "input/adapters/example_source.py").unlink()
+        self.contract(brick, PORTS="{}")
+        self.joint(brick, "other")
+        shutil.rmtree(brick / "input/tapes")
+        self.assertClean()
 
     def test_pure_brick_without_the_folder_still_may_not_gain_adapters(self) -> None:
         brick = self.pure_brick()
@@ -718,15 +901,15 @@ class PureLaneTests(Fixture):
         self.assertError("pure brick may not have adapters")
 
     def test_template_is_not_pure(self) -> None:
-        # The template ships one adapter and a filesystem evidence loader:
+        # The template ships one adapter and a filesystem tape loader:
         # both are exactly what a pure brick gives up.
         self.contract(self.brick(), LANE='"pure"')
         self.assertError("pure brick may not have adapters")
-        self.assertError("input/evidence.py: pure brick imports 'pathlib' outside runner/")
+        self.assertError("input/tape.py: pure brick imports 'pathlib' outside runner/")
 
-    def test_pure_brick_copied_from_the_template_is_told_to_delete_evidence(self) -> None:
+    def test_pure_brick_copied_from_the_template_is_told_to_delete_the_tape_loader(self) -> None:
         self.contract(self.brick(), LANE='"pure"')
-        self.assertError("a pure brick has no saved evidence, so delete input/evidence.py")
+        self.assertError("a pure brick has no ports, so delete input/tape.py")
 
     def test_pure_brick_may_not_declare_sibling_dependencies(self) -> None:
         self.brick("other")

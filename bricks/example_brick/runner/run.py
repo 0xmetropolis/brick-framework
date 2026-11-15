@@ -1,11 +1,12 @@
 # BOILERPLATE: runner.run@5
 """The brick's repository-internal entry point.
 
-A working runner, copied with the brick like ``input/evidence.py``: it creates
-the run ID, reads ``input/config.yml``, builds the plain run context, calls
-``src``, records the run and prunes old records. Only the two imports from the
-brick tree change per brick (``execute`` and the contract types), which is why
-copies of it stay identical.
+A working runner, copied with the brick like ``input/tape.py``: it creates
+the run ID, reads ``input/config.yml``, turns ``fresh`` and ``record`` into the
+run's plan, builds the plain run context, calls ``src``, closes whatever the run
+left open, records the run and prunes old records. Only the imports from the
+brick tree change per brick (``execute`` and the contract), which is why copies
+of it stay identical.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import re
 import tempfile
 from typing import Any
 
-from ..contract import BrickInput, BrickOutput
+from ..contract import BrickInput, BrickOutput, PORTS
 from ..src.logic import execute
 from .rng import create_run_id
 
@@ -66,35 +67,97 @@ def _scalar(text: str) -> Any:
     return {"true": True, "false": False, "null": None}.get(text, text)
 
 
-def run(inputs: BrickInput, *, fresh: bool = False, save: bool = False) -> BrickOutput:
+def run(inputs: BrickInput, *, fresh: Any = False, record: Any = False) -> BrickOutput:
     """Run the brick and return its output.
 
-    ``fresh`` performs this brick's external calls without changing tracked
-    examples. ``save`` implies fresh and replaces reviewed tracked examples.
-    Neither option is forwarded to sibling bricks. Set ``BRICK_RUN_KIND=test``
-    (smoke tests do) and the record is a local ``*.test.json`` instead of
-    tracked history.
+    ``fresh`` and ``record`` each take False (nothing), True (every source port of
+    this brick), or a collection of port names: one of this brick's sources
+    (``"rates"``), a source reached through a followed joint (``"assistant.xai"``),
+    or ``"*"`` for all of them. ``fresh`` performs those calls against the live
+    source without changing tracked takes; ``record`` implies fresh for the same
+    names and replaces the reviewed takes. Everything not named replays. Neither
+    option reaches a sibling brick except through a joint's declared ``follow``.
+    Set ``BRICK_RUN_KIND=test`` (smoke tests do) and the record is a local
+    ``*.test.json`` instead of tracked history.
     """
+    plan = make_plan(fresh, record)
     run_id = create_run_id()
     config = load_config()
-    mode = "save" if save else "fresh" if fresh else "saved"
-    record: dict[str, Any] = {
+    entry: dict[str, Any] = {
         "run_id": run_id,
         "kind": "test" if os.environ.get(KIND_ENV) == "test" else "run",
-        "mode": mode,
+        "fresh": sorted(name for name in plan["fresh"] if "." not in name),
+        "record": sorted(name for name in plan["record"] if "." not in name),
+        "followed": sorted(name for name in plan["fresh"] if "." in name),
         "input": inputs,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    context: dict[str, Any] = {"run_id": run_id, "mode": mode, "config": config}
+    context: dict[str, Any] = {"run_id": run_id, "plan": plan, "config": config, "closers": []}
+    failed = True
     try:
         output = execute(inputs, context)
+        failed = False
     except Exception as exc:
-        record["error"] = {"type": type(exc).__name__, "message": str(exc)}
-        _record(record, config)
+        entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        _record(entry, config)
         raise
-    record["output"] = output
-    _record(record, config)
+    finally:
+        problems = _close(context, failed)
+    if problems:
+        entry["error"] = {"type": type(problems[0]).__name__, "message": str(problems[0])}
+        _record(entry, config)
+        raise problems[0]
+    entry["output"] = output
+    _record(entry, config)
     return output
+
+
+def make_plan(fresh: Any, record: Any) -> dict[str, tuple[str, ...]]:
+    """Turn the ``fresh`` and ``record`` options into the set of port names each applies to.
+
+    Names are this brick's own source ports, or ``<joint>.<source>`` for a source
+    a joint follows. An unknown name is an error; ``record`` implies ``fresh``.
+    """
+    own = {name for name, port in PORTS.items() if port.get("kind") == "source"}
+    followed = {
+        f"{name}.{source}"
+        for name, port in PORTS.items()
+        if port.get("kind") == "joint"
+        for source in port.get("follow", ())
+    }
+
+    def names(option: Any, label: str) -> set[str]:
+        if option is None or option is False:
+            return set()
+        if option is True:
+            return set(own)
+        if isinstance(option, str):
+            option = [option]
+        picked: set[str] = set()
+        for name in option:
+            if name == "*":
+                picked |= own | followed
+            elif name in own or name in followed:
+                picked.add(name)
+            else:
+                known = ", ".join(sorted(own | followed)) or "none"
+                raise ValueError(f"{label}= names {name!r}, which is not a source port of this brick or one it follows (known: {known})")
+        return picked
+
+    recorded = names(record, "record")
+    went_fresh = names(fresh, "fresh") | recorded
+    return {"fresh": tuple(sorted(went_fresh)), "record": tuple(sorted(recorded))}
+
+
+def _close(context: dict[str, Any], failed: bool) -> list[Exception]:
+    """Close what the run left open, newest first. A failing close never hides another."""
+    problems: list[Exception] = []
+    for closer in reversed(context.get("closers", [])):
+        try:
+            closer(failed)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(exc)
+    return problems
 
 
 def _record(record: dict[str, Any], config: dict[str, Any]) -> None:

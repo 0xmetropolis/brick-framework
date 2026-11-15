@@ -23,17 +23,26 @@ LANE = "strict"
 DETERMINISTIC = True
 
 # Every crossing of the brick boundary, declared once and implemented by one file
-# of the same name under input/adapters/. A source port reaches an outside system. A
-# joint port reaches a sibling brick: it is named for the sibling, carries the
-# consistency policy ("eventual" or "orchestrated"), and pins the sibling's
-# CONTRACT_VERSION this brick was written against. A brick with no ports is sealed:
-# PORTS = {} and no input/adapters/.
+# of the same name under input/adapters/. A brick with no ports is sealed:
+# PORTS = {} and no input/adapters/ or input/tapes/.
+#
+# A source port reaches an outside system.
+#   epoch      bumped when the adapter's request or response meaning changes; takes
+#              recorded at another epoch are stale
+#   label      optional: what the source is (a version, a build, a protocol), merged
+#              into every take's request and checked on connect; a session needs one
+#   followable optional: a caller may ask this source to go fresh
+# A joint port reaches a sibling brick. It is named for the sibling.
+#   policy     "eventual" or "orchestrated"
+#   pin        the sibling's CONTRACT_VERSION this brick was written against
+#   follow     optional, orchestrated only: the sibling's followable sources that this
+#              brick's fresh and record reach
 PORTS: dict[str, dict] = {
-    "example_source": {"kind": "source"},
+    "example_source": {"kind": "source", "epoch": 1},
 }
 
 # Stable identifiers for application state owned exclusively by this brick.
-# Brick-local evidence under input/data and runner/runs is owned implicitly.
+# Brick-local takes under input/tapes and runner/runs are owned implicitly.
 OWNED_STATE: tuple[str, ...] = ()
 
 

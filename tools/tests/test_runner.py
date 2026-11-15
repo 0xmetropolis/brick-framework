@@ -70,21 +70,133 @@ class RunnerTests(unittest.TestCase):
         output = self.module.run({"day": 1})
         self.assertEqual(output["echo"], {"day": 1})
         (record,) = self.records()
-        self.assertEqual((record["kind"], record["mode"], record["input"]), ("run", "saved", {"day": 1}))
+        self.assertEqual(
+            (record["kind"], record["fresh"], record["record"], record["followed"], record["input"]),
+            ("run", [], [], [], {"day": 1}),
+        )
+        self.assertNotIn("mode", record)
         self.assertEqual(record["output"]["echo"], {"day": 1})
         self.assertRegex(record["run_id"], r"^\d{8}-\d{6}-\d{6}-[0-9a-f]{4}$")
 
-    def test_the_context_has_run_id_mode_and_nested_config(self) -> None:
+    def test_the_context_has_run_id_plan_and_nested_config(self) -> None:
         self.module.run({}, fresh=True)
         context = self.logic.CALLS[-1]
-        self.assertEqual(context["mode"], "fresh")
-        self.assertEqual(context["config"]["limits"]["max_evidence_bytes"], 122880)
+        self.assertEqual(context["plan"], {"fresh": ("example_source",), "record": ()})
+        self.assertNotIn("mode", context)
+        self.assertEqual(context["config"]["limits"]["max_take_bytes"], 122880)
         self.assertEqual(context["config"]["retention"]["runs"], 10)
         self.assertEqual(context["config"]["brick"], "example_brick")
 
-    def test_save_implies_fresh_and_is_the_save_mode(self) -> None:
-        self.module.run({}, save=True)
-        self.assertEqual(self.logic.CALLS[-1]["mode"], "save")
+    def test_record_implies_fresh_for_the_same_names(self) -> None:
+        self.module.run({}, record=True)
+        self.assertEqual(self.logic.CALLS[-1]["plan"], {"fresh": ("example_source",), "record": ("example_source",)})
+        (record,) = self.records()
+        self.assertEqual((record["fresh"], record["record"]), (["example_source"], ["example_source"]))
+
+    def test_the_old_save_option_is_gone(self) -> None:
+        with self.assertRaises(TypeError):
+            self.module.run({}, save=True)
+
+    def test_nothing_is_fresh_by_default(self) -> None:
+        self.module.run({})
+        self.assertEqual(self.logic.CALLS[-1]["plan"], {"fresh": (), "record": ()})
+
+    def plan(self, fresh=False, record=False, ports=None):
+        ports = ports if ports is not None else {
+            "rates": {"kind": "source", "epoch": 1},
+            "game": {"kind": "source", "epoch": 1},
+            "model": {"kind": "joint", "policy": "orchestrated", "pin": 1, "follow": ("xai", "tts")},
+            "other": {"kind": "joint", "policy": "eventual", "pin": 1},
+        }
+        with mock.patch.object(self.module, "PORTS", ports):
+            return self.module.make_plan(fresh, record)
+
+    def test_true_means_this_bricks_own_sources_and_never_a_sibling(self) -> None:
+        self.assertEqual(self.plan(fresh=True), {"fresh": ("game", "rates"), "record": ()})
+
+    def test_names_pick_individual_sources(self) -> None:
+        self.assertEqual(self.plan(fresh={"game"}), {"fresh": ("game",), "record": ()})
+        self.assertEqual(self.plan(fresh=["rates"], record="game"), {"fresh": ("game", "rates"), "record": ("game",)})
+
+    def test_a_dotted_name_reaches_a_followed_source(self) -> None:
+        self.assertEqual(self.plan(fresh={"model.xai"}), {"fresh": ("model.xai",), "record": ()})
+        self.assertEqual(self.plan(record={"model.tts"}), {"fresh": ("model.tts",), "record": ("model.tts",)})
+
+    def test_star_means_every_own_source_and_every_followed_one(self) -> None:
+        self.assertEqual(
+            self.plan(fresh={"*"}),
+            {"fresh": ("game", "model.tts", "model.xai", "rates"), "record": ()},
+        )
+
+    def test_an_unknown_or_unfollowed_name_is_an_error_that_lists_what_exists(self) -> None:
+        for name in ("nothing", "model", "other.xai", "model.nothing", "xai"):
+            with self.assertRaises(ValueError) as caught:
+                self.plan(fresh={name})
+            self.assertIn(f"fresh= names {name!r}", str(caught.exception))
+            self.assertIn("known: game, model.tts, model.xai, rates", str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            self.plan(record={"nothing"})
+        self.assertIn("record= names 'nothing'", str(caught.exception))
+
+    def test_a_brick_with_no_sources_has_nothing_to_name(self) -> None:
+        self.assertEqual(self.plan(fresh=True, ports={}), {"fresh": (), "record": ()})
+        with self.assertRaises(ValueError) as caught:
+            self.plan(fresh={"x"}, ports={})
+        self.assertIn("known: none", str(caught.exception))
+
+    def test_followed_names_are_listed_apart_from_own_ones_in_the_record(self) -> None:
+        ports = {"rates": {"kind": "source", "epoch": 1}, "model": {"kind": "joint", "policy": "orchestrated", "pin": 1, "follow": ("xai",)}}
+        with mock.patch.object(self.module, "PORTS", ports):
+            self.module.run({}, fresh={"rates", "model.xai"}, record={"rates"})
+        (record,) = self.records()
+        self.assertEqual((record["fresh"], record["record"], record["followed"]), (["rates"], ["rates"], ["model.xai"]))
+
+    def test_the_run_closes_what_the_context_registered_even_when_it_fails(self) -> None:
+        closed = []
+
+        def execute(inputs, context):
+            context["closers"].append(lambda failed: closed.append(("a", failed)))
+            context["closers"].append(lambda failed: closed.append(("b", failed)))
+            if inputs.get("boom"):
+                raise ValueError("boom")
+            return {}
+
+        self.module.execute = execute
+        self.module.run({})
+        with self.assertRaises(ValueError):
+            self.module.run({"boom": True})
+        self.assertEqual(closed, [("b", False), ("a", False), ("b", True), ("a", True)])
+
+    def test_a_failing_close_is_reported_and_does_not_stop_the_others(self) -> None:
+        closed = []
+
+        def execute(inputs, context):
+            context["closers"].append(lambda failed: closed.append("first"))
+
+            def bad(failed):
+                raise OSError("disk full")
+
+            context["closers"].append(bad)
+            return {}
+
+        self.module.execute = execute
+        with self.assertRaises(OSError):
+            self.module.run({})
+        self.assertEqual(closed, ["first"])
+        (record,) = self.records()
+        self.assertEqual(record["error"], {"type": "OSError", "message": "disk full"})
+
+    def test_a_failure_hides_nothing_when_a_close_fails_too(self) -> None:
+        def execute(inputs, context):
+            def bad(failed):
+                raise OSError("disk full")
+
+            context["closers"].append(bad)
+            raise ValueError("the real one")
+
+        self.module.execute = execute
+        with self.assertRaises(ValueError):
+            self.module.run({})
 
     def test_a_failure_is_recorded_and_raised(self) -> None:
         with self.assertRaises(ValueError):
