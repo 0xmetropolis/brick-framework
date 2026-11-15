@@ -252,6 +252,18 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
             lint.add(path, f"{class_name} must be declared as a TypedDict")
+    for class_name in ("BrickInput", "BrickOutput"):
+        declaration = classes.get(class_name)
+        for member in declaration.body if declaration else ():
+            if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name) and any(
+                isinstance(part, ast.Name) and part.id in {"bytes", "bytearray"} for part in ast.walk(member.annotation)
+            ):
+                lint.add(
+                    path,
+                    f"{class_name}.{member.target.id} holds bytes, but inputs and outputs are recorded as JSON; "
+                    "use a base64 string or a manifest (input/AGENTS.md, Recorded data)",
+                    warning=True,
+                )
     if lane is None:
         lane = "strict"
     elif lane not in LANES:

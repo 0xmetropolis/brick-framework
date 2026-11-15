@@ -20,7 +20,7 @@ This folder owns orchestration, brick-local run identity, run history, and smoke
 - Input evidence captured by an explicit save operation carries the same run ID and can be joined outside the runner.
 - `run` may be called from several threads at once (a workflow's threads calling one sibling). Recording and pruning must tolerate a record another call already removed.
 - Retain only the configured number of recent runs. Prune after recording the new run.
-- Enforce `max_run_record_bytes` before writing a run record.
+- Enforce `max_run_record_bytes` before writing a run record. A value that does not fit is summarized, not dropped: long strings and lists become a size, a digest and a head, bytes become a size and digest, and the record lists what it summarized. Inputs and outputs are JSON values; carry bytes as a base64 string or a manifest.
 - Tracked run records are intentionally in Git (test records are not). A brick called very often by siblings, such as a pure brick, may set `retention.runs: 1` in `config.yml`; calling it once per tick is better avoided. The human or agent operating the repository commits the resulting bounded history changes.
 
 ## Tests

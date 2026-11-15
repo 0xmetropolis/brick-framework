@@ -148,6 +148,24 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
+class ContractBytesTests(Fixture):
+    def test_bytes_in_a_contract_warns(self) -> None:
+        brick = self.brick()
+        path = brick / "contract.py"
+        text = path.read_text(encoding="utf-8")
+        text = text.replace('class BrickInput(TypedDict):\n    """Input accepted by run(). Replace with domain fields."""\n', 'class BrickInput(TypedDict, total=False):\n    frames: dict[str, bytes]\n    one: bytes | None\n')
+        text = text.replace('class BrickOutput(TypedDict):\n    """Output returned by run(). Replace with domain fields."""\n', 'class BrickOutput(TypedDict):\n    files: dict[str, str | bytearray]\n')
+        path.write_text(text, encoding="utf-8")
+        warnings = [w for w in self.warnings() if "holds bytes" in w]
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(any("BrickInput.frames" in w for w in warnings) and any("BrickOutput.files" in w for w in warnings))
+        self.assertEqual(self.errors(), [])
+
+    def test_json_fields_do_not_warn(self) -> None:
+        self.brick()
+        self.assertClean()
+
+
 class IoBanTests(Fixture):
     def src(self, brick: Path, text: str, name: str = "helpers.py") -> None:
         (brick / "src" / name).write_text(text, encoding="utf-8")

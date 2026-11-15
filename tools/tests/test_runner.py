@@ -133,14 +133,50 @@ class RunnerTests(unittest.TestCase):
     def test_the_runs_folder_ignores_test_records(self) -> None:
         self.assertIn("*.test.json", (self.brick / "runner/runs/.gitignore").read_text(encoding="utf-8"))
 
-    def test_an_oversize_record_drops_output_then_input(self) -> None:
-        self.config(max_run_record_bytes=1000)
+    def test_an_oversize_record_keeps_its_shape_and_says_what_it_summarized(self) -> None:
+        self.config(max_run_record_bytes=2000)
         self.module.run({"pad": 5000})
         (record,) = self.records()
-        self.assertIn("omitted_bytes", record["output"])
         self.assertEqual(record["input"], {"pad": 5000})
-        self.module.run({"pad": 1, "more": "y" * 3000})
-        self.assertIn("omitted_bytes", self.records()[-1]["input"])
+        self.assertEqual(record["output"]["big"]["chars"], 5000)
+        self.assertEqual(len(record["output"]["big"]["sha256"]), 16)
+        self.assertEqual(record["output"]["echo"], {"pad": 5000})
+        self.assertEqual(record["summarized"], ["output"])
+        self.assertLessEqual((self.brick / "runner/runs" / f"{record['run_id']}.json").stat().st_size, 2000)
+
+    def test_bytes_are_recorded_as_size_and_digest_not_repr(self) -> None:
+        self.config(max_run_record_bytes=2000)
+        self.module.run({"frames": {"d1.png": b"\x89PNG" * 1000}, "keep": 1})
+        (record,) = self.records()
+        frame = record["input"]["frames"]["d1.png"]
+        self.assertEqual(frame["bytes"], 4000)
+        self.assertEqual(len(frame["sha256"]), 16)
+        self.assertEqual(record["input"]["keep"], 1)
+        self.assertNotIn("PNG", json.dumps(record))
+
+    def test_a_workflow_sized_output_still_names_its_files(self) -> None:
+        self.config(max_run_record_bytes=4000)
+        files = {f"run-1/file-{index}.txt": "line\n" * 20_000 for index in range(17)}
+        with mock.patch.object(self.logic, "execute", lambda inputs, ctx: {"passed": True, "artifacts": files}):
+            self.module.execute = self.logic.execute
+            self.module.run({})
+        (record,) = self.records()
+        self.assertEqual(sorted(record["output"]["artifacts"]), sorted(files))
+        self.assertEqual(record["output"]["artifacts"]["run-1/file-3.txt"]["chars"], 100_000)
+        self.assertTrue(record["output"]["passed"])
+
+    def test_a_record_too_big_even_summarized_falls_back_to_keys_and_size(self) -> None:
+        self.config(max_run_record_bytes=600)
+        wide = {f"key-{index}": index for index in range(400)}
+        self.module.run({"wide": wide})
+        (record,) = self.records()
+        self.assertIn("omitted_bytes", record["input"])
+        self.assertIn("input", record["summarized"])
+
+    def test_a_small_record_is_not_marked_summarized(self) -> None:
+        self.module.run({"day": 1})
+        (record,) = self.records()
+        self.assertNotIn("summarized", record)
 
     def test_config_reader_handles_the_subset(self) -> None:
         path = self.brick / "input/config.yml"
