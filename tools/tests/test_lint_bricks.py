@@ -148,6 +148,195 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
+class DispatcherTests(Fixture):
+    def input_class(self, brick: Path, header: str, fields: list[str]) -> None:
+        path = brick / "contract.py"
+        text = path.read_text(encoding="utf-8")
+        body = "".join(f"    {name}: str\n" for name in fields) or '    """x"""\n'
+        text = text.replace('class BrickInput(TypedDict):\n    """Input accepted by run(). Replace with domain fields."""\n', f"{header}\n{body}")
+        path.write_text(text, encoding="utf-8")
+
+    def test_dispatcher_field_warns(self) -> None:
+        for name in ("op", "flow", "action", "operation", "kind"):
+            with self.subTest(name=name):
+                brick = self.brick(f"b_{name}")
+                self.input_class(brick, "class BrickInput(TypedDict):", [name])
+        warnings = [w for w in self.warnings() if "selects an operation" in w]
+        self.assertEqual(len(warnings), 5)
+        self.assertEqual(self.errors(), [])
+
+    def test_pure_brick_is_held_to_it_too(self) -> None:
+        brick = self.pure_brick()
+        self.input_class(brick, "class BrickInput(TypedDict, total=False):", ["op", "text"])
+        self.assertTrue(any("BrickInput.op selects an operation" in w for w in self.warnings()))
+
+    def test_many_optional_fields_warn(self) -> None:
+        brick = self.brick()
+        self.input_class(brick, "class BrickInput(TypedDict, total=False):", [f"f{i}" for i in range(7)])
+        self.assertTrue(any("7 fields and all are optional" in w for w in self.warnings()))
+
+    def test_six_optional_fields_or_many_required_ones_do_not(self) -> None:
+        brick = self.brick("six")
+        self.input_class(brick, "class BrickInput(TypedDict, total=False):", [f"f{i}" for i in range(6)])
+        brick = self.brick("many")
+        self.input_class(brick, "class BrickInput(TypedDict):", [f"g{i}" for i in range(9)])
+        self.assertClean()
+
+    def test_template_input_is_clean(self) -> None:
+        self.brick()
+        self.assertClean()
+
+
+class ModeBlindFunctionTests(Fixture):
+    ADAPTER = (
+        "from pathlib import Path\nfrom ..evidence import load_example\n\n\n"
+        "def exists(template_dir, seed):\n    return (Path(template_dir) / f'seed-{seed}.save').is_file()\n\n\n"
+        "def store(ctx, template_dir, seed):\n    return load_example('t', 'c', {})\n\n\n"
+        "def stats(pid):\n    return Path(f'/proc/{pid}').exists()\n"
+    )
+
+    def test_io_function_without_context_called_from_src_warns(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        (brick / "src/logic.py").write_text(
+            "from ..input.adapters import template_files\n\n\ndef execute(inputs, ctx):\n    return template_files.exists('d', 1)\n",
+            encoding="utf-8",
+        )
+        warnings = [w for w in self.warnings() if "does I/O and takes no run context" in w]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("template_files.py: exists()", warnings[0])
+        self.assertEqual(self.errors(), [])
+
+    def test_helper_used_only_inside_the_adapter_is_not_flagged(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        self.assertFalse([w for w in self.warnings() if "takes no run context" in w])
+
+    def test_importing_the_function_by_name_counts_as_a_call_from_outside(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        (brick / "src/logic.py").write_text(
+            "from ..input.adapters.template_files import exists\n\n\ndef execute(inputs, ctx):\n    return exists('d', 1)\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("exists() does I/O" in w for w in self.warnings()))
+
+    def test_function_that_takes_the_context_is_fine(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(
+            self.ADAPTER.replace("def exists(template_dir, seed)", "def exists(ctx, template_dir, seed)"), encoding="utf-8"
+        )
+        (brick / "src/logic.py").write_text(
+            "from ..input.adapters import template_files\n\n\ndef execute(inputs, ctx):\n    return template_files.exists(ctx, 'd', 1)\n",
+            encoding="utf-8",
+        )
+        self.assertFalse([w for w in self.warnings() if "takes no run context" in w])
+
+
+class ContractBytesTests(Fixture):
+    def test_bytes_in_a_contract_warns(self) -> None:
+        brick = self.brick()
+        path = brick / "contract.py"
+        text = path.read_text(encoding="utf-8")
+        text = text.replace('class BrickInput(TypedDict):\n    """Input accepted by run(). Replace with domain fields."""\n', 'class BrickInput(TypedDict, total=False):\n    frames: dict[str, bytes]\n    one: bytes | None\n')
+        text = text.replace('class BrickOutput(TypedDict):\n    """Output returned by run(). Replace with domain fields."""\n', 'class BrickOutput(TypedDict):\n    files: dict[str, str | bytearray]\n')
+        path.write_text(text, encoding="utf-8")
+        warnings = [w for w in self.warnings() if "holds bytes" in w]
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(any("BrickInput.frames" in w for w in warnings) and any("BrickOutput.files" in w for w in warnings))
+        self.assertEqual(self.errors(), [])
+
+    def test_json_fields_do_not_warn(self) -> None:
+        self.brick()
+        self.assertClean()
+
+
+class IoBanTests(Fixture):
+    def src(self, brick: Path, text: str, name: str = "helpers.py") -> None:
+        (brick / "src" / name).write_text(text, encoding="utf-8")
+
+    def test_modules_that_do_io_are_banned_in_src(self) -> None:
+        brick = self.brick()
+        modules = ["http.client", "tempfile", "glob", "ssl", "asyncio", "ctypes", "multiprocessing", "shelve", "webbrowser", "builtins"]
+        self.src(brick, "".join(f"import {name}\n" for name in modules))
+        for name in modules:
+            self.assertError(f"src imports direct-I/O module {name.split('.')[0]!r}")
+
+    def test_logging_handlers_are_banned_but_logging_is_not(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import logging\nimport logging.handlers\n")
+        errors = [item for item in self.errors() if "helpers.py" in item]
+        self.assertEqual(errors, ["bricks/example_brick/src/helpers.py: src imports direct-I/O module 'logging.handlers'"])
+
+    def test_dynamic_import_eval_and_exec_are_banned_in_src(self) -> None:
+        brick = self.brick()
+        self.src(brick, "def a():\n    return __import__('os')\n\n\ndef b(x):\n    return eval(x)\n\n\ndef c(x):\n    exec(x)\n")
+        for name in ("__import__", "eval", "exec"):
+            self.assertError(f"src may not call {name}()")
+
+    def test_importlib_is_banned_in_src(self) -> None:
+        self.src(self.brick(), "import importlib\n")
+        self.assertError("src imports direct-I/O module 'importlib'")
+
+    def test_sys_modules_and_builtins_are_banned_in_src(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import sys\n\n\ndef a():\n    return sys.modules['os']\n\n\ndef b():\n    return __builtins__\n")
+        self.assertError("src may not use sys.modules")
+        self.assertError("src may not use __builtins__")
+
+    def test_importing_sys_for_other_things_is_fine(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import sys\n\n\ndef limit():\n    return sys.maxsize\n")
+        self.assertClean()
+
+    def test_importlib_in_an_adapter_is_a_hidden_dependency(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/dyn.py").write_text(
+            "import importlib\nfrom ..evidence import load_example\n\n\ndef f(ctx):\n    load_example('a', 'b', {})\n    return importlib.import_module('bricks.other')\n",
+            encoding="utf-8",
+        )
+        self.assertError("dyn.py: dynamic imports hide brick boundaries")
+
+    def test_runner_may_still_import_what_it_needs(self) -> None:
+        self.brick()
+        self.assertClean()
+
+    def test_pure_brick_may_import_only_allowlisted_standard_library(self) -> None:
+        brick = self.pure_brick()
+        self.src(brick, "import json\nimport re\nimport io\nimport operator\nimport sys\nimport logging\nimport inspect\n")
+        self.assertError("pure brick imports standard-library module 'sys', which is not on the pure allowlist")
+        self.assertError("standard-library module 'logging'")
+        self.assertError("standard-library module 'inspect'")
+        self.assertFalse([item for item in self.errors() if "'json'" in item or "'re'" in item or "'io'" in item or "'operator'" in item])
+
+    def test_pure_brick_may_use_third_party_libraries(self) -> None:
+        brick = self.pure_brick()
+        self.src(brick, "import numpy\n")
+        self.assertClean()
+
+    def test_pure_brick_bans_escape_hatches_outside_src_too(self) -> None:
+        brick = self.pure_brick()
+        (brick / "input/loader.py").write_text("def f(x):\n    return __import__(x)\n", encoding="utf-8")
+        self.assertError("loader.py: pure brick may not call __import__()")
+
+    def test_pure_brick_bans_logging_handlers_outside_src(self) -> None:
+        brick = self.pure_brick()
+        (brick / "input/loader.py").write_text("import logging.handlers\n", encoding="utf-8")
+        self.assertError("loader.py: pure brick imports 'logging.handlers' outside runner/")
+
+    def test_door_importing_io_modules_warns(self) -> None:
+        brick = self.brick()
+        self.contract(brick, LANE='"workflow"')
+        (brick / "__main__.py").write_text(
+            "import argparse\nimport os\nimport subprocess\nimport shutil\nfrom pathlib import Path\n\nfrom bricks.example_brick import run\n",
+            encoding="utf-8",
+        )
+        warnings = [w for w in self.warnings() if "__main__.py" in w]
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("'subprocess'" in w for w in warnings) and any("'shutil'" in w for w in warnings))
+        self.assertEqual(self.errors(), [])
+
+
 class AdapterExperienceTests(Fixture):
     def adapter(self, brick: Path, name: str, text: str) -> None:
         (brick / "input/adapters" / f"{name}.py").write_text(text, encoding="utf-8")
@@ -187,6 +376,12 @@ class AdapterExperienceTests(Fixture):
         brick = self.brick()
         self.adapter(brick, "tool", "import subprocess\n\n\ndef encode(request, ctx):\n    return {}\n")
         self.assertTrue(any("tool.py: adapter never calls load_example" in w for w in self.warnings()))
+
+    def test_through_and_transcript_count_as_a_saved_mode(self) -> None:
+        brick = self.brick()
+        self.adapter(brick, "a", "from ..evidence import through\n\n\ndef f(ctx):\n    return through(ctx, 'a', 'c', {}, dict)\n")
+        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c')\n")
+        self.assertTrue(all("never calls" not in w for w in self.warnings()))
 
     def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
         self.brick("other")

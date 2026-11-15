@@ -9,12 +9,16 @@ still a composition and not a domain in disguise.
 
 Criteria 1–8 of the strict lane, then:
 
-9. **The runner composes; it does not compute.** `runner/run.py` and
+9. **The workflow composes; it does not compute.** `runner/run.py` and
    `__main__.py` create the run context, call `src/`, and record the outcome.
+   `src/` of a workflow sequences sibling and adapter calls and assembles their
+   results; a rule, a validation, a checklist, a parser or a scoring function in
+   it is a domain decision that belongs in a brick the workflow calls.
    A diff that puts a decision, a calculation, a retry policy or a data
-   transformation into either — anything a focused test would want to reach —
-   has moved domain logic to the one place the lane's rules do not follow it.
-   Block.
+   transformation into the runner or the door — anything a focused test would
+   want to reach — has moved domain logic to the one place the lane's rules do
+   not follow it. Block. The same in the workflow's `src/` is advisory: raise it
+   with the brick it should move to.
 
 10. **Orchestration is real.** A workflow is where `orchestrated` sibling
     dependencies are honoured: it sequences the sibling calls and compensates
@@ -30,5 +34,5 @@ Criteria 1–8 of the strict lane, then:
 
 ## Severity
 
-Criteria **9 and 10 block**; criterion 11 blocks only when it makes a sibling
+Criteria **9 and 10 block** (criterion 9 only for the runner and the door; in `src/` it is advisory); criterion 11 blocks only when it makes a sibling
 run fresh. The strict lane's severities stand for criteria 1–8.

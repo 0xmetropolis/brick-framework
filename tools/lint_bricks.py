@@ -42,9 +42,28 @@ CONFIG_DEFAULTS = {
     "max_run_record_bytes": 122_880,
 }
 DIRECT_IO = {
-    "boto3", "ftplib", "httpx", "os", "pathlib", "psycopg", "requests",
-    "shutil", "smtplib", "socket", "sqlite3", "subprocess", "urllib",
+    "asyncio", "boto3", "builtins", "ctypes", "fcntl", "fileinput", "ftplib", "glob", "http", "httpx",
+    "imaplib", "importlib", "mmap", "multiprocessing", "os", "pathlib", "poplib", "psycopg", "requests",
+    "selectors", "shelve", "shutil", "smtplib", "socket", "socketserver", "sqlite3", "ssl", "subprocess",
+    "tempfile", "telnetlib", "urllib", "webbrowser", "xmlrpc",
 }
+# Submodules of an otherwise harmless package that do I/O.
+DIRECT_IO_DOTTED = {"logging.handlers", "logging.config"}
+# Ways to reach a banned module without importing it by name.
+ESCAPE_CALLS = {"__import__", "eval", "exec"}
+# The standard-library modules a pure brick may import: no I/O, clock, randomness, threads or process state.
+PURE_STDLIB = {
+    "__future__", "abc", "array", "ast", "base64", "binascii", "bisect", "calendar", "cmath", "codecs",
+    "collections", "colorsys", "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "difflib",
+    "enum", "fnmatch", "fractions", "functools", "graphlib", "hashlib", "heapq", "hmac", "html", "io",
+    "ipaddress", "itertools", "json", "keyword", "math", "numbers", "operator", "pprint", "re", "reprlib",
+    "shlex", "statistics", "string", "struct", "textwrap", "types", "typing", "unicodedata", "warnings", "zlib",
+}
+# Calls in evidence.py that give an adapter its saved mode.
+SAVED_MODE_CALLS = {"load_example", "through", "Transcript"}
+# A BrickInput field with one of these names selects an operation: the split signal.
+DISPATCH_FIELDS = {"op", "flow", "action", "operation", "kind"}
+OPTIONAL_FIELD_LIMIT = 6
 # Names a run context goes by in src/ and adapters.
 CONTEXT_NAMES = {"ctx", "context", "run_context"}
 # An environment variable that switches behavior is a mode the run does not record.
@@ -101,6 +120,27 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     if isinstance(node, ast.Import):
         return [alias.name for alias in node.names]
     return ["." * node.level + (node.module or "")]
+
+
+def stdlib_names() -> frozenset[str] | None:
+    """The standard library's top-level module names (Python 3.10+), or None where unknown."""
+    return getattr(sys, "stdlib_module_names", None)
+
+
+def escape_hatches(path: Path, tree: ast.Module, lint: Lint, label: str) -> None:
+    """Dynamic import, eval/exec and ``sys.modules`` reach banned modules without naming them."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and called_name(node) in ESCAPE_CALLS and isinstance(node.func, ast.Name):
+            lint.add(path, f"{label} may not call {called_name(node)}(); it reaches modules the import rules cannot see")
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        ):
+            lint.add(path, f"{label} may not use sys.modules; it reaches modules the import rules cannot see")
+        if isinstance(node, ast.Name) and node.id == "__builtins__":
+            lint.add(path, f"{label} may not use __builtins__; it reaches open() and __import__ unseen")
 
 
 def mode_override(node: ast.AST) -> bool:
@@ -217,6 +257,40 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
             lint.add(path, f"{class_name} must be declared as a TypedDict")
+    declaration = classes.get("BrickInput")
+    if declaration:
+        fields = [m.target.id for m in declaration.body if isinstance(m, ast.AnnAssign) and isinstance(m.target, ast.Name)]
+        for field_name in fields:
+            if field_name in DISPATCH_FIELDS:
+                lint.add(
+                    path,
+                    f"BrickInput.{field_name} selects an operation; one run is one operation, so split the "
+                    "brick (bricks/AGENTS.md: split when run becomes a dispatcher)",
+                    warning=True,
+                )
+        optional = any(
+            keyword.arg == "total" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+            for keyword in declaration.keywords
+        )
+        if optional and len(fields) > OPTIONAL_FIELD_LIMIT:
+            lint.add(
+                path,
+                f"BrickInput has {len(fields)} fields and all are optional, so the type promises almost nothing; "
+                "make the required fields required, or split the brick",
+                warning=True,
+            )
+    for class_name in ("BrickInput", "BrickOutput"):
+        declaration = classes.get(class_name)
+        for member in declaration.body if declaration else ():
+            if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name) and any(
+                isinstance(part, ast.Name) and part.id in {"bytes", "bytearray"} for part in ast.walk(member.annotation)
+            ):
+                lint.add(
+                    path,
+                    f"{class_name}.{member.target.id} holds bytes, but inputs and outputs are recorded as JSON; "
+                    "use a base64 string or a manifest (input/AGENTS.md, Recorded data)",
+                    warning=True,
+                )
     if lane is None:
         lane = "strict"
     elif lane not in LANES:
@@ -273,6 +347,13 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
         adapter = relative[:2] == ("input", "adapters")
         calls: set[str] = set()
         imports_sibling = False
+        if role == "src":
+            escape_hatches(path, tree, lint, "src")
+        elif role != "runner" and any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "__import__"
+            for node in ast.walk(tree)
+        ):
+            lint.add(path, "dynamic imports hide brick boundaries")
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 calls.add(called_name(node))
@@ -292,6 +373,10 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, "src may not import runner")
                         if parts[0] in DIRECT_IO:
                             lint.add(path, f"src imports direct-I/O module {parts[0]!r}")
+                        elif ".".join(parts[:2]) in DIRECT_IO_DOTTED:
+                            lint.add(path, f"src imports direct-I/O module {'.'.join(parts[:2])!r}")
+                    elif role != "runner" and parts[0] == "importlib":
+                        lint.add(path, "dynamic imports hide brick boundaries")
                     if len(parts) > 1 and parts[0] == "bricks" and parts[1] != brick.name:
                         actual_dependencies.add(parts[1])
                         imports_sibling = True
@@ -343,10 +428,10 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                         "source live from this brick, give this brick its own adapter for it "
                         "(input/AGENTS.md, Sources several bricks share)",
                     )
-        if adapter and not imports_sibling and "load_example" not in calls:
+        if adapter and not imports_sibling and not calls & SAVED_MODE_CALLS:
             lint.add(
                 path,
-                "adapter never calls load_example, so it has no saved mode; a file or tool adapter "
+                "adapter never calls load_example, through or Transcript, so it has no saved mode; a file or tool adapter "
                 "replays a recorded manifest (input/AGENTS.md, Recorded data)",
                 warning=True,
             )
@@ -541,6 +626,7 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
         lint.add(path, "pure brick may not have adapters")
     if contract.dependencies:
         lint.add(brick / "contract.py", "pure brick may not declare sibling dependencies")
+    stdlib = stdlib_names()
     for path in brick.rglob("*.py"):
         relative = path.relative_to(brick).parts
         if relative[0] == "runner":
@@ -548,10 +634,21 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
         tree = lint.tree(path)
         if not tree:
             continue
+        if relative[0] != "src":
+            escape_hatches(path, tree, lint, "pure brick")
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for module in imported_modules(node):
                     name = module.lstrip(".").split(".")[0]
+                    if (
+                        stdlib is not None
+                        and name in stdlib
+                        and name not in PURE_STDLIB
+                        and name not in PURE_FORBIDDEN
+                    ):
+                        lint.add(path, f"pure brick imports standard-library module {name!r}, which is not on the pure allowlist")
+                    if ".".join(module.lstrip(".").split(".")[:2]) in DIRECT_IO_DOTTED and relative[0] != "src":
+                        lint.add(path, f"pure brick imports {'.'.join(module.split('.')[:2])!r} outside runner/")
                     # src/ already reports DIRECT_IO under the rule every brick gets.
                     if name in PURE_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
                         hint = (
@@ -591,6 +688,14 @@ def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
         for module in imported_modules(node):
             inside = module.startswith(".") or module.split(".")[0] == "bricks"
             if not inside:
+                top = module.split(".")[0]
+                if top in DIRECT_IO - {"os", "pathlib"}:
+                    lint.add(
+                        brick / "__main__.py",
+                        f"__main__ imports direct-I/O module {top!r}; a door parses arguments, calls run and "
+                        "prints or writes what run returned; effects belong in an adapter",
+                        warning=True,
+                    )
                 continue
             names = [item.name for item in node.names]
             if not (isinstance(node, ast.ImportFrom) and module in own_run and names == ["run"]):
@@ -619,6 +724,7 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_smokes(brick, contract, lint)
     if contract.lane != "workflow" and (brick / "__main__.py").exists():
         lint.add(brick / "__main__.py", "only a workflow brick may have __main__.py")
+    lint_adapter_functions(brick, lint)
     lint_deterministic(brick, contract, lint)
     LANES[contract.lane](brick, contract, lint)
 
@@ -662,6 +768,63 @@ def lint_copies(bricks: list[Path], lint: Lint) -> None:
                     path,
                     f"copy of {name!r}@{version} differs from {first_path.relative_to(lint.root)}; "
                     "sync the copies, or bump @n here to record a deliberate fork",
+                    warning=True,
+                )
+
+
+def lint_adapter_functions(brick: Path, lint: Lint) -> None:
+    """Warn on an adapter function that does I/O, takes no run context, and is called from outside its file.
+
+    Such a function cannot see the mode, so it behaves the same in saved,
+    fresh and save: a saved run reads the real disk or network. Helpers used
+    only inside their own adapter are not flagged.
+    """
+    adapters = sorted((brick / "input/adapters").glob("*.py"))
+    candidates: dict[str, dict[str, tuple[Path, ast.FunctionDef]]] = {}
+    for path in adapters:
+        tree = lint.tree(path)
+        if not tree:
+            continue
+        io_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                io_names |= {(a.asname or a.name).split(".")[0] for a in node.names if a.name.split(".")[0] in DIRECT_IO}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module and node.module.split(".")[0] in DIRECT_IO:
+                io_names |= {a.asname or a.name for a in node.names}
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+                continue
+            params = {a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)}
+            if params & CONTEXT_NAMES:
+                continue
+            does_io = any(
+                (isinstance(part, ast.Name) and part.id in io_names)
+                or (isinstance(part, ast.Call) and called_name(part) == "open")
+                for part in ast.walk(node)
+            )
+            if does_io:
+                candidates.setdefault(path.stem, {})[node.name] = (path, node)
+    if not candidates:
+        return
+    used: dict[str, set[str]] = {stem: set() for stem in candidates}
+    for path in brick.rglob("*.py"):
+        if path.parent == brick / "input/adapters" and path.stem in candidates:
+            continue
+        tree = lint.tree(path)
+        if not tree:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in used:
+                used[node.value.id].add(node.attr)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[-1] in used:
+                used[node.module.split(".")[-1]] |= {a.name for a in node.names}
+    for stem, functions in candidates.items():
+        for name, (path, node) in functions.items():
+            if name in used[stem]:
+                lint.add(
+                    path,
+                    f"{name}() does I/O and takes no run context, so it behaves the same in every mode; "
+                    "take ctx and answer from a saved example in saved mode",
                     warning=True,
                 )
 

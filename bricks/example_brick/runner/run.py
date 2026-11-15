@@ -1,4 +1,4 @@
-# BOILERPLATE: runner.run@1
+# BOILERPLATE: runner.run@3
 """The brick's repository-internal entry point.
 
 A working runner, copied with the brick like ``input/evidence.py``: it creates
@@ -11,6 +11,7 @@ copies of it stay identical.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -112,19 +113,71 @@ def _record(record: dict[str, Any], config: dict[str, Any]) -> None:
         path for path in RUNS.glob("*.json") if path.name.endswith(TEST_SUFFIX) == (suffix == TEST_SUFFIX)
     )
     for old in mine[:-retained]:
-        old.unlink()
+        # Another thread's run may have pruned the same record already.
+        old.unlink(missing_ok=True)
+
+
+def _plain(value: Any) -> Any:
+    """JSON-safe form of a value. Bytes become their size and digest, never their repr."""
+    if isinstance(value, (bytes, bytearray)):
+        return {"bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()[:16]}
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)[:200]
+
+
+def _summarize(value: Any, threshold: int) -> Any:
+    """Shrink long strings and long lists in place of dropping the whole value."""
+    if isinstance(value, str) and len(value) > threshold:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        return {"chars": len(value), "sha256": digest, "head": value[:60]}
+    if isinstance(value, dict):
+        return {key: _summarize(item, threshold) for key, item in value.items()}
+    if isinstance(value, list):
+        kept = [_summarize(item, threshold) for item in value[:20]]
+        return kept + [{"omitted_items": len(value) - 20}] if len(value) > 20 and threshold <= 500 else [
+            _summarize(item, threshold) for item in value
+        ]
+    return value
 
 
 def _bounded(record: dict[str, Any], limit: int) -> bytes:
-    """Serialize canonically; drop output, then input, rather than exceed the limit."""
+    """Serialize canonically within ``limit``, summarizing instead of dropping.
+
+    Long strings and lists are replaced by their size, a digest and a head, so
+    the record still shows the shape of what went in and came out. Only if that
+    is not enough is a whole field reduced to its top-level keys and size. Fields
+    that were changed are listed under ``summarized``.
+    """
 
     def encode(value: dict[str, Any]) -> bytes:
-        return (json.dumps(value, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
+        return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
+    record = _plain(record)
     payload = encode(record)
+    changed: list[str] = []
+    for threshold in (2000, 500, 120, 40):
+        if len(payload) <= limit:
+            return payload
+        for field in ("output", "input"):
+            if field in record:
+                shrunk = _summarize(record[field], threshold)
+                if shrunk != record[field]:
+                    record = {**record, field: shrunk}
+                    if field not in changed:
+                        changed.append(field)
+        payload = encode({**record, "summarized": changed})
     for field in ("output", "input"):
-        if len(payload) <= limit or field not in record:
-            continue
-        record = {**record, field: {"omitted_bytes": len(json.dumps(record[field], default=str))}}
-        payload = encode(record)
+        if len(payload) <= limit:
+            break
+        if field in record:
+            value = record[field]
+            record = {**record, field: {"omitted_bytes": len(json.dumps(value)), "keys": sorted(value)[:20] if isinstance(value, dict) else None}}
+            if field not in changed:
+                changed.append(field)
+            payload = encode({**record, "summarized": changed})
     return payload

@@ -1,4 +1,4 @@
-# BOILERPLATE: evidence@1
+# BOILERPLATE: evidence@2
 """Small, Git-stable saved-example storage for this brick.
 
 Copy this file with the brick boilerplate. It deliberately has no dependency
@@ -149,9 +149,119 @@ def digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-def provenance(record: dict[str, Any]) -> dict[str, Any]:
-    """What an adapter returns beside a saved response so src can say it was recorded."""
+def provenance(record: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What an adapter returns beside a response so src can say whether it was recorded.
+
+    Pass the saved example for a replay; pass nothing for a live answer.
+    """
+    if record is None:
+        return {"recorded": False, "capture_run_id": None}
     return {"recorded": True, "capture_run_id": record["capture_run_id"]}
+
+
+def _max_bytes(run_context: dict[str, Any]) -> int:
+    return int(run_context.get("config", {}).get("limits", {}).get("max_evidence_bytes", DEFAULT_MAX_BYTES))
+
+
+def through(
+    run_context: dict[str, Any], adapter: str, case: str, request: dict[str, Any], live: Any
+) -> tuple[Any, dict[str, Any]]:
+    """The saved / fresh / save contract for one adapter call: returns ``(response, provenance)``.
+
+    saved  replay the example for ``case`` (request must match; a recorded error is raised)
+    fresh  call ``live()``; nothing is written
+    save   call ``live()`` and atomically replace the example, a failure included
+    ``live`` takes no arguments and returns a JSON value.
+    """
+    mode = run_context["mode"]
+    if mode == "saved":
+        record = load_example(adapter, case, request)
+        if "error" in record:
+            raise RuntimeError(f"saved adapter error: {record['error']}")
+        return record["response"], provenance(record)
+    try:
+        response = live()
+    except Exception as exc:
+        if mode == "save":
+            save_example(adapter, case, run_context["run_id"], request, error={"type": type(exc).__name__}, max_bytes=_max_bytes(run_context))
+        raise
+    if mode == "save":
+        save_example(adapter, case, run_context["run_id"], request, response=response, max_bytes=_max_bytes(run_context))
+    return response, provenance()
+
+
+class Transcript:
+    """A chatty source as windows: one saved example per window, operations replayed in order.
+
+    A window is one example named ``<case>-<window>``. Its request (the window name plus what the
+    caller puts in ``request``, for instance a protocol version and a digest of the starting state)
+    must match, like any example, so one stale window is found and re-recorded alone. Its response is
+    the ordered list of operations; in saved mode each ``op`` must equal the next recorded one.
+    ``record`` is True (every window), a list of window names, or False; it only matters in save mode.
+    """
+
+    def __init__(self, run_context: dict[str, Any], adapter: str, case: str, record: Any = True) -> None:
+        self.context, self.adapter, self.case, self.record = run_context, adapter, case, record
+        self.mode = run_context["mode"]
+        self.window = ""
+        self.request: dict[str, Any] = {}
+        self.entries: list[dict[str, Any]] = []
+        self.cursor = 0
+
+    def _wants(self, window: str) -> bool:
+        return self.mode == "save" and (self.record is True or (isinstance(self.record, list) and window in self.record))
+
+    def begin(self, window: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Close the open window and start the next; returns the provenance of the window."""
+        self.end()
+        self.window = window
+        self.request = _normalize({"window": window, **request})
+        self.entries, self.cursor = [], 0
+        if self.mode == "saved":
+            record = load_example(self.adapter, f"{self.case}-{window}", self.request)
+            if "error" in record:
+                raise RuntimeError(f"saved adapter error: {record['error']}")
+            self.entries = record["response"]["transcript"]
+            return provenance(record)
+        return provenance()
+
+    def op(self, kind: str, request: Any, live: Any) -> Any:
+        """One operation: replayed in saved mode, otherwise ``live()`` and, when recording, kept."""
+        request = _normalize(request)
+        where = f"{self.case}-{self.window}"
+        if self.mode == "saved":
+            if self.cursor >= len(self.entries):
+                raise EvidenceError(
+                    f"saved window {where} ended after {self.cursor} operations; a further {kind} was requested; "
+                    "re-record the window with save"
+                )
+            entry = self.entries[self.cursor]
+            self.cursor += 1
+            if entry["op"] != kind:
+                raise EvidenceError(
+                    f"saved window {where} mismatch at operation {self.cursor}: recorded a {entry['op']}, requested a {kind}; "
+                    "re-record the window with save"
+                )
+            if entry["request"] != request:
+                differences = request_diff(entry["request"], request)
+                raise EvidenceError(
+                    f"saved window {where} mismatch at operation {self.cursor} ({kind}): {'; '.join(differences)}; "
+                    "re-record the window with save"
+                )
+            return entry["response"]
+        response = _normalize(live())
+        if self._wants(self.window):
+            self.entries.append({"op": kind, "request": request, "response": response})
+        return response
+
+    def end(self) -> None:
+        """Close the open window; in save mode a recorded window is written."""
+        if self.window and self._wants(self.window):
+            save_example(
+                self.adapter, f"{self.case}-{self.window}", self.context["run_id"], self.request,
+                response={"transcript": self.entries}, max_bytes=_max_bytes(self.context),
+            )
+        self.window = ""
 
 
 def _example_path(adapter: str, case: str) -> Path:

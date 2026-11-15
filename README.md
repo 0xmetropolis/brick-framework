@@ -49,7 +49,7 @@ A lane is the enforcement class a brick declares for itself with `LANE` in `cont
 | Lane | What it means | What the linter adds |
 | --- | --- | --- |
 | `strict` | The regular brick. | Nothing beyond the rules every brick gets. |
-| `pure` | Output is a function of input alone. | No adapters and no sibling dependencies, so it has no `input/adapters/` folder (Git cannot track an empty one; the linter does not require it for this lane). The direct-I/O ban that `src/` already carries widens to the whole brick, plus `random` and `time`, plus any `.now()`, `.today()`, or `.utcnow()` call. `runner/` is exempt because it records runs and owns `rng.py`; `datetime` stays importable for annotations and arithmetic. |
+| `pure` | Output is a function of input alone. | No adapters and no sibling dependencies, so it has no `input/adapters/` folder (Git cannot track an empty one; the linter does not require it for this lane). The direct-I/O ban that `src/` already carries widens to the whole brick, plus `random` and `time`, and its standard-library imports are limited to an allowlist of modules with no I/O, clock, randomness or process state (`PURE_STDLIB` in `tools/lint_bricks.py`; third-party libraries are still allowed), plus any `.now()`, `.today()`, or `.utcnow()` call. `runner/` is exempt because it records runs and owns `rng.py`; `datetime` stays importable for annotations and arithmetic. |
 | `workflow` | Invoked as a whole operation, never imported for its parts. | No contract may name it as a sibling dependency. It alone may carry a process door, `__main__.py`, and that door may import nothing from the brick tree except the brick's own `run`. Smoke tests belong only here. |
 
 A lane cannot exist without an enforcer: the `LANES` table in `tools/lint_bricks.py` maps each name to the function that checks it, and the linter rejects any other value.
@@ -99,3 +99,11 @@ Each node lists the state its brick owns, and says `nondeterministic` when the b
 `tools/brick_contract.py` reads a brick's `contract.py` without importing it; repo-local checks should use `contract_value(brick, "NAME")` rather than a regular expression on config. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
 
 The linter warns, and never fails, on experience problems: a mode-like environment variable in an adapter, an adapter with no saved mode, `src/` reading or overriding the run mode, evidence near its size limit, boilerplate copies that have drifted, and smoke tests that do not mark their records as tests.
+
+Run any brick, in any mode, from the command line (this is how to record or refresh a brick that has no process door, since only a workflow may carry `__main__.py`):
+
+```sh
+python3 tools/run_brick.py <brick> --input request.json [--fresh | --save] [--test]
+```
+
+The input is JSON from a file or stdin, `--save` implies fresh, `--test` writes a local test record, and a failure is one line with a nonzero status. The tool lives outside the bricks and calls only the brick's `run`.

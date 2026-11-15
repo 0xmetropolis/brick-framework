@@ -6,6 +6,7 @@ This folder owns the brick's private domain logic. Its internal organization is 
 - Decide when external or sibling-brick data is needed and call adapters from this brick's `input/` folder.
 - Pass the run context into every adapter so it can apply saved, fresh, or save behavior.
 - Do not implement mode branching here; each adapter owns that behavior using the mode in the run context. The linter warns when `src/` reads `mode` from the run context or builds a context with another one (`dict(ctx, mode=...)`). To use one source live and another recorded, make the recorded one its own sibling brick.
+- The import ban is a floor, not a loophole: `src/` may not use `importlib`, `__import__`, `eval`, `exec`, `sys.modules` or `__builtins__` to reach a module it could not import by name.
 - Do not perform direct network, database, filesystem, subprocess, environment, clock, or sibling-brick calls. Those calls must go through adapters.
 - Do not import sibling bricks directly. Import only this brick's input adapters.
 - Return values, not files. Render, encode and decode in memory (`io.BytesIO`, `bytes`, `str`) and hand the result back as data; adapters write files and run external tools. The `open` check is name-based: any call named `open` in `src/` is a file access, except `x.open(io.BytesIO(data))` (or `StringIO`) with the buffer built in the call, which cannot reach a file. A buffer held in a variable is still flagged.
