@@ -697,6 +697,7 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_smokes(brick, contract, lint)
     if contract.lane != "workflow" and (brick / "__main__.py").exists():
         lint.add(brick / "__main__.py", "only a workflow brick may have __main__.py")
+    lint_adapter_functions(brick, lint)
     lint_deterministic(brick, contract, lint)
     LANES[contract.lane](brick, contract, lint)
 
@@ -740,6 +741,63 @@ def lint_copies(bricks: list[Path], lint: Lint) -> None:
                     path,
                     f"copy of {name!r}@{version} differs from {first_path.relative_to(lint.root)}; "
                     "sync the copies, or bump @n here to record a deliberate fork",
+                    warning=True,
+                )
+
+
+def lint_adapter_functions(brick: Path, lint: Lint) -> None:
+    """Warn on an adapter function that does I/O, takes no run context, and is called from outside its file.
+
+    Such a function cannot see the mode, so it behaves the same in saved,
+    fresh and save: a saved run reads the real disk or network. Helpers used
+    only inside their own adapter are not flagged.
+    """
+    adapters = sorted((brick / "input/adapters").glob("*.py"))
+    candidates: dict[str, dict[str, tuple[Path, ast.FunctionDef]]] = {}
+    for path in adapters:
+        tree = lint.tree(path)
+        if not tree:
+            continue
+        io_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                io_names |= {(a.asname or a.name).split(".")[0] for a in node.names if a.name.split(".")[0] in DIRECT_IO}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module and node.module.split(".")[0] in DIRECT_IO:
+                io_names |= {a.asname or a.name for a in node.names}
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+                continue
+            params = {a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)}
+            if params & CONTEXT_NAMES:
+                continue
+            does_io = any(
+                (isinstance(part, ast.Name) and part.id in io_names)
+                or (isinstance(part, ast.Call) and called_name(part) == "open")
+                for part in ast.walk(node)
+            )
+            if does_io:
+                candidates.setdefault(path.stem, {})[node.name] = (path, node)
+    if not candidates:
+        return
+    used: dict[str, set[str]] = {stem: set() for stem in candidates}
+    for path in brick.rglob("*.py"):
+        if path.parent == brick / "input/adapters" and path.stem in candidates:
+            continue
+        tree = lint.tree(path)
+        if not tree:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in used:
+                used[node.value.id].add(node.attr)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[-1] in used:
+                used[node.module.split(".")[-1]] |= {a.name for a in node.names}
+    for stem, functions in candidates.items():
+        for name, (path, node) in functions.items():
+            if name in used[stem]:
+                lint.add(
+                    path,
+                    f"{name}() does I/O and takes no run context, so it behaves the same in every mode; "
+                    "take ctx and answer from a saved example in saved mode",
                     warning=True,
                 )
 

@@ -15,6 +15,7 @@ This folder owns every external-source boundary and sibling-brick boundary for t
 - Other bricks in this repository are sibling bricks, not external sources.
 - An adapter fetches or sends data; it does not contain domain logic.
 - A sibling adapter calls only the sibling brick's `run` entry point.
+- Every adapter function that `src/` calls takes the run context first. A function that reads the disk or network without it (a cache check, an existence test) cannot know the mode and would read the real thing in saved mode too; the linter warns on it.
 - Adapters are called by `src/` with a plain run context containing the owning brick's run ID, mode, and resolved adapter configuration.
 - Adapters never import or call `src/` or `runner/`.
 - A sibling adapter never forwards `fresh`, `save`, the parent run ID, or other run-control state. The sibling run remains fully contained and creates its own identity.

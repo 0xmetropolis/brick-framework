@@ -148,6 +148,52 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
+class ModeBlindFunctionTests(Fixture):
+    ADAPTER = (
+        "from pathlib import Path\nfrom ..evidence import load_example\n\n\n"
+        "def exists(template_dir, seed):\n    return (Path(template_dir) / f'seed-{seed}.save').is_file()\n\n\n"
+        "def store(ctx, template_dir, seed):\n    return load_example('t', 'c', {})\n\n\n"
+        "def stats(pid):\n    return Path(f'/proc/{pid}').exists()\n"
+    )
+
+    def test_io_function_without_context_called_from_src_warns(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        (brick / "src/logic.py").write_text(
+            "from ..input.adapters import template_files\n\n\ndef execute(inputs, ctx):\n    return template_files.exists('d', 1)\n",
+            encoding="utf-8",
+        )
+        warnings = [w for w in self.warnings() if "does I/O and takes no run context" in w]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("template_files.py: exists()", warnings[0])
+        self.assertEqual(self.errors(), [])
+
+    def test_helper_used_only_inside_the_adapter_is_not_flagged(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        self.assertFalse([w for w in self.warnings() if "takes no run context" in w])
+
+    def test_importing_the_function_by_name_counts_as_a_call_from_outside(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        (brick / "src/logic.py").write_text(
+            "from ..input.adapters.template_files import exists\n\n\ndef execute(inputs, ctx):\n    return exists('d', 1)\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("exists() does I/O" in w for w in self.warnings()))
+
+    def test_function_that_takes_the_context_is_fine(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/template_files.py").write_text(
+            self.ADAPTER.replace("def exists(template_dir, seed)", "def exists(ctx, template_dir, seed)"), encoding="utf-8"
+        )
+        (brick / "src/logic.py").write_text(
+            "from ..input.adapters import template_files\n\n\ndef execute(inputs, ctx):\n    return template_files.exists(ctx, 'd', 1)\n",
+            encoding="utf-8",
+        )
+        self.assertFalse([w for w in self.warnings() if "takes no run context" in w])
+
+
 class ContractBytesTests(Fixture):
     def test_bytes_in_a_contract_warns(self) -> None:
         brick = self.brick()
