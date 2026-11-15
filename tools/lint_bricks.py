@@ -59,6 +59,7 @@ class Contract:
     dependencies: dict[str, str] = field(default_factory=dict)
     owned_state: tuple[str, ...] = ()
     lane: str = "strict"
+    deterministic: bool | None = None
 
 
 class Lint:
@@ -141,6 +142,7 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     dependencies = assigned_literal(tree, "SIBLING_DEPENDENCIES")
     owned_state = assigned_literal(tree, "OWNED_STATE")
     lane = assigned_literal(tree, "LANE")
+    deterministic = assigned_literal(tree, "DETERMINISTIC")
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
@@ -159,6 +161,9 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     ):
         lint.add(path, "OWNED_STATE must contain non-empty resource identifiers")
         owned_state = ()
+    if deterministic is not None and not isinstance(deterministic, bool):
+        lint.add(path, "DETERMINISTIC must be True or False")
+        deterministic = None
     for class_name in ("BrickInput", "BrickOutput"):
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
@@ -169,7 +174,7 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         lint.add(path, f"LANE must be one of {', '.join(sorted(LANES))}")
         lane = "strict"
 
-    return Contract(version, dict(dependencies), tuple(owned_state), lane)
+    return Contract(version, dict(dependencies), tuple(owned_state), lane, deterministic)
 
 
 def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -371,6 +376,44 @@ def lint_strict(brick: Path, contract: Contract, lint: Lint) -> None:
 
 PURE_FORBIDDEN = DIRECT_IO | {"random", "time"}
 CLOCK_CALLS = {"now", "today", "utcnow"}
+# What a brick that declares DETERMINISTIC = True keeps out of src/.
+NONDETERMINISTIC_MODULES = {
+    "concurrent", "multiprocessing", "random", "secrets", "threading", "time", "uuid",
+}
+
+
+def lint_deterministic(brick: Path, contract: Contract, lint: Lint) -> None:
+    """``DETERMINISTIC = True`` is a promise ``src/`` can be held to; ``False`` says it is not made.
+
+    A brick that says nothing makes no promise and gets no check. A brick that
+    declares ``True`` may not reach for the clock, randomness, threads or
+    generated IDs in ``src/`` (adapters are where such things enter, as inputs).
+    The pure lane already holds its whole brick to this, so it may not say ``False``.
+    """
+    if contract.lane == "pure" and contract.deterministic is False:
+        lint.add(brick / "contract.py", "a pure brick is deterministic by definition; remove DETERMINISTIC = False")
+    if contract.deterministic is not True or contract.lane == "pure":
+        return
+    for path in sorted((brick / "src").rglob("*.py")):
+        tree = lint.tree(path)
+        if not tree:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for module in imported_modules(node):
+                    name = module.lstrip(".").split(".")[0]
+                    if name in NONDETERMINISTIC_MODULES:
+                        lint.add(
+                            path,
+                            f"DETERMINISTIC = True, but src imports {name!r}; take it as input through an "
+                            "adapter, or declare DETERMINISTIC = False and say why",
+                        )
+            if isinstance(node, ast.Call) and called_name(node) in CLOCK_CALLS:
+                lint.add(
+                    path,
+                    f"DETERMINISTIC = True, but src reads the clock with {called_name(node)}(); "
+                    "take the time as input, or declare DETERMINISTIC = False and say why",
+                )
 
 
 def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -463,6 +506,7 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_smokes(brick, contract, lint)
     if contract.lane != "workflow" and (brick / "__main__.py").exists():
         lint.add(brick / "__main__.py", "only a workflow brick may have __main__.py")
+    lint_deterministic(brick, contract, lint)
     LANES[contract.lane](brick, contract, lint)
 
 

@@ -139,6 +139,54 @@ class ModeReadTests(Fixture):
         self.assertClean()
 
 
+class DeterminismTests(Fixture):
+    def test_template_declares_determinism(self) -> None:
+        self.assertIn("DETERMINISTIC = True", (ROOT / "bricks/example_brick/contract.py").read_text(encoding="utf-8"))
+
+    def test_determinism_must_be_a_bool(self) -> None:
+        self.contract(self.brick(), DETERMINISTIC='"yes"')
+        self.assertError("DETERMINISTIC must be True or False")
+
+    def test_deterministic_src_may_not_use_randomness_threads_or_ids(self) -> None:
+        brick = self.brick()
+        (brick / "src/helpers.py").write_text("import random\nimport uuid\nfrom threading import Thread\n", encoding="utf-8")
+        for name in ("random", "uuid", "threading"):
+            self.assertError(f"DETERMINISTIC = True, but src imports {name!r}")
+
+    def test_deterministic_src_may_not_read_the_clock(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n", encoding="utf-8"
+        )
+        self.assertError("DETERMINISTIC = True, but src reads the clock with now()")
+
+    def test_nondeterminism_can_be_declared(self) -> None:
+        brick = self.brick()
+        self.contract(brick, DETERMINISTIC="False")
+        (brick / "src/helpers.py").write_text("import random\nimport time\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_saying_nothing_makes_no_promise(self) -> None:
+        brick = self.brick()
+        path = brick / "contract.py"
+        text = path.read_text(encoding="utf-8").replace("DETERMINISTIC = True\n", "")
+        path.write_text(text, encoding="utf-8")
+        (brick / "src/helpers.py").write_text("import random\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_adapters_may_bring_in_the_clock(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/clock.py").write_text(
+            "import time\n\n\ndef now(ctx):\n    return ctx['io']\n", encoding="utf-8"
+        )
+        self.assertFalse([item for item in self.errors() if "DETERMINISTIC" in item])
+
+    def test_a_pure_brick_may_not_declare_nondeterminism(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, DETERMINISTIC="False")
+        self.assertError("a pure brick is deterministic by definition")
+
+
 class PureLaneTests(Fixture):
     def test_pure_brick_lints_clean(self) -> None:
         self.pure_brick()
@@ -218,8 +266,9 @@ class PureLaneTests(Fixture):
         )
         self.assertClean()
 
-    def test_strict_brick_may_read_the_clock_in_src(self) -> None:
+    def test_strict_brick_may_read_the_clock_in_src_when_it_says_so(self) -> None:
         brick = self.brick()
+        self.contract(brick, DETERMINISTIC="False")
         (brick / "src/logic.py").write_text(
             "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n",
             encoding="utf-8",

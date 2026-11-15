@@ -33,6 +33,14 @@ class ContractReaderTests(unittest.TestCase):
         self.assertIs(lint_bricks.assigned_literal, brick_contract.assigned_literal)
         self.assertIs(graph_bricks.assigned_literal, brick_contract.assigned_literal)
 
+    def test_graph_marks_declared_nondeterminism(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            brick = Path(tmp) / "bricks" / "load"
+            brick.mkdir(parents=True)
+            (brick / "contract.py").write_text("DETERMINISTIC = False\n", encoding="utf-8")
+            contracts = {"load": graph_bricks.read_contract(brick)}
+        self.assertIn("nondeterministic", graph_bricks.render(contracts))
+
 
 if __name__ == "__main__":
     unittest.main()
