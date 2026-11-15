@@ -345,10 +345,10 @@ class AdapterExperienceTests(Fixture):
         brick = self.brick()
         self.adapter(
             brick, "feed",
-            ADAPTER_WITH_SAVED_MODE.format(body="    if os.environ.get('SYX_FEED_REPLAY'):\n        pass\n")
+            ADAPTER_WITH_SAVED_MODE.format(body="    if os.environ.get('FEED_REPLAY'):\n        pass\n")
             .replace("from ..evidence", "import os\nfrom ..evidence"),
         )
-        self.assertTrue(any("environment variable 'SYX_FEED_REPLAY'" in w for w in self.warnings()))
+        self.assertTrue(any("environment variable 'FEED_REPLAY'" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
 
     def test_getenv_and_subscript_forms_warn(self) -> None:
