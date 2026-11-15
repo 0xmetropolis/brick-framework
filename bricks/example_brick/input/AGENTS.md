@@ -52,3 +52,10 @@ The framework does not share adapter code between bricks: a cross-brick import o
 - **A brick that must reach the source live keeps its own adapter.** `fresh` and `save` never cross a brick boundary, so a flow that drives the live source needs the adapter inside it. Mark every copy `# BOILERPLATE: <id>@<n>` in its first lines. The linter warns when copies at the same version differ, or when one lags a newer version; a deliberate fork bumps `@n`.
 
 Bricks that exchange files should not both guess a folder name. The producer lists the folder in `OWNED_STATE` (`files:<name>`), and the consumer receives the data, or a manifest of it, through a sibling `run`.
+
+## Effects that must go live
+
+A sibling always replays, so an effect adapter inside a sibling (an encoder, a file writer, an upload) can only ever replay its recorded manifest when a workflow calls it. An effect a workflow wants to run live, such as encoding a video from the frames of a live session, is an adapter of the workflow itself: the workflow's `fresh` reaches it, and its saved mode replays a manifest and runs nothing. The sibling does the pure part (choosing and ordering the frames, building the encoder arguments) and returns data; the workflow's adapter performs the effect.
+
+Adapters may write files and run local tools; they are the only place that may. "A brick cannot write files" is never a reason to drop an output.
+
