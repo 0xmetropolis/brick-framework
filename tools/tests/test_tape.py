@@ -78,13 +78,16 @@ class TakeTests(TapeCase):
         path = self.record()
         self.assertNotIn("contract_version", json.loads(path.read_text(encoding="utf-8")))
 
-    def test_the_old_take_format_points_at_the_converter(self) -> None:
+    def test_the_old_take_format_says_what_the_new_one_is_and_where_to_read_more(self) -> None:
         path = self.record()
         path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
         with self.assertRaises(tape.TapeError) as caught:
             tape.load("feed", "day1", {})
-        self.assertIn("old format (schema 1)", str(caught.exception))
-        self.assertIn("tools/convert_ports.py", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("is not in schema 2 (it has schema 1)", message)
+        self.assertIn("schema_version 2, source, take, epoch, recorded_in, request and exactly one of response or error", message)
+        self.assertIn("see the README, 'Moving a project to this version'", message)
+        self.assertNotIn("convert", message)
 
     def test_diff_covers_nested_lists_and_absent_fields(self) -> None:
         recorded = {"a": {"b": [1, 2]}, "gone": 1}

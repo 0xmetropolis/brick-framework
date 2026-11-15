@@ -72,7 +72,7 @@ SOURCE_FIELDS = {"kind", "epoch", "label", "followable"}
 JOINT_FIELDS = {"kind", "policy", "pin", "follow"}
 # Declarations that PORTS replaced; a manifest that still has one is in the old format.
 OLD_DECLARATIONS = ("SIBLING_DEPENDENCIES", "LIVE_ADAPTER", "MODE_PASSING", "LANE")
-CONVERTER = "tools/convert_ports.py"
+MIGRATION = "see the README, 'Moving a project to this version'"
 LOCAL_SUFFIX = ".local.json"
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
@@ -261,8 +261,9 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     if old:
         lint.add(
             path,
-            f"{', '.join(old)} belong to the old manifest format: declare PORTS instead, and the shape "
-            f"(sealed, entry or open) is computed (run python3 {CONVERTER} once to convert a project)",
+            f"{', '.join(old)} belong to the old manifest format. The manifest now declares every source and "
+            "joint in PORTS (a dict of port name to declaration) and the shape (sealed, entry or open) is computed "
+            f"from the ports and the files, never declared; {MIGRATION}",
         )
     ports = lint_ports(path, tree, lint)
     declared = ports is not None
@@ -563,12 +564,12 @@ def label_differences(recorded: Any, wanted: Any) -> list[str]:
 
 def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: Lint) -> None:
     for old, advice in (
-        ("input/data", "takes now live in input/tapes"),
-        ("input/evidence.py", "the loader is now input/tape.py"),
-        ("runner/runs", "run records are now ledger entries in runner/ledger"),
+        ("input/data", "the old takes folder: takes now live in input/tapes/<source>/<take>.json (schema 2)"),
+        ("input/evidence.py", "the old take loader: the loader is now input/tape.py, copied from bricks/example_brick"),
+        ("runner/runs", "the old run-record folder: ledger entries now live in runner/ledger"),
     ):
         if (brick / old).exists():
-            lint.add(brick / old, f"old path of the previous format; run python3 {CONVERTER} once ({advice})")
+            lint.add(brick / old, f"{advice}; {MIGRATION}")
     tapes = brick / "input/tapes"
     counts: dict[str, int] = {}
     for path in sorted(tapes.rglob("*.json")):
@@ -598,7 +599,11 @@ def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: 
             continue
         required = {"schema_version", "source", "take", "epoch", "recorded_in", "request"}
         if record.get("schema_version") != 2:
-            lint.add(path, f"take is not in schema 2 (the old format?); run python3 {CONVERTER} once to convert the project")
+            lint.add(
+                path,
+                "take is not in schema 2. A take has schema_version 2, source, take, epoch, recorded_in, request and "
+                f"exactly one of response or error; {MIGRATION}",
+            )
             continue
         if required - record.keys():
             lint.add(path, "take is missing required fields")

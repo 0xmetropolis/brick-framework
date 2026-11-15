@@ -20,7 +20,6 @@ This repository uses Python file boilerplate to organize one codebase as discret
 - Keep this repository as boilerplate. Do not add shared runtimes, generators, dependencies, or heavier enforcement unless the user explicitly requests them.
 - Keep enforcement in `tools/lint_bricks.py` lightweight and standard-library-only. Experience checks there are warnings: they say what to do instead.
 - A file copied into every brick (`input/tape.py`, `runner/run.py`, `runner/rng.py`) is boilerplate, not a shared runtime: it carries `# BOILERPLATE: <id>@<n>` and each brick owns its copy.
-- `tools/convert_ports.py` is the one exception to "no generators": a one-time conversion from the previous format that a project deletes once it has converted.
 
 ## Non-negotiable rules
 

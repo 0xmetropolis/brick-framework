@@ -26,7 +26,7 @@ from ..contract import PORTS
 TAPE_DIR = Path(__file__).with_name("tapes")
 DEFAULT_MAX_BYTES = 122_880
 SCHEMA_VERSION = 2
-CONVERTER = "tools/convert_ports.py"
+MIGRATION = "see the README, 'Moving a project to this version'"
 _SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _REDACTED_KEYS = {
     "access_token",
@@ -155,8 +155,9 @@ def load(source: str, take: str, request: dict[str, Any]) -> dict[str, Any]:
     record = json.loads(path.read_text(encoding="utf-8"))
     if record.get("schema_version") != SCHEMA_VERSION:
         raise TapeError(
-            f"take {path} is in the old format (schema {record.get('schema_version')}); "
-            f"run python3 {CONVERTER} once to convert the project"
+            f"take {path} is not in schema {SCHEMA_VERSION} (it has schema {record.get('schema_version')}). A take has "
+            "schema_version 2, source, take, epoch, recorded_in, request and exactly one of response or error; "
+            f"{MIGRATION}"
         )
     epoch = port["epoch"]
     if record.get("epoch") != epoch:

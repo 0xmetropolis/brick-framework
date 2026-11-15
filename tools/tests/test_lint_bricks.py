@@ -144,7 +144,7 @@ class ShapeTests(Fixture):
         self.contract(self.brick(), LANE='"strict"')
         self.assertError("LANE belong to the old manifest format")
         self.assertError("the shape (sealed, entry or open) is computed")
-        self.assertError("tools/convert_ports.py")
+        self.assertError("see the README, 'Moving a project to this version'")
 
     def test_a_manifest_that_cannot_be_read_reads_as_open(self) -> None:
         brick = self.brick()
@@ -401,11 +401,12 @@ class PortTests(Fixture):
         self.adapter(brick, "other", "def fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
         self.assertTrue(any("declared joint 'other' has no static adapter import" in w for w in self.warnings()))
 
-    def test_the_old_manifest_declarations_are_errors_that_name_the_converter(self) -> None:
+    def test_the_old_manifest_declarations_are_errors_that_say_what_the_new_format_is(self) -> None:
         brick = self.brick()
         self.contract(brick, SIBLING_DEPENDENCIES="{}", LIVE_ADAPTER="False", MODE_PASSING="()")
         self.assertError("SIBLING_DEPENDENCIES, LIVE_ADAPTER, MODE_PASSING belong to the old manifest format")
-        self.assertError("tools/convert_ports.py")
+        self.assertError("The manifest now declares every source and joint in PORTS")
+        self.assertError("see the README, 'Moving a project to this version'")
 
     def test_a_brick_with_a_port_is_not_sealed(self) -> None:
         brick = self.sealed_brick()
@@ -776,18 +777,18 @@ class TakeLintTests(Fixture):
         self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": {"api": "v2"}}}')
         self.assertError("take label differs from port 'example_source' (api: recorded \"nothing\", port \"v2\")")
 
-    def test_the_old_take_format_and_paths_point_at_the_converter(self) -> None:
+    def test_the_old_take_format_and_paths_say_what_the_new_ones_are(self) -> None:
         brick = self.brick()
         old = brick / "input/data/example_source"
         old.mkdir(parents=True)
         (old / "default.json").write_text('{"schema_version": 1}\n', encoding="utf-8")
-        self.assertError("input/data: old path of the previous format; run python3 tools/convert_ports.py once")
+        self.assertError("input/data: the old takes folder: takes now live in input/tapes/<source>/<take>.json (schema 2); see the README")
         (brick / "input/evidence.py").write_text("x = 1\n", encoding="utf-8")
-        self.assertError("input/evidence.py: old path of the previous format")
+        self.assertError("input/evidence.py: the old take loader: the loader is now input/tape.py, copied from bricks/example_brick")
         schema_one = brick / "input/tapes/example_source"
         schema_one.mkdir(parents=True, exist_ok=True)
         (schema_one / "default.json").write_text('{"schema_version": 1}\n', encoding="utf-8")
-        self.assertError("take is not in schema 2 (the old format?); run python3 tools/convert_ports.py once")
+        self.assertError("take is not in schema 2. A take has schema_version 2, source, take, epoch, recorded_in, request and exactly one of response or error")
 
 
 class LedgerTests(Fixture):
@@ -823,10 +824,10 @@ class LedgerTests(Fixture):
         self.entry(brick, "20260101-000002.json", fresh=[], followed=["game.source"])
         self.assertEqual(len([e for e in self.errors() if "tracked ledger entry" in e]), 1)
 
-    def test_the_old_runs_folder_points_at_the_converter(self) -> None:
+    def test_the_old_runs_folder_says_where_entries_live_now(self) -> None:
         brick = self.brick()
         (brick / "runner/runs").mkdir()
-        self.assertError("runner/runs: old path of the previous format; run python3 tools/convert_ports.py once")
+        self.assertError("runner/runs: the old run-record folder: ledger entries now live in runner/ledger")
 
     def test_the_template_ledger_folder_ignores_local_entries(self) -> None:
         self.assertIn("*.local.json", (ROOT / "bricks/example_brick/runner/ledger/.gitignore").read_text(encoding="utf-8"))

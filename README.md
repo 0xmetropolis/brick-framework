@@ -183,14 +183,21 @@ The input is JSON from a file or stdin. `--fresh` or `--record` alone means ever
 
 ## Moving a project to this version
 
-A project built on the previous version converts once, as a single cut, with `tools/convert_ports.py`. There is no compatibility mode: a brick in the old format fails the lint with a pointer to the script, and old manifests and takes are never read.
+A project built on the previous version moves over in one cut, by hand. There is no compatibility mode: a brick in the old format fails the lint with a message that says what the new format is and points here, and old manifests, takes and run records are never read. Do the steps below for every brick, then lint and test; merge only when both are clean.
 
-```sh
-python3 tools/convert_ports.py --dry-run     # converts a copy, prints what would change
-python3 tools/convert_ports.py               # converts the bricks under ./bricks in place
-```
+Start from this framework's files: `tools/`, `review/`, the `AGENTS.md` files, and the `# BOILERPLATE:` files of `bricks/example_brick`. Then, for each brick:
 
-It rewrites each brick's `contract.py` to `PORTS`, moves takes to schema 2 under `input/tapes`, moves `runner/runs` to `runner/ledger`, swaps in this framework's boilerplate (`tape.py`, `run.py`, `rng.py`), renames the config keys, and prints every call in your adapters and `src` that still uses an old name, with what to use instead. Change those by hand, run the linter and your tests, commit, then delete the script from the project.
+1. **Boilerplate.** Delete `input/evidence.py`. Copy `input/tape.py` (not for a brick that will have no ports), `runner/run.py` and `runner/rng.py` from `bricks/example_brick`. Rename the keys in `input/config.yml`: `retention.runs` to `retention.entries`, `saved_examples_per_adapter` to `takes_per_tape`, `max_evidence_bytes` to `max_take_bytes`, `max_run_record_bytes` to `max_entry_bytes`.
+2. **One adapter file per port.** Each outside source gets `input/adapters/<source>.py`, named for the port; each sibling the brick calls gets `input/adapters/<sibling>.py`, named for the sibling and importing only that sibling's `run`. Delete any adapter helper that is not a port (move it into the adapter that uses it).
+3. **The manifest.** In `contract.py`, delete `SIBLING_DEPENDENCIES`, `LIVE_ADAPTER`, `MODE_PASSING` and `LANE`, and declare `PORTS`:
+   - a source port per outside-source adapter: `{"kind": "source", "epoch": 1}`; add `"label"` with the old fingerprint if the source had one (a session needs it to go fresh or record), and `"followable": True` if the brick was a Live Adapter;
+   - a joint port per sibling: `{"kind": "joint", "policy": <the old policy>, "pin": <that sibling's CONTRACT_VERSION>}`; if the old brick passed its mode to that sibling, add `"follow": (<the sibling's followable source names>,)`;
+   - `PORTS = {}` for a brick with no adapters. That brick is sealed: it also loses `input/tape.py`, `input/adapters/` and `input/tapes/`, and the sealed rules apply to the whole brick.
+   - A workflow keeps its `__main__.py` and is now an entry brick; a brick that had `LANE = "workflow"` but no `__main__.py` is an open brick, and its smoke tests need one.
+4. **Call sites.** In adapters and `src/`, change the old names (table below). The linter holds the rest: it finds a sibling run that gets `fresh` or `record` outside a declared `follow`, an adapter that names another port's tape, a session on a source with no label.
+5. **Takes.** Move `input/data/<adapter>/<case>.json` to `input/tapes/<source>/<take>.json`, where `<source>` is the adapter file's name. Inside, rename `adapter` to `source`, `case` to `take`, `capture_run_id` to `recorded_in`, and the request's `fingerprint` key to `label`; delete `contract_version`; add `"epoch": 1`; set `"schema_version": 2`. Keep the JSON canonical (sorted keys, two-space indent, trailing newline). The lint then checks each take against its port's epoch and label.
+6. **The ledger.** Delete `runner/runs/`. Create `runner/ledger/` with a `.gitignore` containing `*.local.json` and a `.gitkeep`; old records are history and are not carried over. Set `BRICK_TEST=1` where smoke tests set `BRICK_RUN_KIND=test`.
+7. **Check.** Run `python3 tools/lint_bricks.py`, your tests, and one replay of each flow.
 
 | Before | After |
 | --- | --- |
@@ -198,6 +205,7 @@ It rewrites each brick's `contract.py` to `PORTS`, moves takes to schema 2 under
 | `LIVE_ADAPTER`, `MODE_PASSING`, `pass_mode` | `followable` on a source, `follow` on a joint, `tape.follow` |
 | `LANE` (strict, pure, workflow) | the computed shape: open, sealed, entry |
 | `evidence.py`, `through()`, `Transcript`, `load_example`, `save_example` | `tape.py`, `tape.once`, `tape.session`, `tape.load`, `tape.write` |
+| `provenance()`, `check_source`, `SourceMismatch`, `EvidenceError` | `tape.stamp`, `tape.verify`, `LabelMismatch`, `TapeError` |
 | `input/data/<adapter>/<case>.json`, `fingerprint`, `capture_run_id` | `input/tapes/<source>/<take>.json`, `label`, `recorded_in` |
 | `run(..., save=True)`, saved mode | `run(..., record=...)`, replay |
 | `runner/runs`, run records, `BRICK_RUN_KIND=test` | `runner/ledger`, ledger entries, `BRICK_TEST=1` |
