@@ -39,4 +39,6 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 - Do not import another brick's `src/`, `runner/`, configuration, or saved data.
 - Do not package bricks for, or expose them to, consumers outside this repository.
 
+A `pure` brick has no adapters, so it omits `input/adapters/`; every other lane requires the folder.
+
 Do not add `__init__.py` merely to mark folders. Keep the repository `bricks/` file for discovery, the brick-level file for the internal entry point, and `runner/__init__.py`. Add `runner/tests/__init__.py` only when a `workflow` brick has smoke tests. The other folders use namespace-package behavior.

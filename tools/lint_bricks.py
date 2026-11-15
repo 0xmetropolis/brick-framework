@@ -27,6 +27,8 @@ REQUIRED = (
     "runner/runs",
     "src/AGENTS.md",
 )
+# Required paths a lane may leave out, because the lane forbids what they hold.
+LANE_OPTIONAL = {"pure": ("input/adapters",)}
 CONFIG_DEFAULTS = {
     "runs": 10,
     "saved_examples_per_adapter": 3,
@@ -435,6 +437,9 @@ LANES = {
 
 def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     for relative in REQUIRED:
+        # A pure brick has no adapters, and Git cannot track the empty folder.
+        if relative in LANE_OPTIONAL.get(contract.lane, ()):
+            continue
         if not (brick / relative).exists():
             lint.add(brick / relative, "required brick path is missing")
     config_path = brick / "input/config.yml"

@@ -121,6 +121,29 @@ class PureLaneTests(Fixture):
         self.pure_brick()
         self.assertClean()
 
+    def test_pure_brick_needs_no_adapters_folder(self) -> None:
+        brick = self.pure_brick()
+        shutil.rmtree(brick / "input/adapters")
+        self.assertClean()
+
+    def test_strict_brick_still_needs_adapters_folder(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, LANE='"strict"')
+        shutil.rmtree(brick / "input/adapters")
+        self.assertError("input/adapters: required brick path is missing")
+
+    def test_workflow_brick_still_needs_adapters_folder(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, LANE='"workflow"')
+        shutil.rmtree(brick / "input/adapters")
+        self.assertError("input/adapters: required brick path is missing")
+
+    def test_pure_brick_without_the_folder_still_may_not_gain_adapters(self) -> None:
+        brick = self.pure_brick()
+        self.assertTrue((brick / "input/adapters").is_dir())
+        (brick / "input/adapters/other.py").write_text("x = 1\n", encoding="utf-8")
+        self.assertError("pure brick may not have adapters")
+
     def test_template_is_not_pure(self) -> None:
         # The template ships one adapter and a filesystem evidence loader:
         # both are exactly what a pure brick gives up.
