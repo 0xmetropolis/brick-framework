@@ -377,6 +377,12 @@ class AdapterExperienceTests(Fixture):
         self.adapter(brick, "tool", "import subprocess\n\n\ndef encode(request, ctx):\n    return {}\n")
         self.assertTrue(any("tool.py: adapter never calls load_example" in w for w in self.warnings()))
 
+    def test_through_and_transcript_count_as_a_saved_mode(self) -> None:
+        brick = self.brick()
+        self.adapter(brick, "a", "from ..evidence import through\n\n\ndef f(ctx):\n    return through(ctx, 'a', 'c', {}, dict)\n")
+        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c')\n")
+        self.assertTrue(all("never calls" not in w for w in self.warnings()))
+
     def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
         self.brick("other")
         brick = self.brick()

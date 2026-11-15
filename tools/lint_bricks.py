@@ -59,6 +59,8 @@ PURE_STDLIB = {
     "ipaddress", "itertools", "json", "keyword", "math", "numbers", "operator", "pprint", "re", "reprlib",
     "shlex", "statistics", "string", "struct", "textwrap", "types", "typing", "unicodedata", "warnings", "zlib",
 }
+# Calls in evidence.py that give an adapter its saved mode.
+SAVED_MODE_CALLS = {"load_example", "through", "Transcript"}
 # A BrickInput field with one of these names selects an operation: the split signal.
 DISPATCH_FIELDS = {"op", "flow", "action", "operation", "kind"}
 OPTIONAL_FIELD_LIMIT = 6
@@ -426,10 +428,10 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                         "source live from this brick, give this brick its own adapter for it "
                         "(input/AGENTS.md, Sources several bricks share)",
                     )
-        if adapter and not imports_sibling and "load_example" not in calls:
+        if adapter and not imports_sibling and not calls & SAVED_MODE_CALLS:
             lint.add(
                 path,
-                "adapter never calls load_example, so it has no saved mode; a file or tool adapter "
+                "adapter never calls load_example, through or Transcript, so it has no saved mode; a file or tool adapter "
                 "replays a recorded manifest (input/AGENTS.md, Recorded data)",
                 warning=True,
             )
