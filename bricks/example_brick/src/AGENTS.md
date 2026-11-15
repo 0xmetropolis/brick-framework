@@ -5,9 +5,10 @@ This folder owns the brick's private domain logic. Its internal organization is 
 - Receive the brick input and a plain run context from `runner/`.
 - Decide when external or sibling-brick data is needed and call adapters from this brick's `input/` folder.
 - Pass the run context into every adapter so it can apply saved, fresh, or save behavior.
-- Do not implement mode branching here; each adapter owns that behavior using the mode in the run context.
+- Do not implement mode branching here; each adapter owns that behavior using the mode in the run context. The linter warns when `src/` reads `mode` from the run context.
 - Do not perform direct network, database, filesystem, subprocess, environment, clock, or sibling-brick calls. Those calls must go through adapters.
 - Do not import sibling bricks directly. Import only this brick's input adapters.
+- Return values, not files. Render, encode and decode in memory (`io.BytesIO`, `bytes`, `str`) and hand the result back as data; adapters write files and run external tools. The `open` check is name-based, so any call named `open` in `src/` is flagged, even on an in-memory buffer; use a library's in-memory decoder that is not named `open`.
 - Libraries are allowed only when their use is local and does not make external calls.
 - Keep behavior deterministic for the same supplied inputs unless randomness is explicitly passed in. A brick that declares `LANE = "pure"` has the linter hold it to this: no clock calls, no `random` or `time`, no adapters at all.
 - Export functions only for use by this brick's `runner/`; the repository-internal brick entry point remains `run` alone.
