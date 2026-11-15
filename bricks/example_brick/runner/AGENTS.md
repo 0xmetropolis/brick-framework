@@ -16,6 +16,7 @@ This folder owns orchestration, brick-local run identity, run history, and smoke
 ## Run records
 
 - Record every run, including failures and tests, under `runs/` using its brick-local run ID. With `BRICK_RUN_KIND=test` the record is `<run id>.test.json`: still recorded and bounded (its own retention), but gitignored by `runs/.gitignore`, so tests do not churn tracked history.
+- When a workflow passes its mode to a Live Adapter sibling, the adapter's `pass_mode` adds the sibling's name to `run_context["fresh_siblings"]` and the record lists it as `fresh_siblings`. This is a plain list the runner copies for record-keeping; `src` never reads it and the runner never calls an adapter.
 - Each run-outcome record includes the run ID, kind (`run` or `test`), mode (`saved`, `fresh`, or `save`), input, output or error, and timestamp.
 - Input evidence captured by an explicit save operation carries the same run ID and can be joined outside the runner.
 - `run` may be called from several threads at once (a workflow's threads calling one sibling). Recording and pruning must tolerate a record another call already removed.

@@ -1,4 +1,4 @@
-# BOILERPLATE: evidence@2
+# BOILERPLATE: evidence@5
 """Small, Git-stable saved-example storage for this brick.
 
 Copy this file with the brick boilerplate. It deliberately has no dependency
@@ -41,6 +41,43 @@ _MISSING = object()
 
 class EvidenceError(RuntimeError):
     """Saved evidence is absent, unsafe, invalid, or does not match."""
+
+
+class SourceMismatch(EvidenceError):
+    """The live source is not the one the saved examples were recorded against."""
+
+
+def check_source(run_context: dict[str, Any], fingerprint: dict[str, Any], observed: dict[str, Any]) -> None:
+    """On connect, refuse to continue when the live source differs from the recorded fingerprint.
+
+    ``fingerprint`` is what the examples were recorded against (a game version, a build, a
+    protocol); ``observed`` is what the live source reports now. Only the keys of the
+    fingerprint are compared, so the source may report more. Saved mode connects to
+    nothing and passes. A mismatch is an error in fresh and save: a run against a different
+    source would record or compare the wrong thing.
+    """
+    if run_context["mode"] == "saved":
+        return
+    differences = [
+        f"{key}: recorded against {json.dumps(expected)}, the source reports "
+        + (json.dumps(observed[key]) if key in observed else "nothing")
+        for key, expected in sorted(fingerprint.items())
+        if observed.get(key) != expected
+    ]
+    if differences:
+        raise SourceMismatch(
+            "the live source does not match the fingerprint of the saved examples ("
+            + "; ".join(differences)
+            + "); use the matching source, or change the fingerprint and re-record with save"
+        )
+
+
+def _with_fingerprint(request: dict[str, Any], fingerprint: dict[str, Any] | None) -> dict[str, Any]:
+    if not fingerprint:
+        return request
+    if "fingerprint" in request:
+        raise EvidenceError("the request already has a 'fingerprint' key; the fingerprint is added for you")
+    return {"fingerprint": fingerprint, **request}
 
 
 def load_example(adapter: str, case: str, request: dict[str, Any]) -> dict[str, Any]:
@@ -159,20 +196,50 @@ def provenance(record: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"recorded": True, "capture_run_id": record["capture_run_id"]}
 
 
+def pass_mode(run_context: dict[str, Any], sibling: str) -> dict[str, bool]:
+    """Mode passing: turn this brick's mode into the ``fresh`` and ``save`` flags for one sibling.
+
+    A workflow adapter calls the sibling like this and nothing else is allowed to
+    supply those two keywords (the linter checks)::
+
+        flags = pass_mode(run_context, "game_client")
+        run(inputs, fresh=flags["fresh"], save=flags["save"])
+
+    saved gives (False, False), fresh gives (True, False), save gives (True, True).
+    When the sibling will run fresh its name is added to ``run_context["fresh_siblings"]``,
+    which the runner copies into this brick's run record: a plain list for record-keeping,
+    never read by ``src``. The sibling must declare ``LIVE_ADAPTER = True`` in its
+    contract and this brick must list it in ``MODE_PASSING``.
+    """
+    mode = run_context["mode"]
+    flags = {"fresh": mode in ("fresh", "save"), "save": mode == "save"}
+    if flags["fresh"]:
+        listed = run_context.setdefault("fresh_siblings", [])
+        if sibling not in listed:
+            listed.append(sibling)
+    return flags
+
+
 def _max_bytes(run_context: dict[str, Any]) -> int:
     return int(run_context.get("config", {}).get("limits", {}).get("max_evidence_bytes", DEFAULT_MAX_BYTES))
 
 
 def through(
-    run_context: dict[str, Any], adapter: str, case: str, request: dict[str, Any], live: Any
+    run_context: dict[str, Any], adapter: str, case: str, request: dict[str, Any], live: Any,
+    *, fingerprint: dict[str, Any] | None = None, record_errors: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     """The saved / fresh / save contract for one adapter call: returns ``(response, provenance)``.
 
     saved  replay the example for ``case`` (request must match; a recorded error is raised)
     fresh  call ``live()``; nothing is written
     save   call ``live()`` and atomically replace the example, a failure included
-    ``live`` takes no arguments and returns a JSON value.
+           (pass ``record_errors=False`` for a paid or hard-to-repeat call: a failure then
+           raises and leaves the saved example as it was)
+    ``live`` takes no arguments and returns a JSON value. A ``fingerprint`` (a game version, a
+    build, a protocol) is merged into the request, so an example recorded against another
+    source version is stale and says which field changed.
     """
+    request = _with_fingerprint(request, fingerprint)
     mode = run_context["mode"]
     if mode == "saved":
         record = load_example(adapter, case, request)
@@ -182,7 +249,7 @@ def through(
     try:
         response = live()
     except Exception as exc:
-        if mode == "save":
+        if mode == "save" and record_errors:
             save_example(adapter, case, run_context["run_id"], request, error={"type": type(exc).__name__}, max_bytes=_max_bytes(run_context))
         raise
     if mode == "save":
@@ -198,9 +265,18 @@ class Transcript:
     must match, like any example, so one stale window is found and re-recorded alone. Its response is
     the ordered list of operations; in saved mode each ``op`` must equal the next recorded one.
     ``record`` is True (every window), a list of window names, or False; it only matters in save mode.
+
+    ``fingerprint`` is required: what the source is (game version, build, protocol). It is merged
+    into every window's request, so a window recorded against another version is stale and the
+    error names the field. In fresh and save, call ``check_source(observed)`` after connecting.
     """
 
-    def __init__(self, run_context: dict[str, Any], adapter: str, case: str, record: Any = True) -> None:
+    def __init__(
+        self, run_context: dict[str, Any], adapter: str, case: str, record: Any = True, *, fingerprint: dict[str, Any]
+    ) -> None:
+        if not isinstance(fingerprint, dict) or not fingerprint:
+            raise EvidenceError("a Transcript needs a non-empty source fingerprint (game version, build, protocol)")
+        self.fingerprint = _normalize(fingerprint)
         self.context, self.adapter, self.case, self.record = run_context, adapter, case, record
         self.mode = run_context["mode"]
         self.window = ""
@@ -211,11 +287,15 @@ class Transcript:
     def _wants(self, window: str) -> bool:
         return self.mode == "save" and (self.record is True or (isinstance(self.record, list) and window in self.record))
 
+    def check_source(self, observed: dict[str, Any]) -> None:
+        """Compare what the live source reports with the fingerprint; refuse to continue on a mismatch."""
+        check_source(self.context, self.fingerprint, observed)
+
     def begin(self, window: str, request: dict[str, Any]) -> dict[str, Any]:
         """Close the open window and start the next; returns the provenance of the window."""
         self.end()
         self.window = window
-        self.request = _normalize({"window": window, **request})
+        self.request = _normalize({"window": window, **_with_fingerprint(request, self.fingerprint)})
         self.entries, self.cursor = [], 0
         if self.mode == "saved":
             record = load_example(self.adapter, f"{self.case}-{window}", self.request)

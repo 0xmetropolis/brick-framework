@@ -24,6 +24,7 @@ This repository uses Python file boilerplate to organize one codebase as discret
 - Every brick declares a typed, versioned input and output boundary in `contract.py`.
 - A brick exposes only its `run` entry point to sibling bricks.
 - External access crosses an external-source adapter; sibling-brick access crosses a sibling adapter.
+- A **Live Adapter** drives a live source over a session, records it through `Transcript` or `through()`, and replays by default. The only way a workflow's mode reaches a sibling is mode passing to a Live Adapter sibling that opted in; everything else a sibling does replays.
 - Every sibling dependency declares its consistency policy as `eventual` or `orchestrated`. Dependency cycles are not allowed; introduce or reshape a parent brick instead.
 - Every persistent application-state resource has exactly one owning brick. Brick-local evidence folders are owned implicitly by their brick.
 - Bricks are used only inside this repository. Do not package or expose them for outside consumers.

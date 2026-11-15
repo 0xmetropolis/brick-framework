@@ -148,6 +148,126 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
+PASSING_ADAPTER = (
+    "from bricks.game import run\nfrom ..evidence import pass_mode\n\n\n"
+    "def step(ctx, request):\n    flags = pass_mode(ctx, 'game')\n"
+    "    return run(request, fresh=flags['fresh'], save=flags['save'])\n"
+)
+RECORDING_ADAPTER = (
+    "from ..evidence import through\n\n\ndef call(ctx, request):\n"
+    "    return through(ctx, 'game_source', 'c', request, dict)\n"
+)
+
+
+class FingerprintLintTests(Fixture):
+    def test_a_transcript_without_a_fingerprint_warns(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/game.py").write_text(
+            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c')\n", encoding="utf-8"
+        )
+        self.assertTrue(any("game.py: Transcript is created without fingerprint=" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_a_transcript_with_one_is_clean(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/game.py").write_text(
+            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n", encoding="utf-8"
+        )
+        self.assertClean()
+
+
+class ModePassingTests(Fixture):
+    def pair(self, *, adapter: str = PASSING_ADAPTER, policy: str = "orchestrated", opt_in: bool = True, listed: bool = True) -> tuple[Path, Path]:
+        game = self.brick("game")
+        self.contract(game, LIVE_ADAPTER="True" if opt_in else "False")
+        (game / "input/adapters/game_source.py").write_text(RECORDING_ADAPTER, encoding="utf-8")
+        flow = self.brick("flow")
+        self.contract(flow, LANE='"workflow"', SIBLING_DEPENDENCIES='{"game": "%s"}' % policy, MODE_PASSING='("game",)' if listed else "()")
+        (flow / "input/adapters/game.py").write_text(adapter, encoding="utf-8")
+        return flow, game
+
+    def test_a_declared_helper_fed_call_lints_clean(self) -> None:
+        self.pair()
+        self.assertClean()
+
+    def test_the_helper_can_be_called_inline(self) -> None:
+        self.pair(adapter=PASSING_ADAPTER.replace("    flags = pass_mode(ctx, 'game')\n", "").replace("flags['fresh']", "pass_mode(ctx, 'game')['fresh']").replace("flags['save']", "pass_mode(ctx, 'game')['save']"))
+        self.assertClean()
+
+    def test_a_hard_coded_flag_is_an_error(self) -> None:
+        self.pair(adapter=PASSING_ADAPTER.replace("fresh=flags['fresh']", "fresh=True"))
+        self.assertError("fresh= for 'game' must be pass_mode(ctx, 'game')['fresh'], not a value written here")
+
+    def test_expanded_keyword_arguments_are_an_error(self) -> None:
+        self.pair(adapter=PASSING_ADAPTER.replace("fresh=flags['fresh'], save=flags['save']", "**flags"))
+        self.assertError("may not receive expanded keyword arguments")
+        self.assertError("must give both fresh and save")
+
+    def test_giving_only_one_flag_is_an_error(self) -> None:
+        self.pair(adapter=PASSING_ADAPTER.replace(", save=flags['save']", ""))
+        self.assertError("must give both fresh and save")
+
+    def test_flags_made_for_another_sibling_are_an_error(self) -> None:
+        self.pair(adapter=PASSING_ADAPTER.replace("pass_mode(ctx, 'game')", "pass_mode(ctx, 'other')"))
+        self.assertError("pass_mode for 'other', which is not listed in MODE_PASSING")
+        self.assertError("fresh= for 'game' must be pass_mode(ctx, 'game')['fresh']")
+
+    def test_a_sibling_that_has_not_opted_in_is_an_error(self) -> None:
+        self.pair(opt_in=False)
+        self.assertError("MODE_PASSING names 'game', which does not declare LIVE_ADAPTER = True")
+
+    def test_the_dependency_must_be_orchestrated(self) -> None:
+        self.pair(policy="eventual")
+        self.assertError("MODE_PASSING names 'game', which must be an orchestrated dependency")
+
+    def test_not_listing_the_sibling_makes_the_flags_an_error(self) -> None:
+        self.pair(listed=False)
+        self.assertError("sibling run may not receive fresh or save unless")
+
+    def test_mode_passing_must_name_a_dependency(self) -> None:
+        flow, _ = self.pair()
+        self.contract(flow, SIBLING_DEPENDENCIES="{}", MODE_PASSING='("game",)')
+        (flow / "input/adapters/game.py").unlink()
+        self.assertError("MODE_PASSING names 'game', which is not a sibling dependency")
+
+    def test_only_a_workflow_may_pass_its_mode(self) -> None:
+        brick = self.brick()
+        self.contract(brick, MODE_PASSING='("x",)')
+        self.assertError("only a workflow may pass its mode to a sibling (MODE_PASSING)")
+
+    def test_a_live_adapter_is_strict_lane(self) -> None:
+        self.contract(self.pure_brick(), LIVE_ADAPTER="True")
+        self.assertError("a Live Adapter brick is in the strict lane")
+
+    def test_a_live_adapter_must_record_through_the_helpers(self) -> None:
+        game = self.brick("game")
+        self.contract(game, LIVE_ADAPTER="True")
+        self.assertError("LIVE_ADAPTER = True, but no adapter records through Transcript or through()")
+
+    def test_a_transcript_adapter_counts(self) -> None:
+        game = self.brick("game")
+        self.contract(game, LIVE_ADAPTER="True")
+        (game / "input/adapters/game_source.py").write_text(
+            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n", encoding="utf-8"
+        )
+        self.assertFalse([e for e in self.errors() if "LIVE_ADAPTER" in e])
+
+    def test_declarations_must_be_well_formed(self) -> None:
+        brick = self.brick()
+        self.contract(brick, LIVE_ADAPTER='"yes"', MODE_PASSING="3")
+        self.assertError("LIVE_ADAPTER must be True or False")
+        self.assertError("MODE_PASSING must list sibling brick names")
+
+    def test_an_ordinary_sibling_still_gets_no_flags(self) -> None:
+        other = self.brick("other")
+        flow = self.brick("flow")
+        self.contract(flow, SIBLING_DEPENDENCIES='{"other": "eventual"}')
+        (flow / "input/adapters/other.py").write_text(
+            "from bricks.other import run\n\n\ndef f(request):\n    return run(request, fresh=True)\n", encoding="utf-8"
+        )
+        self.assertError("sibling run may not receive fresh or save unless")
+
+
 class DispatcherTests(Fixture):
     def input_class(self, brick: Path, header: str, fields: list[str]) -> None:
         path = brick / "contract.py"
@@ -380,7 +500,7 @@ class AdapterExperienceTests(Fixture):
     def test_through_and_transcript_count_as_a_saved_mode(self) -> None:
         brick = self.brick()
         self.adapter(brick, "a", "from ..evidence import through\n\n\ndef f(ctx):\n    return through(ctx, 'a', 'c', {}, dict)\n")
-        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c')\n")
+        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c', fingerprint={'v': 1})\n")
         self.assertTrue(all("never calls" not in w for w in self.warnings()))
 
     def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
@@ -426,8 +546,8 @@ class AdapterExperienceTests(Fixture):
             brick, "other",
             "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request, fresh=True)\n",
         )
-        self.assertError("a sibling always replays")
-        self.assertError("Sources several bricks share")
+        self.assertError("sibling run may not receive fresh or save unless the sibling declares LIVE_ADAPTER = True")
+        self.assertError("MODE_PASSING")
 
 
 class EvidenceSizeTests(Fixture):

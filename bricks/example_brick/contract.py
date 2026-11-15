@@ -20,6 +20,16 @@ LANE = "strict"
 # comment. Omit it and the brick makes no promise and gets no check.
 DETERMINISTIC = True
 
+# True when this brick is a Live Adapter: it drives a live source over a session,
+# records it through Transcript or through(), and replays by default. Only such a
+# brick may receive a workflow's mode (strict lane; see README, Live Adapters).
+LIVE_ADAPTER = False
+
+# A workflow only: the Live Adapter siblings it passes its mode to. Each must be an
+# orchestrated dependency that declares LIVE_ADAPTER = True, and the adapter must
+# take the flags from pass_mode(). Everything else a workflow calls replays.
+MODE_PASSING: tuple[str, ...] = ()
+
 # Map sibling brick names to "eventual" or "orchestrated".
 SIBLING_DEPENDENCIES: dict[str, str] = {}
 
