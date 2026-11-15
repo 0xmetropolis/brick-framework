@@ -181,11 +181,16 @@ def build(root: Path, *, record: bool = True) -> Path:
     assistant = brick(root, "assistant", ASSISTANT_CONTRACT, ASSISTANT_LOGIC, {"xai.py": ASSISTANT_XAI})
     (assistant / "input/tapes").mkdir()
     if record:
-        done = subprocess.run(
-            [sys.executable, str(ROOT / "tools/run_brick.py"), "chat", "--root", str(root), "--test", "--record", "*"],
-            input='{"user": "ada", "goal": "ship"}', capture_output=True, text=True, check=False,
-            env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin"},
-        )
-        if done.returncode != 0:
-            raise RuntimeError(f"recording the sample project failed: {done.stderr}")
+        record_takes(root)
     return root
+
+
+def record_takes(root: Path) -> None:
+    """Record every source of the project once, through ``chat``, from the stubs."""
+    done = subprocess.run(
+        [sys.executable, str(ROOT / "tools/run_brick.py"), "chat", "--root", str(root), "--test", "--record", "*"],
+        input='{"user": "ada", "goal": "ship"}', capture_output=True, text=True, check=False,
+        env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin"},
+    )
+    if done.returncode != 0:
+        raise RuntimeError(f"recording the sample project failed: {done.stderr}")
