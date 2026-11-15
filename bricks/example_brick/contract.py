@@ -7,12 +7,6 @@ from typing import TypedDict
 # Joints in other bricks pin the version they were written against.
 CONTRACT_VERSION = 1
 
-# The enforcement class this brick declares for itself: "strict" (the regular
-# brick), "pure" (output is a function of input alone), or "workflow" (invoked
-# as a whole, never depended on). A lane only adds rules. Omitting it means
-# "strict".
-LANE = "strict"
-
 # Meaning: the same input and the same adapter answers give the same output.
 # What an adapter returns (a game state, a model answer) is an input to src/, so a
 # brick that calls a live source can still say True; the promise is about src/.
@@ -23,8 +17,10 @@ LANE = "strict"
 DETERMINISTIC = True
 
 # Every crossing of the brick boundary, declared once and implemented by one file
-# of the same name under input/adapters/. A brick with no ports is sealed:
-# PORTS = {} and no input/adapters/ or input/tapes/.
+# of the same name under input/adapters/. Nothing else says what kind of brick this
+# is: the tools compute its shape from these ports and its files. No ports (PORTS = {},
+# no input/adapters/ or input/tapes/) is a sealed brick; a __main__.py makes an entry
+# brick; everything else is open.
 #
 # A source port reaches an outside system.
 #   epoch      bumped when the adapter's request or response meaning changes; takes

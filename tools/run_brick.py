@@ -3,8 +3,8 @@
 
     python3 tools/run_brick.py <brick> [--input FILE|-] [--fresh [PORT ...]] [--record [PORT ...]] [--test]
 
-This is the way to record or refresh the takes of a brick that has no process
-door: a model brick, a source adapter's brick. It lives outside the bricks,
+This is the way to record or refresh the takes of a brick that has no
+``__main__.py``: a model brick, a source adapter's brick. It lives outside the bricks,
 imports only the brick's top-level ``run`` and passes the JSON input unchanged.
 ``--fresh`` or ``--record`` alone means every source port of that brick; with
 names it means those ports (``rates``, ``assistant.xai``, or ``'*'``). ``--record``

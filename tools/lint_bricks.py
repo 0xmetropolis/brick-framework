@@ -47,8 +47,8 @@ DIRECT_IO = {
 DIRECT_IO_DOTTED = {"logging.handlers", "logging.config"}
 # Ways to reach a banned module without importing it by name.
 ESCAPE_CALLS = {"__import__", "eval", "exec"}
-# The standard-library modules a pure brick may import: no I/O, clock, randomness, threads or process state.
-PURE_STDLIB = {
+# The standard-library modules a sealed brick may import: no I/O, clock, randomness, threads or process state.
+SEALED_STDLIB = {
     "__future__", "abc", "array", "ast", "base64", "binascii", "bisect", "calendar", "cmath", "codecs",
     "collections", "colorsys", "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "difflib",
     "enum", "fnmatch", "fractions", "functools", "graphlib", "hashlib", "heapq", "hmac", "html", "io",
@@ -71,7 +71,7 @@ PORT_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 SOURCE_FIELDS = {"kind", "epoch", "label", "followable"}
 JOINT_FIELDS = {"kind", "policy", "pin", "follow"}
 # Declarations that PORTS replaced; a manifest that still has one is in the old format.
-OLD_DECLARATIONS = ("SIBLING_DEPENDENCIES", "LIVE_ADAPTER", "MODE_PASSING")
+OLD_DECLARATIONS = ("SIBLING_DEPENDENCIES", "LIVE_ADAPTER", "MODE_PASSING", "LANE")
 CONVERTER = "tools/convert_ports.py"
 LOCAL_SUFFIX = ".local.json"
 SENSITIVE = {
@@ -85,8 +85,13 @@ class Contract:
     version: int = 0
     ports: dict[str, dict[str, Any]] = field(default_factory=dict)
     owned_state: tuple[str, ...] = ()
-    lane: str = "strict"
     deterministic: bool | None = None
+    declared: bool = True
+
+    @property
+    def sealed(self) -> bool:
+        """No ports: the brick reaches nothing outside itself."""
+        return self.declared and not self.ports
 
     @property
     def joints(self) -> dict[str, dict[str, Any]]:
@@ -242,7 +247,6 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
 
     version = assigned_literal(tree, "CONTRACT_VERSION")
     owned_state = assigned_literal(tree, "OWNED_STATE")
-    lane = assigned_literal(tree, "LANE")
     deterministic = assigned_literal(tree, "DETERMINISTIC")
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
@@ -257,10 +261,11 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     if old:
         lint.add(
             path,
-            f"{', '.join(old)} are declarations of the old manifest format; declare PORTS instead "
-            f"(run python3 {CONVERTER} once to convert a project)",
+            f"{', '.join(old)} belong to the old manifest format: declare PORTS instead, and the shape "
+            f"(sealed, entry or open) is computed (run python3 {CONVERTER} once to convert a project)",
         )
     ports = lint_ports(path, tree, lint)
+    declared = ports is not None
     if not isinstance(owned_state, (tuple, list)) or not all(
         isinstance(item, str) and item for item in owned_state
     ):
@@ -307,13 +312,7 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
                     "use a base64 string or a manifest (input/AGENTS.md, Recorded data)",
                     warning=True,
                 )
-    if lane is None:
-        lane = "strict"
-    elif lane not in LANES:
-        lint.add(path, f"LANE must be one of {', '.join(sorted(LANES))}")
-        lane = "strict"
-
-    return Contract(version, ports, tuple(owned_state), lane, deterministic)
+    return Contract(version, ports or {}, tuple(owned_state), deterministic, declared)
 
 
 def json_safe(value: Any) -> bool:
@@ -324,8 +323,8 @@ def json_safe(value: Any) -> bool:
     return True
 
 
-def lint_ports(path: Path, tree: ast.Module, lint: Lint) -> dict[str, dict[str, Any]]:
-    """Validate ``PORTS`` and return the well-formed ports."""
+def lint_ports(path: Path, tree: ast.Module, lint: Lint) -> dict[str, dict[str, Any]] | None:
+    """Validate ``PORTS`` and return the well-formed ports, or None when they are not declared as a dict."""
     declared = assigned_literal(tree, "PORTS")
     if not any(
         (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PORTS" for t in node.targets))
@@ -333,10 +332,10 @@ def lint_ports(path: Path, tree: ast.Module, lint: Lint) -> dict[str, dict[str, 
         for node in tree.body
     ):
         lint.add(path, "PORTS is not declared; declare every source and joint (PORTS = {} for a brick with none)")
-        return {}
+        return None
     if not isinstance(declared, dict):
         lint.add(path, "PORTS must be a dict literal mapping port names to declarations")
-        return {}
+        return None
     ports: dict[str, dict[str, Any]] = {}
     for name, port in declared.items():
         if not isinstance(name, str) or not PORT_NAME.fullmatch(name):
@@ -661,10 +660,10 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
         return
     if not (tests_dir / "__init__.py").is_file():
         lint.add(tests_dir / "__init__.py", "smoke-test package marker is missing")
-    if contract.lane != "workflow":
-        lint.add(tests_dir, "smoke tests belong only to workflow bricks")
+    if not (brick / "__main__.py").is_file():
+        lint.add(tests_dir, "smoke tests belong only to entry bricks (a brick with a __main__.py)")
     if len(tests) > 3:
-        lint.add(tests_dir, "a workflow may have at most three smoke-test files")
+        lint.add(tests_dir, "an entry brick may have at most three smoke-test files")
     for path in tests:
         tree = lint.tree(path)
         if not tree:
@@ -696,11 +695,7 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(path, "smoke test must use from bricks.<name> import run")
 
 
-def lint_strict(brick: Path, contract: Contract, lint: Lint) -> None:
-    """The regular lane. Every rule above already applies; this adds none."""
-
-
-PURE_FORBIDDEN = DIRECT_IO | {"random", "time"}
+SEALED_FORBIDDEN = DIRECT_IO | {"random", "time"}
 CLOCK_CALLS = {"now", "today", "utcnow"}
 # What a brick that declares DETERMINISTIC = True keeps out of src/.
 NONDETERMINISTIC_MODULES = {
@@ -714,11 +709,11 @@ def lint_deterministic(brick: Path, contract: Contract, lint: Lint) -> None:
     A brick that says nothing makes no promise and gets no check. A brick that
     declares ``True`` may not reach for the clock, randomness, threads or
     generated IDs in ``src/`` (adapters are where such things enter, as inputs).
-    The pure lane already holds its whole brick to this, so it may not say ``False``.
+    A sealed brick is held to this across the whole brick, so it may not say ``False``.
     """
-    if contract.lane == "pure" and contract.deterministic is False:
-        lint.add(brick / "contract.py", "a pure brick is deterministic by definition; remove DETERMINISTIC = False")
-    if contract.deterministic is not True or contract.lane == "pure":
+    if contract.sealed and contract.deterministic is False:
+        lint.add(brick / "contract.py", "a sealed brick is deterministic by definition; remove DETERMINISTIC = False")
+    if contract.deterministic is not True or contract.sealed:
         return
     for path in sorted((brick / "src").rglob("*.py")):
         tree = lint.tree(path)
@@ -742,23 +737,22 @@ def lint_deterministic(brick: Path, contract: Contract, lint: Lint) -> None:
                 )
 
 
-def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
-    """A pure brick's output is a function of its input and nothing else.
+def lint_sealed(brick: Path, contract: Contract, lint: Lint) -> None:
+    """A sealed brick has no ports, so its output is a function of its input and nothing else.
 
-    Adapters are the only sanctioned channel to the outside, so a pure brick
-    has none, and therefore no sibling dependencies either. The direct-I/O
+    Ports are the only sanctioned channel to the outside, so a sealed brick has
+    no adapters and no tapes. The direct-I/O
     ban every ``src/`` already carries widens to the whole brick, joined by
     ``random`` and ``time``, and by the clock calls the ``src/`` contract has
     always forbidden in prose. ``runner/`` is the one exemption: it writes
     ledger entries and owns ``rng.py``, so it keeps the filesystem and
     randomness the rest of the brick gives up. ``datetime`` stays importable:
-    arithmetic on a caller-supplied time is pure; reading ``now()`` is not.
+    arithmetic on a caller-supplied time is allowed; reading ``now()`` is not.
     """
-    adapters = sorted((brick / "input/adapters").glob("*.py"))
-    for path in adapters:
-        lint.add(path, "pure brick may not have adapters")
-    if contract.ports:
-        lint.add(brick / "contract.py", "pure brick may not declare ports: it has no sources and no joints")
+    for folder, what in (("input/adapters", "adapters"), ("input/tapes", "tapes")):
+        for path in sorted((brick / folder).rglob("*")) if (brick / folder).is_dir() else ():
+            if path.is_file() and path.name != ".gitkeep":
+                lint.add(path, f"sealed brick may not have {what}: it has no ports")
     stdlib = stdlib_names()
     for path in brick.rglob("*.py"):
         relative = path.relative_to(brick).parts
@@ -768,7 +762,7 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
         if not tree:
             continue
         if relative[0] != "src":
-            escape_hatches(path, tree, lint, "pure brick")
+            escape_hatches(path, tree, lint, "sealed brick")
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for module in imported_modules(node):
@@ -776,46 +770,38 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
                     if (
                         stdlib is not None
                         and name in stdlib
-                        and name not in PURE_STDLIB
-                        and name not in PURE_FORBIDDEN
+                        and name not in SEALED_STDLIB
+                        and name not in SEALED_FORBIDDEN
                     ):
-                        lint.add(path, f"pure brick imports standard-library module {name!r}, which is not on the pure allowlist")
+                        lint.add(path, f"sealed brick imports standard-library module {name!r}, which is not on the sealed allowlist")
                     if ".".join(module.lstrip(".").split(".")[:2]) in DIRECT_IO_DOTTED and relative[0] != "src":
-                        lint.add(path, f"pure brick imports {'.'.join(module.split('.')[:2])!r} outside runner/")
+                        lint.add(path, f"sealed brick imports {'.'.join(module.split('.')[:2])!r} outside runner/")
                     # src/ already reports DIRECT_IO under the rule every brick gets.
-                    if name in PURE_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
+                    if name in SEALED_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
                         hint = (
-                            "; a pure brick has no ports, so delete input/tape.py"
+                            "; a sealed brick has no ports, so delete input/tape.py"
                             if relative == ("input", "tape.py")
                             else ""
                         )
-                        lint.add(path, f"pure brick imports {name!r} outside runner/{hint}")
+                        lint.add(path, f"sealed brick imports {name!r} outside runner/{hint}")
             if isinstance(node, ast.Call) and called_name(node) in CLOCK_CALLS:
-                lint.add(path, f"pure brick reads the clock with {called_name(node)}()")
+                lint.add(path, f"sealed brick reads the clock with {called_name(node)}()")
 
 
-# A lane is a declared enforcement class: the rules above plus the ones its
-# enforcer adds. A lane may only add rules, never relax one (AGENTS.md:
-# "may not relax a parent rule"), and it may not exist without an enforcer,
-# which is why the table maps each name to a function rather than listing
-# names. A contract with no LANE is in the strict lane.
-def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
-    """A workflow is invoked as a whole operation, never imported for its parts.
+def lint_entry(brick: Path, contract: Contract, lint: Lint) -> None:
+    """An entry brick is invoked as a whole operation, never imported for its parts.
 
-    Two consequences, one enforced here and one in the graph. Here: it is the
-    only kind of brick that may carry a process door, ``__main__.py``, and
-    that door may import nothing from the brick tree except the brick's own
-    ``run`` -- the same rule a sibling adapter lives under, applied to the
-    outside world. In the graph: no contract may list a workflow as a sibling
-    dependency. Smoke tests, which prove integration through ``run``, belong
-    only here; before lanes that was derived from the graph (a brick nothing
-    depended on) and now the brick says so.
+    Two consequences, one enforced here and one in the graph. Here: its
+    ``__main__.py`` may import nothing from the brick tree except the brick's
+    own ``run`` -- the same rule a joint adapter lives under, applied to the
+    outside world. In the graph: no joint may point at an entry brick. Smoke
+    tests, which prove integration through ``run``, belong only here.
     """
-    door = lint.tree(brick / "__main__.py")
-    if not door:
+    main = lint.tree(brick / "__main__.py")
+    if not main:
         return
     own_run = {".", ".runner.run", f"bricks.{brick.name}"}
-    for node in ast.walk(door):
+    for node in ast.walk(main):
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
         for module in imported_modules(node):
@@ -825,7 +811,7 @@ def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
                 if top in DIRECT_IO - {"os", "pathlib"}:
                     lint.add(
                         brick / "__main__.py",
-                        f"__main__ imports direct-I/O module {top!r}; a door parses arguments, calls run and "
+                        f"__main__ imports direct-I/O module {top!r}; it parses arguments, calls run and "
                         "prints or writes what run returned; effects belong in an adapter",
                         warning=True,
                     )
@@ -833,13 +819,6 @@ def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
             names = [item.name for item in node.names]
             if not (isinstance(node, ast.ImportFrom) and module in own_run and names == ["run"]):
                 lint.add(brick / "__main__.py", "__main__ may import only this brick's run")
-
-
-LANES = {
-    "strict": lint_strict,
-    "pure": lint_pure,
-    "workflow": lint_workflow,
-}
 
 
 def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -857,11 +836,12 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_python(brick, contract, lint)
     lint_records(brick, contract, limits, lint)
     lint_smokes(brick, contract, lint)
-    if contract.lane != "workflow" and (brick / "__main__.py").exists():
-        lint.add(brick / "__main__.py", "only a workflow brick may have __main__.py")
     lint_adapter_functions(brick, lint)
     lint_deterministic(brick, contract, lint)
-    LANES[contract.lane](brick, contract, lint)
+    if contract.sealed:
+        lint_sealed(brick, contract, lint)
+    if (brick / "__main__.py").is_file():
+        lint_entry(brick, contract, lint)
 
 
 COPY_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
@@ -1070,10 +1050,10 @@ def lint_graph(
             elif dependency not in names:
                 lint.add(where(name), f"joint {dependency!r} names a brick that does not exist")
             else:
-                if contracts[dependency].lane == "workflow":
+                if (where(dependency).parent / "__main__.py").is_file():
                     lint.add(
                         where(name),
-                        f"joint {dependency!r} is a workflow brick; a workflow is invoked as a whole, not depended on",
+                        f"joint {dependency!r} is an entry brick; an entry brick is invoked as a whole, not depended on",
                     )
                 pin, version = port.get("pin"), contracts[dependency].version
                 if isinstance(pin, int) and version and pin != version:

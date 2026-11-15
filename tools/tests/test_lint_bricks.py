@@ -74,12 +74,18 @@ class Fixture(unittest.TestCase):
             "joint", policy=policy, pin=pin,
         )
 
-    def pure_brick(self, name: str = "example_brick") -> Path:
-        """The template with its one adapter and the tape loader removed."""
+    def sealed_brick(self, name: str = "example_brick") -> Path:
+        """The template with its one port, adapter and tape loader removed."""
         brick = self.brick(name)
         (brick / "input/adapters/example_source.py").unlink()
         (brick / "input/tape.py").unlink()
-        self.contract(brick, LANE='"pure"', PORTS="{}")
+        self.contract(brick, PORTS="{}")
+        return brick
+
+    def entry_brick(self, name: str = "example_brick") -> Path:
+        """The template with a __main__.py: an entry brick."""
+        brick = self.brick(name)
+        (brick / "__main__.py").write_text("from . import run\n\nrun({})\n", encoding="utf-8")
         return brick
 
     def errors(self) -> list[str]:
@@ -113,34 +119,43 @@ class BoilerplateTests(Fixture):
         self.assertError("src imports direct-I/O module 'requests'")
 
 
-class LaneTests(Fixture):
-    def test_absent_lane_is_strict(self) -> None:
+class ShapeTests(Fixture):
+    def shape(self, brick: Path) -> str:
+        return brick_contract.brick_shape(brick)
+
+    def test_a_brick_with_ports_is_open(self) -> None:
         brick = self.brick()
-        path = brick / "contract.py"
-        kept = [line for line in path.read_text(encoding="utf-8").splitlines(keepends=True)
-                if not line.startswith("LANE")]
-        path.write_text("".join(kept), encoding="utf-8")
-        self.assertNotIn("LANE =", path.read_text(encoding="utf-8"))
-        lint = lint_bricks.lint_repo(self.root)
-        self.assertEqual(lint.errors, [])
-        self.assertEqual(lint_bricks.lint_contract(brick, lint).lane, "strict")
-
-    def test_every_lane_has_an_enforcer(self) -> None:
-        self.assertIn("strict", lint_bricks.LANES)
-        for lane, enforcer in lint_bricks.LANES.items():
-            self.assertTrue(callable(enforcer), lane)
-
-    def test_declared_strict_lints_clean(self) -> None:
-        self.contract(self.brick(), LANE='"strict"')
+        self.assertEqual(self.shape(brick), "open")
         self.assertClean()
 
-    def test_unknown_lane_is_an_error(self) -> None:
-        self.contract(self.brick(), LANE='"permissive"')
-        self.assertError("LANE must be one of")
+    def test_a_brick_with_no_ports_is_sealed(self) -> None:
+        brick = self.sealed_brick()
+        self.assertEqual(self.shape(brick), "sealed")
+        self.assertClean()
 
-    def test_non_string_lane_is_an_error(self) -> None:
-        self.contract(self.brick(), LANE="1")
-        self.assertError("LANE must be one of")
+    def test_a_brick_with_a_main_is_entry_even_with_no_ports(self) -> None:
+        self.assertEqual(self.shape(self.entry_brick()), "entry")
+        brick = self.sealed_brick("flow")
+        (brick / "__main__.py").write_text("from . import run\n", encoding="utf-8")
+        self.assertEqual(self.shape(brick), "entry")
+
+    def test_the_shape_is_not_declared_and_the_old_declaration_is_an_error(self) -> None:
+        self.contract(self.brick(), LANE='"strict"')
+        self.assertError("LANE belong to the old manifest format")
+        self.assertError("the shape (sealed, entry or open) is computed")
+        self.assertError("tools/convert_ports.py")
+
+    def test_a_manifest_that_cannot_be_read_reads_as_open(self) -> None:
+        brick = self.brick()
+        self.contract(brick, PORTS="make_ports()")
+        self.assertEqual(self.shape(brick), "open")
+        self.assertEqual(self.shape(self.root / "bricks/missing"), "open")
+
+    def test_unreadable_ports_do_not_make_the_brick_sealed_for_the_lint(self) -> None:
+        self.contract(self.brick(), PORTS="make_ports()")
+        errors = self.errors()
+        self.assertTrue(any("PORTS must be a dict literal" in item for item in errors))
+        self.assertFalse(any("sealed" in item for item in errors), errors)
 
 
 class ModeReadTests(Fixture):
@@ -388,13 +403,13 @@ class PortTests(Fixture):
     def test_the_old_manifest_declarations_are_errors_that_name_the_converter(self) -> None:
         brick = self.brick()
         self.contract(brick, SIBLING_DEPENDENCIES="{}", LIVE_ADAPTER="False", MODE_PASSING="()")
-        self.assertError("SIBLING_DEPENDENCIES, LIVE_ADAPTER, MODE_PASSING are declarations of the old manifest format")
+        self.assertError("SIBLING_DEPENDENCIES, LIVE_ADAPTER, MODE_PASSING belong to the old manifest format")
         self.assertError("tools/convert_ports.py")
 
-    def test_a_pure_brick_may_not_declare_ports(self) -> None:
-        brick = self.pure_brick()
-        self.contract(brick, PORTS='{"feed": {"kind": "source", "epoch": 1}}')
-        self.assertError("pure brick may not declare ports")
+    def test_a_brick_with_a_port_is_not_sealed(self) -> None:
+        brick = self.sealed_brick()
+        self.adapter(brick, "feed", ADAPTER_WITH_REPLAY.format(body=""))
+        self.assertEqual([item for item in self.errors() if "sealed" in item], [])
 
 
 class DispatcherTests(Fixture):
@@ -414,8 +429,8 @@ class DispatcherTests(Fixture):
         self.assertEqual(len(warnings), 5)
         self.assertEqual(self.errors(), [])
 
-    def test_pure_brick_is_held_to_it_too(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_is_held_to_it_too(self) -> None:
+        brick = self.sealed_brick()
         self.input_class(brick, "class BrickInput(TypedDict, total=False):", ["op", "text"])
         self.assertTrue(any("BrickInput.op selects an operation" in w for w in self.warnings()))
 
@@ -547,32 +562,31 @@ class IoBanTests(Fixture):
         self.brick()
         self.assertClean()
 
-    def test_pure_brick_may_import_only_allowlisted_standard_library(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_may_import_only_allowlisted_standard_library(self) -> None:
+        brick = self.sealed_brick()
         self.src(brick, "import json\nimport re\nimport io\nimport operator\nimport sys\nimport logging\nimport inspect\n")
-        self.assertError("pure brick imports standard-library module 'sys', which is not on the pure allowlist")
+        self.assertError("sealed brick imports standard-library module 'sys', which is not on the sealed allowlist")
         self.assertError("standard-library module 'logging'")
         self.assertError("standard-library module 'inspect'")
         self.assertFalse([item for item in self.errors() if "'json'" in item or "'re'" in item or "'io'" in item or "'operator'" in item])
 
-    def test_pure_brick_may_use_third_party_libraries(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_may_use_third_party_libraries(self) -> None:
+        brick = self.sealed_brick()
         self.src(brick, "import numpy\n")
         self.assertClean()
 
-    def test_pure_brick_bans_escape_hatches_outside_src_too(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_bans_escape_hatches_outside_src_too(self) -> None:
+        brick = self.sealed_brick()
         (brick / "input/loader.py").write_text("def f(x):\n    return __import__(x)\n")
-        self.assertError("loader.py: pure brick may not call __import__()")
+        self.assertError("loader.py: sealed brick may not call __import__()")
 
-    def test_pure_brick_bans_logging_handlers_outside_src(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_bans_logging_handlers_outside_src(self) -> None:
+        brick = self.sealed_brick()
         (brick / "input/loader.py").write_text("import logging.handlers\n", encoding="utf-8")
-        self.assertError("loader.py: pure brick imports 'logging.handlers' outside runner/")
+        self.assertError("loader.py: sealed brick imports 'logging.handlers' outside runner/")
 
-    def test_door_importing_io_modules_warns(self) -> None:
-        brick = self.brick()
-        self.contract(brick, LANE='"workflow"')
+    def test_main_importing_io_modules_warns(self) -> None:
+        brick = self.entry_brick()
         (brick / "__main__.py").write_text(
             "import argparse\nimport os\nimport subprocess\nimport shutil\nfrom pathlib import Path\n\nfrom bricks.example_brick import run\n",
             encoding="utf-8",
@@ -885,20 +899,21 @@ class DeterminismTests(Fixture):
         self.adapter(brick, "clock", "import time\n\n\ndef now(ctx):\n    return ctx['io']\n")
         self.assertFalse([item for item in self.errors() if "DETERMINISTIC" in item])
 
-    def test_a_pure_brick_may_not_declare_nondeterminism(self) -> None:
-        brick = self.pure_brick()
+    def test_a_sealed_brick_may_not_declare_nondeterminism(self) -> None:
+        brick = self.sealed_brick()
         self.contract(brick, DETERMINISTIC="False")
-        self.assertError("a pure brick is deterministic by definition")
+        self.assertError("a sealed brick is deterministic by definition")
 
 
-class PureLaneTests(Fixture):
-    def test_pure_brick_lints_clean(self) -> None:
-        self.pure_brick()
+class SealedShapeTests(Fixture):
+    def test_sealed_brick_lints_clean(self) -> None:
+        self.sealed_brick()
         self.assertClean()
 
-    def test_pure_brick_needs_no_adapters_folder(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_needs_neither_adapters_nor_tapes_folder(self) -> None:
+        brick = self.sealed_brick()
         shutil.rmtree(brick / "input/adapters")
+        shutil.rmtree(brick / "input/tapes")
         self.assertClean()
 
     def test_a_brick_with_ports_needs_the_adapters_and_tapes_folders(self) -> None:
@@ -917,60 +932,57 @@ class PureLaneTests(Fixture):
         shutil.rmtree(brick / "input/tapes")
         self.assertClean()
 
-    def test_pure_brick_without_the_folder_still_may_not_gain_adapters(self) -> None:
-        brick = self.pure_brick()
-        self.assertTrue((brick / "input/adapters").is_dir())
-        self.adapter(brick, "other", "x = 1\n")
-        self.assertError("pure brick may not have adapters")
+    def test_sealed_brick_may_not_gain_adapters_or_tapes(self) -> None:
+        brick = self.sealed_brick()
+        (brick / "input/adapters/other.py").write_text("x = 1\n", encoding="utf-8")
+        (brick / "input/tapes/feed").mkdir(parents=True)
+        (brick / "input/tapes/feed/a.json").write_text("{}\n", encoding="utf-8")
+        self.assertError("input/adapters/other.py: sealed brick may not have adapters: it has no ports")
+        self.assertError("input/tapes/feed/a.json: sealed brick may not have tapes: it has no ports")
 
-    def test_template_is_not_pure(self) -> None:
+    def test_a_brick_that_loses_its_port_but_keeps_its_files_is_told_what_is_wrong(self) -> None:
         # The template ships one adapter and a filesystem tape loader:
-        # both are exactly what a pure brick gives up.
-        self.contract(self.brick(), LANE='"pure"')
-        self.assertError("pure brick may not have adapters")
-        self.assertError("input/tape.py: pure brick imports 'pathlib' outside runner/")
+        # both are exactly what a sealed brick gives up.
+        self.contract(self.brick(), PORTS="{}")
+        self.assertError("input/adapters/example_source.py: sealed brick may not have adapters")
+        self.assertError("input/tape.py: sealed brick imports 'pathlib' outside runner/")
 
-    def test_pure_brick_copied_from_the_template_is_told_to_delete_the_tape_loader(self) -> None:
-        self.contract(self.brick(), LANE='"pure"')
-        self.assertError("a pure brick has no ports, so delete input/tape.py")
+    def test_sealed_brick_copied_from_the_template_is_told_to_delete_the_tape_loader(self) -> None:
+        self.contract(self.brick(), PORTS="{}")
+        self.assertError("a sealed brick has no ports, so delete input/tape.py")
 
-    def test_pure_brick_may_not_declare_sibling_dependencies(self) -> None:
-        self.brick("other")
-        self.contract(self.pure_brick(), PORTS='{"other": {"kind": "joint", "policy": "eventual", "pin": 1}}')
-        self.assertError("pure brick may not declare ports")
-
-    def test_pure_brick_bans_direct_io_outside_runner(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_bans_direct_io_outside_runner(self) -> None:
+        brick = self.sealed_brick()
         (brick / "input/loader.py").write_text("import os\n", encoding="utf-8")
-        self.assertError("input/loader.py: pure brick imports 'os' outside runner/")
+        self.assertError("input/loader.py: sealed brick imports 'os' outside runner/")
 
-    def test_pure_brick_reports_src_direct_io_once(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_reports_src_direct_io_once(self) -> None:
+        brick = self.sealed_brick()
         (brick / "src/helpers.py").write_text("import os\n", encoding="utf-8")
         hits = [item for item in self.errors() if "src/helpers.py" in item]
         self.assertEqual(hits, ["bricks/example_brick/src/helpers.py: src imports direct-I/O module 'os'"])
 
-    def test_pure_brick_bans_random_and_time_outside_runner(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_bans_random_and_time_outside_runner(self) -> None:
+        brick = self.sealed_brick()
         (brick / "src/helpers.py").write_text("import random\nfrom time import sleep\n", encoding="utf-8")
-        self.assertError("pure brick imports 'random' outside runner/")
-        self.assertError("pure brick imports 'time' outside runner/")
+        self.assertError("sealed brick imports 'random' outside runner/")
+        self.assertError("sealed brick imports 'time' outside runner/")
 
-    def test_pure_brick_runner_keeps_its_io(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_runner_keeps_its_io(self) -> None:
+        brick = self.sealed_brick()
         (brick / "runner/rng.py").write_text("import random\nimport pathlib\nimport time\n", encoding="utf-8")
         self.assertClean()
 
-    def test_pure_brick_may_not_read_the_clock(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_may_not_read_the_clock(self) -> None:
+        brick = self.sealed_brick()
         (brick / "src/logic.py").write_text(
             "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n",
             encoding="utf-8",
         )
-        self.assertError("src/logic.py: pure brick reads the clock with now()")
+        self.assertError("src/logic.py: sealed brick reads the clock with now()")
 
-    def test_pure_brick_may_use_datetime_arithmetic(self) -> None:
-        brick = self.pure_brick()
+    def test_sealed_brick_may_use_datetime_arithmetic(self) -> None:
+        brick = self.sealed_brick()
         (brick / "src/logic.py").write_text(
             "from datetime import datetime, timedelta\n\n\n"
             "def tomorrow(now: datetime) -> datetime:\n    return now + timedelta(days=1)\n",
@@ -978,7 +990,7 @@ class PureLaneTests(Fixture):
         )
         self.assertClean()
 
-    def test_strict_brick_may_read_the_clock_in_src_when_it_says_so(self) -> None:
+    def test_open_brick_may_read_the_clock_in_src_when_it_says_so(self) -> None:
         brick = self.brick()
         self.contract(brick, DETERMINISTIC="False")
         (brick / "src/logic.py").write_text(
@@ -1001,70 +1013,65 @@ SMOKE = (
 )
 
 
-class WorkflowLaneTests(Fixture):
-    def workflow_brick(self, name: str = "example_brick") -> Path:
-        brick = self.brick(name)
-        self.contract(brick, LANE='"workflow"')
-        return brick
-
+class EntryShapeTests(Fixture):
     def smoke(self, brick: Path) -> None:
         tests = brick / "runner/tests"
         tests.mkdir()
         (tests / "__init__.py").write_text("", encoding="utf-8")
         (tests / "test_smoke.py").write_text(SMOKE, encoding="utf-8")
 
-    def test_workflow_brick_lints_clean(self) -> None:
-        self.workflow_brick()
+    def test_entry_brick_lints_clean(self) -> None:
+        self.entry_brick()
         self.assertClean()
 
-    def test_nothing_may_depend_on_a_workflow(self) -> None:
-        self.workflow_brick("flow")
+    def test_nothing_may_depend_on_an_entry_brick(self) -> None:
+        self.entry_brick("flow")
         self.joint(self.brick("lib"), "flow")
-        self.assertError("bricks/lib/contract.py: joint 'flow' is a workflow brick")
+        self.assertError("bricks/lib/contract.py: joint 'flow' is an entry brick")
 
-    def test_workflow_may_have_a_process_door(self) -> None:
-        brick = self.workflow_brick()
-        (brick / "__main__.py").write_text("from . import run\n\nrun({})\n", encoding="utf-8")
-        self.assertClean()
-
-    def test_process_door_may_name_the_brick_in_full(self) -> None:
-        brick = self.workflow_brick()
+    def test_entry_brick_main_may_name_the_brick_in_full(self) -> None:
+        brick = self.entry_brick()
         (brick / "__main__.py").write_text("from bricks.example_brick import run\n\nrun({})\n", encoding="utf-8")
         self.assertClean()
 
-    def test_process_door_may_import_only_run(self) -> None:
-        brick = self.workflow_brick()
+    def test_main_may_import_only_run(self) -> None:
+        brick = self.entry_brick()
         (brick / "__main__.py").write_text("from .src.logic import execute\n", encoding="utf-8")
         self.assertError("__main__.py: __main__ may import only this brick's run")
 
-    def test_process_door_may_not_reach_a_sibling(self) -> None:
+    def test_main_may_not_reach_a_sibling(self) -> None:
         self.brick("other")
-        brick = self.workflow_brick()
+        brick = self.entry_brick()
         (brick / "__main__.py").write_text("from bricks.other import run\n", encoding="utf-8")
         self.assertError("__main__.py: __main__ may import only this brick's run")
 
-    def test_only_a_workflow_has_a_process_door(self) -> None:
+    def test_any_brick_may_have_a_main_because_a_main_makes_it_an_entry_brick(self) -> None:
         brick = self.brick()
         (brick / "__main__.py").write_text("from . import run\n", encoding="utf-8")
-        self.assertError("__main__.py: only a workflow brick may have __main__.py")
-
-    def test_smoke_tests_belong_to_workflows(self) -> None:
-        self.smoke(self.workflow_brick())
         self.assertClean()
 
-    def test_smoke_test_that_forgets_the_test_kind_warns(self) -> None:
-        brick = self.workflow_brick()
+    def test_smoke_tests_belong_to_entry_bricks(self) -> None:
+        self.smoke(self.entry_brick())
+        self.assertClean()
+
+    def test_smoke_test_that_forgets_the_test_marker_warns(self) -> None:
+        brick = self.entry_brick()
         self.smoke(brick)
         text = (brick / "runner/tests/test_smoke.py").read_text(encoding="utf-8")
         (brick / "runner/tests/test_smoke.py").write_text(text.replace("BRICK_TEST", "OTHER"), encoding="utf-8")
         self.assertTrue(any("does not set BRICK_TEST=1" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
 
-    def test_strict_brick_may_not_carry_smoke_tests(self) -> None:
-        # Before lanes this was derived: a brick nothing depended on could carry
-        # them. Now the brick says so, or it cannot.
+    def test_an_open_brick_may_not_carry_smoke_tests(self) -> None:
         self.smoke(self.brick())
-        self.assertError("runner/tests: smoke tests belong only to workflow bricks")
+        self.assertError("runner/tests: smoke tests belong only to entry bricks (a brick with a __main__.py)")
+
+    def test_an_entry_brick_may_have_three_smoke_files_and_no_more(self) -> None:
+        brick = self.entry_brick()
+        self.smoke(brick)
+        for index in range(3):
+            (brick / "runner/tests" / f"test_more{index}.py").write_text(SMOKE, encoding="utf-8")
+        self.assertError("an entry brick may have at most three smoke-test files")
 
 
 if __name__ == "__main__":

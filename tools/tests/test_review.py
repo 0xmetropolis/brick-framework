@@ -33,11 +33,16 @@ class Fixture(unittest.TestCase):
                         ignore=shutil.ignore_patterns("__pycache__"))
         return target
 
-    def contract(self, brick: Path, **values: str) -> None:
-        """Append top-level assignments to the brick's contract."""
+    def sealed(self, name: str) -> Path:
+        brick = self.brick(name)
         with (brick / "contract.py").open("a", encoding="utf-8") as handle:
-            for name, value in values.items():
-                handle.write(f"{name} = {value}\n")
+            handle.write("PORTS = {}\n")
+        return brick
+
+    def entry(self, name: str) -> Path:
+        brick = self.brick(name)
+        (brick / "__main__.py").write_text("from . import run\n", encoding="utf-8")
+        return brick
 
 
 class RoutingTests(Fixture):
@@ -49,78 +54,84 @@ class RoutingTests(Fixture):
         self.assertIsNone(review.brick_of("tools/review.py"))
         self.assertIsNone(review.brick_of("README.md"))
 
-    def test_lane_is_read_from_the_contract(self) -> None:
-        self.brick("plain")
-        self.contract(self.brick("calc"), LANE='"pure"')
-        self.contract(self.brick("flow"), LANE='"workflow"')
-        self.assertEqual(review.lane_of(self.root, "plain"), "strict")
-        self.assertEqual(review.lane_of(self.root, "calc"), "pure")
-        self.assertEqual(review.lane_of(self.root, "flow"), "workflow")
+    def test_shape_is_computed_from_the_ports_and_the_files(self) -> None:
+        self.brick("ordinary")
+        self.sealed("calc")
+        self.entry("flow")
+        self.assertEqual(review.shape_of(self.root, "ordinary"), "open")
+        self.assertEqual(review.shape_of(self.root, "calc"), "sealed")
+        self.assertEqual(review.shape_of(self.root, "flow"), "entry")
 
-    def test_missing_contract_reads_as_strict(self) -> None:
-        self.assertEqual(review.lane_of(self.root, "gone"), "strict")
+    def test_a_main_makes_a_brick_an_entry_brick_even_with_no_ports(self) -> None:
+        brick = self.sealed("both")
+        (brick / "__main__.py").write_text("from . import run\n", encoding="utf-8")
+        self.assertEqual(review.shape_of(self.root, "both"), "entry")
 
-    def test_bad_declaration_reads_as_strict(self) -> None:
-        self.contract(self.brick("odd"), LANE='"money"')
-        self.contract(self.brick("dyn"), LANE='os.environ["LANE"]')
-        (self.brick("broken") / "contract.py").write_text("LANE = (", encoding="utf-8")
-        for name in ("odd", "dyn", "broken"):
-            self.assertEqual(review.lane_of(self.root, name), "strict", name)
+    def test_missing_or_broken_contract_reads_as_open(self) -> None:
+        self.assertEqual(review.shape_of(self.root, "gone"), "open")
+        (self.brick("broken") / "contract.py").write_text("PORTS = (", encoding="utf-8")
+        (self.brick("dyn") / "contract.py").write_text("PORTS = make()\n", encoding="utf-8")
+        for name in ("broken", "dyn"):
+            self.assertEqual(review.shape_of(self.root, name), "open", name)
 
-    def test_lanes_are_the_prompts_strict_first(self) -> None:
-        self.assertEqual(review.lanes(self.root), ("strict", "pure", "workflow"))
+    def test_the_old_lane_declaration_changes_nothing(self) -> None:
+        brick = self.brick("old")
+        with (brick / "contract.py").open("a", encoding="utf-8") as handle:
+            handle.write('LANE = "pure"\n')
+        self.assertEqual(review.shape_of(self.root, "old"), "open")
 
-    def test_a_repository_adds_a_lane_by_adding_a_prompt(self) -> None:
+    def test_shapes_are_a_fixed_triple_open_first(self) -> None:
+        self.assertEqual(review.SHAPES, ("open", "sealed", "entry"))
+
+    def test_a_repository_overrides_a_prompt_but_cannot_add_a_shape(self) -> None:
         (self.root / "review").mkdir()
         (self.root / "review/money.md").write_text("# money\n", encoding="utf-8")
-        (self.root / "review/pure.md").write_text("# our pure\n", encoding="utf-8")
-        self.contract(self.brick("desk"), LANE='"money"')
-        self.assertEqual(review.lanes(self.root), ("strict", "money", "pure", "workflow"))
-        self.assertEqual(review.lane_of(self.root, "desk"), "money")
+        (self.root / "review/sealed.md").write_text("# our sealed\n", encoding="utf-8")
+        self.brick("desk")
+        self.assertEqual(review.SHAPES, ("open", "sealed", "entry"))
+        self.assertEqual(list(review.route(self.root, ["bricks/desk/src/logic.py"])[0]), ["open", "sealed", "entry"])
         # Its own prompt where it has one, the framework's where it does not.
-        self.assertEqual(review.prompt_path(self.root, "pure"), self.root / "review/pure.md")
-        self.assertEqual(review.prompt_path(self.root, "strict"),
-                         review.FRAMEWORK / "review/strict.md")
+        self.assertEqual(review.prompt_path(self.root, "sealed"), self.root / "review/sealed.md")
+        self.assertEqual(review.prompt_path(self.root, "open"),
+                         review.FRAMEWORK / "review/open.md")
         self.assertEqual(review.prompt_path(self.root, "common"),
                          review.FRAMEWORK / "review/common.md")
 
-    def test_last_declaration_wins(self) -> None:
-        self.contract(self.brick("twice"), LANE='"pure"')
-        self.contract(self.root / "bricks/twice", LANE='"workflow"')
-        self.assertEqual(review.lane_of(self.root, "twice"), "workflow")
-
-    def test_route_splits_by_lane_and_names_the_rest(self) -> None:
-        self.brick("plain")
-        self.contract(self.brick("calc"), LANE='"pure"')
-        lanes, unrouted = review.route(self.root, [
-            "bricks/plain/src/logic.py",
+    def test_route_splits_by_shape_and_names_the_rest(self) -> None:
+        self.brick("ordinary")
+        self.sealed("calc")
+        shapes, unrouted = review.route(self.root, [
+            "bricks/ordinary/src/logic.py",
             "bricks/calc/src/logic.py",
             "bricks/calc/contract.py",
             "tools/lint_bricks.py",
             "bricks/AGENTS.md",
         ])
-        self.assertEqual(list(lanes), list(review.lanes(self.root)))
-        self.assertEqual(lanes["strict"], ["bricks/plain/src/logic.py"])
-        self.assertEqual(lanes["pure"], ["bricks/calc/src/logic.py", "bricks/calc/contract.py"])
-        self.assertEqual(lanes["workflow"], [])
+        self.assertEqual(list(shapes), list(review.SHAPES))
+        self.assertEqual(shapes["open"], ["bricks/ordinary/src/logic.py"])
+        self.assertEqual(shapes["sealed"], ["bricks/calc/src/logic.py", "bricks/calc/contract.py"])
+        self.assertEqual(shapes["entry"], [])
         self.assertEqual(unrouted, ["tools/lint_bricks.py", "bricks/AGENTS.md"])
 
     def test_brick_docs_follow_the_touched_bricks(self) -> None:
-        self.brick("plain")
+        self.brick("ordinary")
         self.brick("other")
-        docs = review.brick_docs(self.root, ["bricks/plain/src/logic.py", "bricks/plain/contract.py"])
+        docs = review.brick_docs(self.root, ["bricks/ordinary/src/logic.py", "bricks/ordinary/contract.py"])
         self.assertEqual(
             [d.relative_to(self.root).as_posix() for d in docs],
-            ["bricks/plain/input/AGENTS.md", "bricks/plain/runner/AGENTS.md", "bricks/plain/src/AGENTS.md"],
+            ["bricks/ordinary/input/AGENTS.md", "bricks/ordinary/runner/AGENTS.md", "bricks/ordinary/src/AGENTS.md"],
         )
 
 
 class PromptTests(unittest.TestCase):
-    def test_every_lane_has_a_prompt(self) -> None:
-        # A lane is an enforcer and a prompt. The linter's table is the list.
+    def test_every_shape_has_a_prompt(self) -> None:
         self.assertTrue((review.FRAMEWORK / review.PROMPTS / review.COMMON_PROMPT).is_file())
-        for lane in review.lanes(ROOT):
-            self.assertTrue(review.prompt_path(ROOT, lane).is_file(), lane)
+        for shape in review.SHAPES:
+            self.assertTrue(review.prompt_path(ROOT, shape).is_file(), shape)
+
+    def test_the_prompts_are_exactly_the_shapes_and_common(self) -> None:
+        names = sorted(path.name for path in (review.FRAMEWORK / review.PROMPTS).glob("*.md"))
+        self.assertEqual(names, ["common.md", "entry.md", "open.md", "sealed.md"])
 
     def test_context_docs_exist(self) -> None:
         for doc in review.CONTEXT_DOCS:
@@ -176,7 +187,7 @@ class MemoryTests(Fixture):
 
     def setUp(self) -> None:
         super().setUp()
-        self.brick("plain")
+        self.brick("ordinary")
         self.git("init", "-q")
         self.first = self.commit("start")
 
@@ -184,21 +195,21 @@ class MemoryTests(Fixture):
         self.assertFalse(review.carried_forward(self.root, {}, self.first))
 
     def test_same_head_is_not_carried(self) -> None:
-        previous = {"head": self.first, "lanes": {"strict": {"findings": []}}}
+        previous = {"head": self.first, "shapes": {"open": {"findings": []}}}
         self.assertFalse(review.carried_forward(self.root, previous, self.first))
 
     def test_docs_only_delta_carries_forward(self) -> None:
-        previous = {"head": self.first, "lanes": {"strict": {"findings": []}}}
+        previous = {"head": self.first, "shapes": {"open": {"findings": []}}}
         (self.root / "README.md").write_text("notes\n", encoding="utf-8")
         head = self.commit("docs")
         self.assertTrue(review.carried_forward(self.root, previous, head))
 
     def test_brick_delta_reviews_again(self) -> None:
-        previous = {"head": self.first, "lanes": {"strict": {"findings": []}}}
-        (self.root / "bricks/plain/src/logic.py").write_text("X = 1\n", encoding="utf-8")
+        previous = {"head": self.first, "shapes": {"open": {"findings": []}}}
+        (self.root / "bricks/ordinary/src/logic.py").write_text("X = 1\n", encoding="utf-8")
         head = self.commit("logic")
         self.assertFalse(review.carried_forward(self.root, previous, head))
 
     def test_unknown_sha_reviews_again(self) -> None:
-        previous = {"head": "0" * 40, "lanes": {"strict": {"findings": []}}}
+        previous = {"head": "0" * 40, "shapes": {"open": {"findings": []}}}
         self.assertFalse(review.carried_forward(self.root, previous, self.first))
