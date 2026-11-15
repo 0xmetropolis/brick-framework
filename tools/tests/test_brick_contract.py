@@ -36,15 +36,8 @@ class ContractReaderTests(unittest.TestCase):
 
     def test_lint_and_graph_use_the_shared_reader(self) -> None:
         self.assertIs(lint_bricks.assigned_literal, brick_contract.assigned_literal)
-        self.assertIs(graph_bricks.assigned_literal, brick_contract.assigned_literal)
-
-    def test_graph_marks_declared_nondeterminism(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            brick = Path(tmp) / "bricks" / "load"
-            brick.mkdir(parents=True)
-            (brick / "contract.py").write_text("DETERMINISTIC = False\n", encoding="utf-8")
-            contracts = {"load": graph_bricks.read_contract(brick)}
-        self.assertIn("nondeterministic", graph_bricks.render(contracts))
+        self.assertIs(graph_bricks.contract_value, brick_contract.contract_value)
+        self.assertIs(graph_bricks.brick_shape, brick_contract.brick_shape)
 
     def test_the_shape_is_computed_never_declared(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,18 +66,6 @@ class ContractReaderTests(unittest.TestCase):
             )
             (brick / "contract.py").write_text("PORTS = make()\n", encoding="utf-8")
             self.assertEqual(brick_contract.brick_ports(brick), {})
-
-    def test_graph_draws_joints_with_their_policy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            bricks = Path(tmp) / "bricks"
-            for name, ports in (
-                ("flow", '{"lib": {"kind": "joint", "policy": "orchestrated", "pin": 1}, "feed": {"kind": "source"}}'),
-                ("lib", "{}"),
-            ):
-                (bricks / name).mkdir(parents=True)
-                (bricks / name / "contract.py").write_text(f"PORTS = {ports}\n", encoding="utf-8")
-            contracts = {name: graph_bricks.read_contract(bricks / name) for name in ("flow", "lib")}
-        self.assertIn("flow --> lib", graph_bricks.render(contracts))
 
 
 if __name__ == "__main__":

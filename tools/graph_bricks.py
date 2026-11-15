@@ -1,54 +1,57 @@
 #!/usr/bin/env python3
-"""Render the declared joint graph as Mermaid, using only the standard library."""
+"""Render the declared ports of every brick as Mermaid, using only the standard library.
+
+Bricks are boxes, source ports are cylinders (with their epoch), and a joint is an
+arrow to a sibling. An entry or sealed brick carries its computed shape in its label;
+an open brick, the default, does not.
+"""
 
 from __future__ import annotations
 
 import argparse
-import ast
+from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from brick_contract import assigned_literal  # type: ignore[no-redef]
+    from brick_contract import brick_shape, contract_value  # type: ignore[no-redef]
 else:
-    from .brick_contract import assigned_literal
+    from .brick_contract import brick_shape, contract_value
 
 
-Contract = tuple[dict[str, str], tuple[str, ...], "bool | None"]
+@dataclass
+class Brick:
+    """What the graph draws of one brick."""
+
+    shape: str = "open"
+    sources: dict[str, dict[str, Any]] = field(default_factory=dict)
+    joints: dict[str, dict[str, Any]] = field(default_factory=dict)
+    owned_state: tuple[str, ...] = ()
+    deterministic: "bool | None" = None
 
 
-def read_contract(brick: Path) -> Contract:
-    """Read one brick's joints (sibling name to policy), owned state and determinism."""
-    path = brick / "contract.py"
-    if not path.is_file():
-        return {}, (), None
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (OSError, SyntaxError):
-        return {}, (), None
-
-    ports = assigned_literal(tree, "PORTS")
-    dependencies = {
-        name: port.get("policy")
-        for name, port in (ports.items() if isinstance(ports, dict) else ())
-        if isinstance(port, dict) and port.get("kind") == "joint"
-    }
-    owned_state = assigned_literal(tree, "OWNED_STATE")
-    deterministic = assigned_literal(tree, "DETERMINISTIC")
-    if not isinstance(deterministic, bool):
-        deterministic = None
-    if not isinstance(owned_state, (tuple, list)):
-        owned_state = ()
-    return (
-        {
-            name: mode
-            for name, mode in dependencies.items()
-            if isinstance(name, str) and isinstance(mode, str)
+def read_contract(brick: Path) -> Brick:
+    """Read one brick's ports, owned state and determinism, and compute its shape."""
+    ports = contract_value(brick, "PORTS")
+    ports = ports if isinstance(ports, dict) else {}
+    owned_state = contract_value(brick, "OWNED_STATE")
+    deterministic = contract_value(brick, "DETERMINISTIC")
+    return Brick(
+        shape=brick_shape(brick),
+        sources={
+            name: port for name, port in ports.items()
+            if isinstance(name, str) and isinstance(port, dict) and port.get("kind") == "source"
         },
-        tuple(item for item in owned_state if isinstance(item, str) and item),
-        deterministic,
+        joints={
+            name: port for name, port in ports.items()
+            if isinstance(name, str) and isinstance(port, dict) and port.get("kind") == "joint"
+            and port.get("policy") in {"eventual", "orchestrated"}
+        },
+        owned_state=tuple(item for item in owned_state if isinstance(item, str) and item)
+        if isinstance(owned_state, (tuple, list)) else (),
+        deterministic=deterministic if isinstance(deterministic, bool) else None,
     )
 
 
@@ -57,37 +60,56 @@ def escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', "&quot;")
 
 
-def node_label(name: str, owned_state: tuple[str, ...], deterministic: "bool | None" = None) -> str:
-    """Build the node label, listing the state the brick owns and a declared nondeterminism."""
-    lines = [escape(name), *(escape(resource) for resource in owned_state)]
+def node_label(name: str, owned_state: tuple[str, ...], deterministic: "bool | None" = None, shape: str = "open") -> str:
+    """Build the node label: the name, a non-default shape, the state the brick owns, a declared nondeterminism."""
+    lines = [escape(name)]
+    if shape != "open":
+        lines.append(shape)
+    lines.extend(escape(resource) for resource in owned_state)
     if deterministic is False:
         lines.append("nondeterministic")
     return "<br/>".join(lines)
 
 
-def render(contracts: dict[str, Contract]) -> str:
+def source_label(name: str, port: dict[str, Any]) -> str:
+    """The cylinder for a source port: its name and epoch, and whether a caller may follow it."""
+    lines = [escape(name), f"epoch {port.get('epoch', '?')}"]
+    if port.get("followable"):
+        lines.append("followable")
+    return "<br/>".join(lines)
+
+
+def render(bricks: dict[str, Brick]) -> str:
     """Render the declared graph as a Mermaid flowchart."""
-    names = sorted(contracts)
-    depended_on = {
-        dependency
-        for dependencies, _, _ in contracts.values()
-        for dependency in dependencies
-        if dependency in contracts
-    }
+    names = sorted(bricks)
+    depended_on = {joint for brick in bricks.values() for joint in brick.joints if joint in bricks}
 
     lines = [
-        "%% Generated by tools/graph_bricks.py. Solid arrow: orchestrated. Dashed arrow: eventual.",
+        "%% Generated by tools/graph_bricks.py. Cylinder: a source port. Dashed arrow: eventual joint."
+        " Solid arrow: orchestrated joint. Thick arrow: a joint that follows sources.",
         "flowchart TD",
     ]
     for name in names:
-        _, owned_state, deterministic = contracts[name]
-        lines.append(f'    {name}["{node_label(name, owned_state, deterministic)}"]')
+        brick = bricks[name]
+        lines.append(f'    {name}["{node_label(name, brick.owned_state, brick.deterministic, brick.shape)}"]')
+    for name in names:
+        for source, port in sorted(bricks[name].sources.items()):
+            lines.append(f'    {name}__{source}[("{source_label(source, port)}")]')
 
-    edges = [
-        f"    {name} {'-.->' if mode == 'eventual' else '-->'} {dependency}"
-        for name in names
-        for dependency, mode in sorted(contracts[name][0].items())
-    ]
+    edges = []
+    for name in names:
+        brick = bricks[name]
+        for source in sorted(brick.sources):
+            edges.append(f"    {name} --> {name}__{source}")
+        for joint, port in sorted(brick.joints.items()):
+            policy = port["policy"]
+            followed = [item for item in port.get("follow") or () if isinstance(item, str)]
+            if followed:
+                edges.append(f'    {name} ==>|"{policy}, follows {escape(", ".join(followed))}"| {joint}')
+            elif policy == "eventual":
+                edges.append(f"    {name} -.->|eventual| {joint}")
+            else:
+                edges.append(f"    {name} -->|orchestrated| {joint}")
     if edges:
         lines.append("")
         lines.extend(edges)
@@ -105,21 +127,21 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     root = parser.parse_args().root.resolve()
 
-    bricks = root / "bricks"
-    if not bricks.is_dir():
-        print(f"{bricks}: bricks directory is missing", file=sys.stderr)
+    bricks_dir = root / "bricks"
+    if not bricks_dir.is_dir():
+        print(f"{bricks_dir}: bricks directory is missing", file=sys.stderr)
         return 1
 
-    contracts = {
+    bricks = {
         path.name: read_contract(path)
-        for path in sorted(bricks.iterdir())
+        for path in sorted(bricks_dir.iterdir())
         if path.is_dir() and not path.name.startswith((".", "__"))
     }
-    if not contracts:
-        print(f"{bricks}: no bricks to graph", file=sys.stderr)
+    if not bricks:
+        print(f"{bricks_dir}: no bricks to graph", file=sys.stderr)
         return 1
 
-    print(render(contracts), end="")
+    print(render(bricks), end="")
     return 0
 
 
