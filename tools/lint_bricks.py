@@ -437,7 +437,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(
                     path,
                     f"adapter switches behavior on environment variable {env_switch(node)!r}; that is a mode "
-                    "no run record shows. Put the source in its own sibling brick (it always replays), or "
+                    "no run record shows. Put the source in its own sibling brick (it replays unless it is a Live Adapter its workflow passes the mode to), or "
                     "pass the choice in the brick input",
                     warning=True,
                 )

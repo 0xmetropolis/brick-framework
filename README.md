@@ -68,9 +68,37 @@ run(inputs, *, fresh=False, save=False)
 | `fresh=True` | Call the real source | Unchanged |
 | `save=True` | Call the real source, redact and validate it | Atomically replace the named example |
 
-`save=True` implies a fresh call. A missing or mismatched saved example is an error, never an implicit live call. Neither option propagates when a sibling adapter calls another brick.
+`save=True` implies a fresh call. A missing or mismatched saved example is an error, never an implicit live call. Neither option propagates when a sibling adapter calls another brick, except by mode passing to a Live Adapter sibling (below).
 
 Examples use stable paths and canonical JSON, so normal runs do not churn Git. An explicit save is the review point that may create a diff. Each saved example includes the capture run ID; run records and evidence can be correlated later without involving the runner in adapter persistence.
+
+## Live Adapters
+
+A **Live Adapter** drives a live source over a session, records it through `Transcript` or `through()`, and replays by default.
+
+A *live source* is anything outside this repository that answers calls and may hold state: a game or simulator, a browser, a database, a model API, a device. A *session* is a series of calls to it that belong together.
+
+- **Replay is the default; `fresh` is the one switch to the live source.** A missing or mismatched saved example is an error, never an implicit live call.
+- **How it records.** `through()` records one call. `Transcript` records a session as windows: one saved example per window (a game day, a page, a turn), operations replayed in order, so one stale window is found and re-recorded alone.
+- **The source fingerprint.** A `Transcript` requires `fingerprint=` (a game version, a build, a protocol). It is merged into every window's request, so a window recorded against another version is stale and the error names the field. When the adapter connects in `fresh` or `save`, `check_source(observed)` compares what the source reports with the fingerprint and refuses to continue on a mismatch (`SourceMismatch`).
+- **The launcher.** The script that starts the outside process (a headless game, a browser, a database) is the launcher. It lives outside the bricks, in the repository or beside it, and a wrapper runs it around a `fresh` run. The adapter only connects to what the launcher started; it does not start or stop the process. The launcher should hand out free ports, and the adapter should check the source's version on connect.
+
+Where a Live Adapter lives depends on the shape of the source:
+
+- **A one-off call** (a model call, an encode, a write): one request and one answer. Make it a **Live Adapter brick**: strict lane, `LIVE_ADAPTER = True` in `contract.py`, with an adapter that records through `through()` or `Transcript`. A workflow may pass its mode to it (next section).
+- **A session** (hundreds of interleaved calls, a process holding state, a decision between calls): keep the adapter inside the workflow that drives it. A brick's `run` is one request and one response, so a session as a sibling would mean a run record and a saved example per call.
+
+**Mode passing.** A sibling always replays, with one exception, which has its own name: a workflow may pass its mode to a Live Adapter sibling. All of this must hold, and the linter checks it:
+
+1. The sibling declares `LIVE_ADAPTER = True` (strict lane; an adapter that records through `through()` or `Transcript`).
+2. The workflow lists it in `MODE_PASSING`, and it is an `orchestrated` dependency.
+3. The workflow's adapter takes the flags from `pass_mode(run_context, "<sibling>")` and writes `run(inputs, fresh=flags["fresh"], save=flags["save"])`. A hard-coded `fresh=True`, a missing flag or `**kwargs` is an error.
+
+`saved` passes nothing; `fresh` passes `fresh`; `save` passes both. Pure siblings, `eventual` siblings and every call from a brick that is not a workflow still replay. It goes one level: a Live Adapter does not pass the mode on. Run IDs never propagate. The workflow's run record lists the siblings that ran fresh as `fresh_siblings`.
+
+*Use a Live Adapter* when the source can be driven in a controlled setting, its answers are reproducible enough that a recording stays meaningful, and the work is a conversation: simulators and games, browsers under automation, a database in a scenario test, a model API (one completion as a Live Adapter brick; a multi-turn chat as a session), devices behind a driver, short exchanges with a queue.
+
+*Do not use one* for a source whose live use does real, irreversible things (payments, email, production data), whose answers differ every time and carry meaning in the difference (market prices, search results), that streams or pushes events, that returns very large payloads (a saved example is limited to 120 KiB and lives in Git), that several clients share at once, that runs for months, or that depends on real timing or on a person in the loop.
 
 `bricks/__init__.py` enables repository-wide standard-library test discovery. Each brick's top-level file defines its repository-internal entry point. Keep `runner/__init__.py`; add `runner/tests/__init__.py` only when that workflow has smoke tests. `input/`, `adapters/`, and `src/` do not need package-marker files.
 
