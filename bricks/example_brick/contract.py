@@ -3,6 +3,8 @@
 from typing import TypedDict
 
 
+# The interface version: bump it when BrickInput or BrickOutput changes meaning.
+# Joints in other bricks pin the version they were written against.
 CONTRACT_VERSION = 1
 
 # The enforcement class this brick declares for itself: "strict" (the regular
@@ -20,18 +22,15 @@ LANE = "strict"
 # comment. Omit it and the brick makes no promise and gets no check.
 DETERMINISTIC = True
 
-# True when this brick is a Live Adapter: it drives a live source over a session,
-# records it through Transcript or through(), and replays by default. Only such a
-# brick may receive a workflow's mode (strict lane; see README, Live Adapters).
-LIVE_ADAPTER = False
-
-# A workflow only: the Live Adapter siblings it passes its mode to. Each must be an
-# orchestrated dependency that declares LIVE_ADAPTER = True, and the adapter must
-# take the flags from pass_mode(). Everything else a workflow calls replays.
-MODE_PASSING: tuple[str, ...] = ()
-
-# Map sibling brick names to "eventual" or "orchestrated".
-SIBLING_DEPENDENCIES: dict[str, str] = {}
+# Every crossing of the brick boundary, declared once and implemented by one file
+# of the same name under input/adapters/. A source port reaches an outside system. A
+# joint port reaches a sibling brick: it is named for the sibling, carries the
+# consistency policy ("eventual" or "orchestrated"), and pins the sibling's
+# CONTRACT_VERSION this brick was written against. A brick with no ports is sealed:
+# PORTS = {} and no input/adapters/.
+PORTS: dict[str, dict] = {
+    "example_source": {"kind": "source"},
+}
 
 # Stable identifiers for application state owned exclusively by this brick.
 # Brick-local evidence under input/data and runner/runs is owned implicitly.

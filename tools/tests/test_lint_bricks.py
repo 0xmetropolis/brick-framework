@@ -7,12 +7,13 @@ The boilerplate itself must lint clean; that is the first test.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
 
-from tools import lint_bricks
+from tools import brick_contract, lint_bricks
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,25 +35,49 @@ class Fixture(unittest.TestCase):
         return target
 
     def contract(self, brick: Path, **values: str) -> None:
-        """Rewrite one or more top-level assignments in the brick's contract."""
+        """Rewrite one or more top-level assignments in the brick's contract (or add them)."""
         path = brick / "contract.py"
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        text = path.read_text(encoding="utf-8")
         for name, value in values.items():
-            for index, line in enumerate(lines):
-                if line.startswith(f"{name}:") or line.startswith(f"{name} ="):
-                    lines[index] = f"{name} = {value}\n"
+            lines = text.splitlines(keepends=True)
+            for node in ast.parse(text).body:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+                if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                    lines[node.lineno - 1 : node.end_lineno] = [f"{name} = {value}\n"]
                     break
             else:
                 lines.append(f"{name} = {value}\n")
-        path.write_text("".join(lines), encoding="utf-8")
+            text = "".join(lines)
+        path.write_text(text, encoding="utf-8")
 
+    def declare(self, brick: Path, name: str, kind: str = "source", **fields: object) -> None:
+        """Add one port to the brick's PORTS (or replace it)."""
+        ports = brick_contract.brick_ports(brick)
+        ports[name] = {"kind": kind, **fields}
+        self.contract(brick, PORTS=repr(ports))
+
+    def adapter(self, brick: Path, name: str, text: str, kind: str = "source", **fields: object) -> None:
+        """Write input/adapters/<name>.py and declare the port it implements."""
+        (brick / "input/adapters" / f"{name}.py").write_text(text, encoding="utf-8")
+        if name not in brick_contract.brick_ports(brick):
+            if kind == "joint":
+                fields = {"policy": "eventual", "pin": 1, **fields}
+            self.declare(brick, name, kind, **fields)
+
+    def joint(self, brick: Path, name: str, policy: str = "eventual", pin: int = 1) -> None:
+        """Declare a joint to sibling ``name`` and write its adapter."""
+        self.adapter(
+            brick, name,
+            f"from bricks.{name} import run\n\n\ndef fetch(request, ctx):\n    return run(request)\n",
+            "joint", policy=policy, pin=pin,
+        )
 
     def pure_brick(self, name: str = "example_brick") -> Path:
         """The template with its one adapter and the evidence loader removed."""
         brick = self.brick(name)
         (brick / "input/adapters/example_source.py").unlink()
         (brick / "input/evidence.py").unlink()
-        self.contract(brick, LANE='"pure"')
+        self.contract(brick, LANE='"pure"', PORTS="{}")
         return brick
 
     def errors(self) -> list[str]:
@@ -148,124 +173,127 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
-PASSING_ADAPTER = (
-    "from bricks.game import run\nfrom ..evidence import pass_mode\n\n\n"
-    "def step(ctx, request):\n    flags = pass_mode(ctx, 'game')\n"
-    "    return run(request, fresh=flags['fresh'], save=flags['save'])\n"
-)
-RECORDING_ADAPTER = (
-    "from ..evidence import through\n\n\ndef call(ctx, request):\n"
-    "    return through(ctx, 'game_source', 'c', request, dict)\n"
-)
 
 
 class FingerprintLintTests(Fixture):
     def test_a_transcript_without_a_fingerprint_warns(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/game.py").write_text(
-            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c')\n", encoding="utf-8"
-        )
+        self.adapter(brick, "game", "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c')\n")
         self.assertTrue(any("game.py: Transcript is created without fingerprint=" in w for w in self.warnings()))
         self.assertEqual(self.errors(), [])
 
     def test_a_transcript_with_one_is_clean(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/game.py").write_text(
-            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n", encoding="utf-8"
-        )
+        self.adapter(brick, "game", "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n")
         self.assertClean()
 
 
-class ModePassingTests(Fixture):
-    def pair(self, *, adapter: str = PASSING_ADAPTER, policy: str = "orchestrated", opt_in: bool = True, listed: bool = True) -> tuple[Path, Path]:
-        game = self.brick("game")
-        self.contract(game, LIVE_ADAPTER="True" if opt_in else "False")
-        (game / "input/adapters/game_source.py").write_text(RECORDING_ADAPTER, encoding="utf-8")
-        flow = self.brick("flow")
-        self.contract(flow, LANE='"workflow"', SIBLING_DEPENDENCIES='{"game": "%s"}' % policy, MODE_PASSING='("game",)' if listed else "()")
-        (flow / "input/adapters/game.py").write_text(adapter, encoding="utf-8")
-        return flow, game
-
-    def test_a_declared_helper_fed_call_lints_clean(self) -> None:
-        self.pair()
-        self.assertClean()
-
-    def test_the_helper_can_be_called_inline(self) -> None:
-        self.pair(adapter=PASSING_ADAPTER.replace("    flags = pass_mode(ctx, 'game')\n", "").replace("flags['fresh']", "pass_mode(ctx, 'game')['fresh']").replace("flags['save']", "pass_mode(ctx, 'game')['save']"))
-        self.assertClean()
-
-    def test_a_hard_coded_flag_is_an_error(self) -> None:
-        self.pair(adapter=PASSING_ADAPTER.replace("fresh=flags['fresh']", "fresh=True"))
-        self.assertError("fresh= for 'game' must be pass_mode(ctx, 'game')['fresh'], not a value written here")
-
-    def test_expanded_keyword_arguments_are_an_error(self) -> None:
-        self.pair(adapter=PASSING_ADAPTER.replace("fresh=flags['fresh'], save=flags['save']", "**flags"))
-        self.assertError("may not receive expanded keyword arguments")
-        self.assertError("must give both fresh and save")
-
-    def test_giving_only_one_flag_is_an_error(self) -> None:
-        self.pair(adapter=PASSING_ADAPTER.replace(", save=flags['save']", ""))
-        self.assertError("must give both fresh and save")
-
-    def test_flags_made_for_another_sibling_are_an_error(self) -> None:
-        self.pair(adapter=PASSING_ADAPTER.replace("pass_mode(ctx, 'game')", "pass_mode(ctx, 'other')"))
-        self.assertError("pass_mode for 'other', which is not listed in MODE_PASSING")
-        self.assertError("fresh= for 'game' must be pass_mode(ctx, 'game')['fresh']")
-
-    def test_a_sibling_that_has_not_opted_in_is_an_error(self) -> None:
-        self.pair(opt_in=False)
-        self.assertError("MODE_PASSING names 'game', which does not declare LIVE_ADAPTER = True")
-
-    def test_the_dependency_must_be_orchestrated(self) -> None:
-        self.pair(policy="eventual")
-        self.assertError("MODE_PASSING names 'game', which must be an orchestrated dependency")
-
-    def test_not_listing_the_sibling_makes_the_flags_an_error(self) -> None:
-        self.pair(listed=False)
-        self.assertError("sibling run may not receive fresh or save unless")
-
-    def test_mode_passing_must_name_a_dependency(self) -> None:
-        flow, _ = self.pair()
-        self.contract(flow, SIBLING_DEPENDENCIES="{}", MODE_PASSING='("game",)')
-        (flow / "input/adapters/game.py").unlink()
-        self.assertError("MODE_PASSING names 'game', which is not a sibling dependency")
-
-    def test_only_a_workflow_may_pass_its_mode(self) -> None:
+class PortTests(Fixture):
+    def test_the_template_declares_its_one_source_port(self) -> None:
         brick = self.brick()
-        self.contract(brick, MODE_PASSING='("x",)')
-        self.assertError("only a workflow may pass its mode to a sibling (MODE_PASSING)")
+        self.assertEqual(brick_contract.brick_ports(brick), {"example_source": {"kind": "source"}})
+        self.assertClean()
 
-    def test_a_live_adapter_is_strict_lane(self) -> None:
-        self.contract(self.pure_brick(), LIVE_ADAPTER="True")
-        self.assertError("a Live Adapter brick is in the strict lane")
-
-    def test_a_live_adapter_must_record_through_the_helpers(self) -> None:
-        game = self.brick("game")
-        self.contract(game, LIVE_ADAPTER="True")
-        self.assertError("LIVE_ADAPTER = True, but no adapter records through Transcript or through()")
-
-    def test_a_transcript_adapter_counts(self) -> None:
-        game = self.brick("game")
-        self.contract(game, LIVE_ADAPTER="True")
-        (game / "input/adapters/game_source.py").write_text(
-            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n", encoding="utf-8"
-        )
-        self.assertFalse([e for e in self.errors() if "LIVE_ADAPTER" in e])
-
-    def test_declarations_must_be_well_formed(self) -> None:
+    def test_ports_must_be_declared(self) -> None:
         brick = self.brick()
-        self.contract(brick, LIVE_ADAPTER='"yes"', MODE_PASSING="3")
-        self.assertError("LIVE_ADAPTER must be True or False")
-        self.assertError("MODE_PASSING must list sibling brick names")
+        path = brick / "contract.py"
+        kept = ast.unparse(ast.parse(path.read_text(encoding="utf-8")))
+        path.write_text("\n".join(line for line in kept.splitlines() if not line.startswith(("PORTS", "    'example_source'"))), encoding="utf-8")
+        self.assertError("PORTS is not declared")
 
-    def test_an_ordinary_sibling_still_gets_no_flags(self) -> None:
+    def test_ports_must_be_a_dict_literal(self) -> None:
+        self.contract(self.brick(), PORTS="make_ports()")
+        self.assertError("PORTS must be a dict literal")
+
+    def test_a_port_needs_a_valid_kind_and_name(self) -> None:
+        brick = self.brick()
+        self.contract(brick, PORTS='{"Bad-Name": {"kind": "source"}, "other": {"kind": "door"}, "third": 3}')
+        self.assertError("port name 'Bad-Name' must be lowercase letters")
+        self.assertError("port 'other' needs kind 'source' or 'joint'")
+        self.assertError("port 'third' needs kind 'source' or 'joint'")
+
+    def test_a_port_takes_only_its_own_fields(self) -> None:
+        brick = self.brick()
+        self.contract(brick, PORTS='{"example_source": {"kind": "source", "policy": "eventual"}}')
+        self.assertError("port 'example_source' has field 'policy', which a source port does not take")
+
+    def test_a_joint_needs_a_policy_and_a_pin(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.contract(brick, PORTS='{"example_source": {"kind": "source"}, "other": {"kind": "joint"}}')
+        self.assertError("joint 'other' needs policy 'eventual' or 'orchestrated'")
+        self.assertError("joint 'other' needs pin")
+
+    def test_a_joint_with_its_adapter_lints_clean(self) -> None:
+        self.brick("other")
+        self.joint(self.brick(), "other", "orchestrated")
+        self.assertClean()
+
+    def test_an_adapter_must_implement_a_declared_port(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/extra.py").write_text("x = 1\n", encoding="utf-8")
+        self.assertError("adapter extra.py has no port 'extra' in PORTS")
+
+    def test_a_declared_port_needs_its_adapter_file(self) -> None:
+        brick = self.brick()
+        self.declare(brick, "feed")
+        self.assertError("port 'feed' has no adapter file input/adapters/feed.py")
+
+    def test_a_joint_adapter_must_be_named_for_its_joint(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "link", SIBLING_ADAPTER, "joint", policy="eventual", pin=1)
+        self.assertError("joint 'other' is not declared in PORTS")
+        self.declare(brick, "other", "joint", policy="eventual", pin=1)
+        self.assertError("the adapter for joint 'other' must be named other.py")
+
+    def test_an_undeclared_joint_is_an_error(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "other", SIBLING_ADAPTER)
+        self.assertError("joint 'other' is not declared in PORTS")
+
+    def test_a_joint_may_not_name_a_missing_brick_or_itself(self) -> None:
+        brick = self.brick("alone")
+        self.adapter(brick, "ghost", "x = 1\n", "joint", policy="eventual", pin=1)
+        self.declare(brick, "alone", "joint", policy="eventual", pin=1)
+        self.assertError("joint 'ghost' names a brick that does not exist")
+        self.assertError("brick may not depend on itself")
+
+    def test_a_pin_must_match_the_siblings_interface_version(self) -> None:
         other = self.brick("other")
-        flow = self.brick("flow")
-        self.contract(flow, SIBLING_DEPENDENCIES='{"other": "eventual"}')
-        (flow / "input/adapters/other.py").write_text(
-            "from bricks.other import run\n\n\ndef f(request):\n    return run(request, fresh=True)\n", encoding="utf-8"
+        self.contract(other, CONTRACT_VERSION="2")
+        self.joint(self.brick(), "other", pin=1)
+        self.assertError("joint 'other' pins version 1, but 'other' is at version 2; update the adapter and the pin together")
+        self.joint(self.brick("third"), "other", pin=2)
+        self.assertFalse([e for e in self.errors() if "third" in e])
+
+    def test_a_sibling_never_receives_fresh_or_save(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(
+            brick, "other",
+            "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request, fresh=True)\n",
+            "joint", policy="eventual", pin=1,
         )
-        self.assertError("sibling run may not receive fresh or save unless")
+        self.assertError("a sibling run may not receive fresh or save")
+
+    def test_a_declared_joint_with_no_import_warns(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "other", "def fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
+        self.assertTrue(any("declared joint 'other' has no static adapter import" in w for w in self.warnings()))
+
+    def test_the_old_manifest_declarations_are_errors_that_name_the_converter(self) -> None:
+        brick = self.brick()
+        self.contract(brick, SIBLING_DEPENDENCIES="{}", LIVE_ADAPTER="False", MODE_PASSING="()")
+        self.assertError("SIBLING_DEPENDENCIES, LIVE_ADAPTER, MODE_PASSING are declarations of the old manifest format")
+        self.assertError("tools/convert_ports.py")
+
+    def test_a_pure_brick_may_not_declare_ports(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, PORTS='{"feed": {"kind": "source"}}')
+        self.assertError("pure brick may not declare ports")
 
 
 class DispatcherTests(Fixture):
@@ -317,7 +345,7 @@ class ModeBlindFunctionTests(Fixture):
 
     def test_io_function_without_context_called_from_src_warns(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        self.adapter(brick, "template_files", self.ADAPTER)
         (brick / "src/logic.py").write_text(
             "from ..input.adapters import template_files\n\n\ndef execute(inputs, ctx):\n    return template_files.exists('d', 1)\n",
             encoding="utf-8",
@@ -329,12 +357,12 @@ class ModeBlindFunctionTests(Fixture):
 
     def test_helper_used_only_inside_the_adapter_is_not_flagged(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        self.adapter(brick, "template_files", self.ADAPTER)
         self.assertFalse([w for w in self.warnings() if "takes no run context" in w])
 
     def test_importing_the_function_by_name_counts_as_a_call_from_outside(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/template_files.py").write_text(self.ADAPTER, encoding="utf-8")
+        self.adapter(brick, "template_files", self.ADAPTER)
         (brick / "src/logic.py").write_text(
             "from ..input.adapters.template_files import exists\n\n\ndef execute(inputs, ctx):\n    return exists('d', 1)\n",
             encoding="utf-8",
@@ -343,9 +371,7 @@ class ModeBlindFunctionTests(Fixture):
 
     def test_function_that_takes_the_context_is_fine(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/template_files.py").write_text(
-            self.ADAPTER.replace("def exists(template_dir, seed)", "def exists(ctx, template_dir, seed)"), encoding="utf-8"
-        )
+        self.adapter(brick, "template_files", self.ADAPTER.replace("def exists(template_dir, seed)", "def exists(ctx, template_dir, seed)"))
         (brick / "src/logic.py").write_text(
             "from ..input.adapters import template_files\n\n\ndef execute(inputs, ctx):\n    return template_files.exists(ctx, 'd', 1)\n",
             encoding="utf-8",
@@ -411,8 +437,7 @@ class IoBanTests(Fixture):
 
     def test_importlib_in_an_adapter_is_a_hidden_dependency(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/dyn.py").write_text(
-            "import importlib\nfrom ..evidence import load_example\n\n\ndef f(ctx):\n    load_example('a', 'b', {})\n    return importlib.import_module('bricks.other')\n",
+        self.adapter(brick, "dyn", "import importlib\nfrom ..evidence import load_example\n\n\ndef f(ctx):\n    load_example('a', 'b', {})\n    return importlib.import_module('bricks.other')\n",
             encoding="utf-8",
         )
         self.assertError("dyn.py: dynamic imports hide brick boundaries")
@@ -436,7 +461,7 @@ class IoBanTests(Fixture):
 
     def test_pure_brick_bans_escape_hatches_outside_src_too(self) -> None:
         brick = self.pure_brick()
-        (brick / "input/loader.py").write_text("def f(x):\n    return __import__(x)\n", encoding="utf-8")
+        (brick / "input/loader.py").write_text("def f(x):\n    return __import__(x)\n")
         self.assertError("loader.py: pure brick may not call __import__()")
 
     def test_pure_brick_bans_logging_handlers_outside_src(self) -> None:
@@ -458,9 +483,6 @@ class IoBanTests(Fixture):
 
 
 class AdapterExperienceTests(Fixture):
-    def adapter(self, brick: Path, name: str, text: str) -> None:
-        (brick / "input/adapters" / f"{name}.py").write_text(text, encoding="utf-8")
-
     def test_env_switch_in_an_adapter_warns(self) -> None:
         brick = self.brick()
         self.adapter(
@@ -505,9 +527,7 @@ class AdapterExperienceTests(Fixture):
 
     def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
         self.brick("other")
-        brick = self.brick()
-        self.contract(brick, SIBLING_DEPENDENCIES='{"other": "eventual"}')
-        self.adapter(brick, "other", SIBLING_ADAPTER)
+        self.joint(self.brick(), "other")
         self.assertTrue(all("never calls load_example" not in w for w in self.warnings()))
 
     def test_src_overriding_the_mode_warns(self) -> None:
@@ -537,17 +557,6 @@ class AdapterExperienceTests(Fixture):
         )
         hits = [item for item in self.errors() if "src filesystem access must use an adapter" in item]
         self.assertEqual(len(hits), 4)
-
-    def test_forwarding_fresh_to_a_sibling_explains_what_to_do(self) -> None:
-        self.brick("other")
-        brick = self.brick()
-        self.contract(brick, SIBLING_DEPENDENCIES='{"other": "eventual"}')
-        self.adapter(
-            brick, "other",
-            "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request, fresh=True)\n",
-        )
-        self.assertError("sibling run may not receive fresh or save unless the sibling declares LIVE_ADAPTER = True")
-        self.assertError("MODE_PASSING")
 
 
 class EvidenceSizeTests(Fixture):
@@ -671,9 +680,7 @@ class DeterminismTests(Fixture):
 
     def test_adapters_may_bring_in_the_clock(self) -> None:
         brick = self.brick()
-        (brick / "input/adapters/clock.py").write_text(
-            "import time\n\n\ndef now(ctx):\n    return ctx['io']\n", encoding="utf-8"
-        )
+        self.adapter(brick, "clock", "import time\n\n\ndef now(ctx):\n    return ctx['io']\n")
         self.assertFalse([item for item in self.errors() if "DETERMINISTIC" in item])
 
     def test_a_pure_brick_may_not_declare_nondeterminism(self) -> None:
@@ -707,7 +714,7 @@ class PureLaneTests(Fixture):
     def test_pure_brick_without_the_folder_still_may_not_gain_adapters(self) -> None:
         brick = self.pure_brick()
         self.assertTrue((brick / "input/adapters").is_dir())
-        (brick / "input/adapters/other.py").write_text("x = 1\n", encoding="utf-8")
+        self.adapter(brick, "other", "x = 1\n")
         self.assertError("pure brick may not have adapters")
 
     def test_template_is_not_pure(self) -> None:
@@ -723,8 +730,8 @@ class PureLaneTests(Fixture):
 
     def test_pure_brick_may_not_declare_sibling_dependencies(self) -> None:
         self.brick("other")
-        self.contract(self.pure_brick(), SIBLING_DEPENDENCIES='{"other": "eventual"}')
-        self.assertError("pure brick may not declare sibling dependencies")
+        self.contract(self.pure_brick(), PORTS='{"other": {"kind": "joint", "policy": "eventual", "pin": 1}}')
+        self.assertError("pure brick may not declare ports")
 
     def test_pure_brick_bans_direct_io_outside_runner(self) -> None:
         brick = self.pure_brick()
@@ -806,8 +813,8 @@ class WorkflowLaneTests(Fixture):
 
     def test_nothing_may_depend_on_a_workflow(self) -> None:
         self.workflow_brick("flow")
-        self.contract(self.brick("lib"), SIBLING_DEPENDENCIES='{"flow": "eventual"}')
-        self.assertError("bricks/lib/contract.py: sibling dependency 'flow' is a workflow brick")
+        self.joint(self.brick("lib"), "flow")
+        self.assertError("bricks/lib/contract.py: joint 'flow' is a workflow brick")
 
     def test_workflow_may_have_a_process_door(self) -> None:
         brick = self.workflow_brick()

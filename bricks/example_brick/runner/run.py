@@ -1,4 +1,4 @@
-# BOILERPLATE: runner.run@4
+# BOILERPLATE: runner.run@5
 """The brick's repository-internal entry point.
 
 A working runner, copied with the brick like ``input/evidence.py``: it creates
@@ -71,9 +71,7 @@ def run(inputs: BrickInput, *, fresh: bool = False, save: bool = False) -> Brick
 
     ``fresh`` performs this brick's external calls without changing tracked
     examples. ``save`` implies fresh and replaces reviewed tracked examples.
-    Neither option is forwarded to sibling bricks, except by mode passing (a workflow's
-    ``pass_mode`` to a declared Live Adapter sibling). Siblings that ran fresh are listed
-    in the record as ``fresh_siblings``. Set ``BRICK_RUN_KIND=test``
+    Neither option is forwarded to sibling bricks. Set ``BRICK_RUN_KIND=test``
     (smoke tests do) and the record is a local ``*.test.json`` instead of
     tracked history.
     """
@@ -92,20 +90,11 @@ def run(inputs: BrickInput, *, fresh: bool = False, save: bool = False) -> Brick
         output = execute(inputs, context)
     except Exception as exc:
         record["error"] = {"type": type(exc).__name__, "message": str(exc)}
-        _note_fresh_siblings(record, context)
         _record(record, config)
         raise
-    _note_fresh_siblings(record, context)
     record["output"] = output
     _record(record, config)
     return output
-
-
-def _note_fresh_siblings(record: dict[str, Any], context: dict[str, Any]) -> None:
-    """Copy the siblings that ran fresh into the record. Record-keeping only: nothing reads it back."""
-    names = context.get("fresh_siblings")
-    if names:
-        record["fresh_siblings"] = sorted({str(name) for name in names})
 
 
 def _record(record: dict[str, Any], config: dict[str, Any]) -> None:

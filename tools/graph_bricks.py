@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the declared sibling-dependency graph as Mermaid, using only the standard library."""
+"""Render the declared joint graph as Mermaid, using only the standard library."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ Contract = tuple[dict[str, str], tuple[str, ...], "bool | None"]
 
 
 def read_contract(brick: Path) -> Contract:
-    """Read one brick's declared sibling dependencies, owned state and determinism."""
+    """Read one brick's joints (sibling name to policy), owned state and determinism."""
     path = brick / "contract.py"
     if not path.is_file():
         return {}, (), None
@@ -29,13 +29,16 @@ def read_contract(brick: Path) -> Contract:
     except (OSError, SyntaxError):
         return {}, (), None
 
-    dependencies = assigned_literal(tree, "SIBLING_DEPENDENCIES")
+    ports = assigned_literal(tree, "PORTS")
+    dependencies = {
+        name: port.get("policy")
+        for name, port in (ports.items() if isinstance(ports, dict) else ())
+        if isinstance(port, dict) and port.get("kind") == "joint"
+    }
     owned_state = assigned_literal(tree, "OWNED_STATE")
     deterministic = assigned_literal(tree, "DETERMINISTIC")
     if not isinstance(deterministic, bool):
         deterministic = None
-    if not isinstance(dependencies, dict):
-        dependencies = {}
     if not isinstance(owned_state, (tuple, list)):
         owned_state = ()
     return (

@@ -41,6 +41,33 @@ class ContractReaderTests(unittest.TestCase):
             contracts = {"load": graph_bricks.read_contract(brick)}
         self.assertIn("nondeterministic", graph_bricks.render(contracts))
 
+    def test_brick_ports_reads_declared_ports_and_tolerates_the_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            brick = Path(tmp)
+            self.assertEqual(brick_contract.brick_ports(brick), {})
+            (brick / "contract.py").write_text(
+                'PORTS = {"feed": {"kind": "source"}, "other": {"kind": "joint", "policy": "eventual", "pin": 1}, "bad": 3}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                brick_contract.brick_ports(brick),
+                {"feed": {"kind": "source"}, "other": {"kind": "joint", "policy": "eventual", "pin": 1}},
+            )
+            (brick / "contract.py").write_text("PORTS = make()\n", encoding="utf-8")
+            self.assertEqual(brick_contract.brick_ports(brick), {})
+
+    def test_graph_draws_joints_with_their_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bricks = Path(tmp) / "bricks"
+            for name, ports in (
+                ("flow", '{"lib": {"kind": "joint", "policy": "orchestrated", "pin": 1}, "feed": {"kind": "source"}}'),
+                ("lib", "{}"),
+            ):
+                (bricks / name).mkdir(parents=True)
+                (bricks / name / "contract.py").write_text(f"PORTS = {ports}\n", encoding="utf-8")
+            contracts = {name: graph_bricks.read_contract(bricks / name) for name in ("flow", "lib")}
+        self.assertIn("flow --> lib", graph_bricks.render(contracts))
+
 
 if __name__ == "__main__":
     unittest.main()

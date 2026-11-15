@@ -173,32 +173,6 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("omitted_bytes", record["input"])
         self.assertIn("input", record["summarized"])
 
-    def test_siblings_that_ran_fresh_are_listed_in_the_record(self) -> None:
-        def execute(inputs, context):
-            context["fresh_siblings"] = ["model", "game", "model"]
-            return {"ok": True}
-
-        self.module.execute = execute
-        self.module.run({})
-        (record,) = self.records()
-        self.assertEqual(record["fresh_siblings"], ["game", "model"])
-
-    def test_the_list_is_recorded_on_a_failure_too(self) -> None:
-        def execute(inputs, context):
-            context["fresh_siblings"] = ["game"]
-            raise ValueError("boom")
-
-        self.module.execute = execute
-        with self.assertRaises(ValueError):
-            self.module.run({})
-        (record,) = self.records()
-        self.assertEqual(record["fresh_siblings"], ["game"])
-
-    def test_a_run_with_no_fresh_siblings_has_no_such_field(self) -> None:
-        self.module.run({"day": 1})
-        (record,) = self.records()
-        self.assertNotIn("fresh_siblings", record)
-
     def test_a_small_record_is_not_marked_summarized(self) -> None:
         self.module.run({"day": 1})
         (record,) = self.records()

@@ -38,3 +38,15 @@ def contract_value(brick: Path, name: str) -> Any:
         return assigned_literal(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)), name)
     except (OSError, SyntaxError):
         return None
+
+
+def brick_ports(brick: Path) -> dict[str, dict[str, Any]]:
+    """The declared ports of a brick: port name to its declaration. Not validated.
+
+    Anything that is not a dict of dicts reads as no ports; the linter is the
+    place that rejects a malformed ``PORTS``.
+    """
+    ports = contract_value(brick, "PORTS")
+    if not isinstance(ports, dict):
+        return {}
+    return {name: dict(port) for name, port in ports.items() if isinstance(name, str) and isinstance(port, dict)}

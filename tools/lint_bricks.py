@@ -69,6 +69,12 @@ CONTEXT_NAMES = {"ctx", "context", "run_context"}
 # An environment variable that switches behavior is a mode the run does not record.
 ENV_SWITCH = re.compile(r"(?i)replay|fresh|save|mode|live|offline|record")
 IN_MEMORY = {"BytesIO", "StringIO"}
+PORT_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+SOURCE_FIELDS = {"kind"}
+JOINT_FIELDS = {"kind", "policy", "pin"}
+# Declarations that PORTS replaced; a manifest that still has one is in the old format.
+OLD_DECLARATIONS = ("SIBLING_DEPENDENCIES", "LIVE_ADAPTER", "MODE_PASSING")
+CONVERTER = "tools/convert_ports.py"
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
     "headers", "password", "refresh_token", "secret", "set-cookie", "token", "x-api-key",
@@ -78,12 +84,18 @@ SENSITIVE = {
 @dataclass
 class Contract:
     version: int = 0
-    dependencies: dict[str, str] = field(default_factory=dict)
+    ports: dict[str, dict[str, Any]] = field(default_factory=dict)
     owned_state: tuple[str, ...] = ()
     lane: str = "strict"
     deterministic: bool | None = None
-    live_adapter: bool | None = None
-    mode_passing: tuple[str, ...] = ()
+
+    @property
+    def joints(self) -> dict[str, dict[str, Any]]:
+        return {name: port for name, port in self.ports.items() if port.get("kind") == "joint"}
+
+    @property
+    def sources(self) -> dict[str, dict[str, Any]]:
+        return {name: port for name, port in self.ports.items() if port.get("kind") == "source"}
 
 
 class Lint:
@@ -230,25 +242,26 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         return Contract()
 
     version = assigned_literal(tree, "CONTRACT_VERSION")
-    dependencies = assigned_literal(tree, "SIBLING_DEPENDENCIES")
     owned_state = assigned_literal(tree, "OWNED_STATE")
     lane = assigned_literal(tree, "LANE")
     deterministic = assigned_literal(tree, "DETERMINISTIC")
-    live_adapter = assigned_literal(tree, "LIVE_ADAPTER")
-    mode_passing = assigned_literal(tree, "MODE_PASSING")
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         lint.add(path, "CONTRACT_VERSION must be a positive integer")
         version = 0
-    if not isinstance(dependencies, dict) or not all(
-        isinstance(name, str)
-        and isinstance(mode, str)
-        and mode in {"eventual", "orchestrated"}
-        for name, mode in (dependencies.items() if isinstance(dependencies, dict) else ())
-    ):
-        lint.add(path, "SIBLING_DEPENDENCIES must map names to eventual or orchestrated")
-        dependencies = {}
+    old = [name for name in OLD_DECLARATIONS if any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(isinstance(t, ast.Name) and t.id == name for t in (node.targets if isinstance(node, ast.Assign) else [node.target]))
+        for node in tree.body
+    )]
+    if old:
+        lint.add(
+            path,
+            f"{', '.join(old)} are declarations of the old manifest format; declare PORTS instead "
+            f"(run python3 {CONVERTER} once to convert a project)",
+        )
+    ports = lint_ports(path, tree, lint)
     if not isinstance(owned_state, (tuple, list)) or not all(
         isinstance(item, str) and item for item in owned_state
     ):
@@ -257,14 +270,6 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     if deterministic is not None and not isinstance(deterministic, bool):
         lint.add(path, "DETERMINISTIC must be True or False")
         deterministic = None
-    if live_adapter is not None and not isinstance(live_adapter, bool):
-        lint.add(path, "LIVE_ADAPTER must be True or False")
-        live_adapter = None
-    if mode_passing is None:
-        mode_passing = ()
-    elif not isinstance(mode_passing, (tuple, list)) or not all(isinstance(item, str) and item for item in mode_passing):
-        lint.add(path, "MODE_PASSING must list sibling brick names")
-        mode_passing = ()
     for class_name in ("BrickInput", "BrickOutput"):
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
@@ -308,12 +313,43 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     elif lane not in LANES:
         lint.add(path, f"LANE must be one of {', '.join(sorted(LANES))}")
         lane = "strict"
-    if live_adapter and lane != "strict":
-        lint.add(path, "a Live Adapter brick is in the strict lane: a pure brick has no sources and a workflow is never depended on")
-    if mode_passing and lane != "workflow":
-        lint.add(path, "only a workflow may pass its mode to a sibling (MODE_PASSING)")
 
-    return Contract(version, dict(dependencies), tuple(owned_state), lane, deterministic, live_adapter, tuple(mode_passing))
+    return Contract(version, ports, tuple(owned_state), lane, deterministic)
+
+
+def lint_ports(path: Path, tree: ast.Module, lint: Lint) -> dict[str, dict[str, Any]]:
+    """Validate ``PORTS`` and return the well-formed ports."""
+    declared = assigned_literal(tree, "PORTS")
+    if not any(
+        (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PORTS" for t in node.targets))
+        or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "PORTS")
+        for node in tree.body
+    ):
+        lint.add(path, "PORTS is not declared; declare every source and joint (PORTS = {} for a brick with none)")
+        return {}
+    if not isinstance(declared, dict):
+        lint.add(path, "PORTS must be a dict literal mapping port names to declarations")
+        return {}
+    ports: dict[str, dict[str, Any]] = {}
+    for name, port in declared.items():
+        if not isinstance(name, str) or not PORT_NAME.fullmatch(name):
+            lint.add(path, f"port name {name!r} must be lowercase letters, digits and underscores")
+            continue
+        if not isinstance(port, dict) or port.get("kind") not in {"source", "joint"}:
+            lint.add(path, f"port {name!r} needs kind 'source' or 'joint'")
+            continue
+        kind = port["kind"]
+        allowed = SOURCE_FIELDS if kind == "source" else JOINT_FIELDS
+        for key in sorted(set(port) - allowed, key=str):
+            lint.add(path, f"port {name!r} has field {key!r}, which a {kind} port does not take")
+        if kind == "joint":
+            if port.get("policy") not in {"eventual", "orchestrated"}:
+                lint.add(path, f"joint {name!r} needs policy 'eventual' or 'orchestrated'")
+            pin = port.get("pin")
+            if not isinstance(pin, int) or isinstance(pin, bool) or pin < 1:
+                lint.add(path, f"joint {name!r} needs pin: the integer CONTRACT_VERSION of {name!r} it was written against")
+        ports[name] = port
+    return ports
 
 
 def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -364,17 +400,14 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
         calls: set[str] = set()
         imports_sibling = False
         sibling_runs: dict[str, str] = {}
-        pass_mode_flags: dict[str, str] = {}
         if adapter:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("bricks.") and node.level == 0:
                     for alias in node.names:
                         if alias.name == "run":
                             sibling_runs[alias.asname or alias.name] = node.module.split(".")[1]
-                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                    named = pass_mode_sibling(node.value)
-                    if named:
-                        pass_mode_flags[node.targets[0].id] = named
+            if len(relative) == 3 and path.name != "__init__.py" and path.stem not in contract.ports:
+                lint.add(path, f"adapter {path.name} has no port {path.stem!r} in PORTS; one adapter file implements one declared port")
         if role == "src":
             escape_hatches(path, tree, lint, "src")
         elif role != "runner" and any(
@@ -416,8 +449,10 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             or [n.name for n in node.names] != ["run"]
                         ):
                             lint.add(path, "sibling adapter may import only run")
-                        if parts[1] not in contract.dependencies:
-                            lint.add(path, f"sibling dependency {parts[1]!r} is not declared")
+                        if parts[1] not in contract.joints:
+                            lint.add(path, f"joint {parts[1]!r} is not declared in PORTS")
+                        elif adapter and path.stem != parts[1]:
+                            lint.add(path, f"the adapter for joint {parts[1]!r} must be named {parts[1]}.py")
             if role == "src" and mode_read(node):
                 lint.add(
                     path,
@@ -456,7 +491,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                         warning=True,
                     )
             if adapter and isinstance(node, ast.Call):
-                lint_mode_passing_call(path, node, contract, sibling_runs, pass_mode_flags, lint)
+                lint_sibling_run_call(path, node, sibling_runs, lint)
         if adapter and not imports_sibling and not calls & SAVED_MODE_CALLS:
             lint.add(
                 path,
@@ -465,22 +500,11 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                 warning=True,
             )
 
-    if contract.live_adapter:
-        recorded = False
-        for path in sorted((brick / "input/adapters").glob("*.py")):
-            tree = lint.tree(path)
-            if tree and any(
-                isinstance(node, ast.Call) and called_name(node) in {"through", "Transcript"} for node in ast.walk(tree)
-            ):
-                recorded = True
-        if not recorded:
-            lint.add(
-                brick / "contract.py",
-                "LIVE_ADAPTER = True, but no adapter records through Transcript or through(); "
-                "a Live Adapter records what it drives and replays by default",
-            )
-    for dependency in contract.dependencies.keys() - actual_dependencies:
-        lint.add(brick / "contract.py", f"declared dependency {dependency!r} has no static adapter import", warning=True)
+    for name in sorted(contract.ports):
+        if not (brick / "input/adapters" / f"{name}.py").is_file():
+            lint.add(brick / "contract.py", f"port {name!r} has no adapter file input/adapters/{name}.py")
+    for joint in contract.joints.keys() - actual_dependencies:
+        lint.add(brick / "contract.py", f"declared joint {joint!r} has no static adapter import", warning=True)
 
 
 def read_json(path: Path, lint: Lint) -> Any:
@@ -667,8 +691,8 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
     adapters = sorted((brick / "input/adapters").glob("*.py"))
     for path in adapters:
         lint.add(path, "pure brick may not have adapters")
-    if contract.dependencies:
-        lint.add(brick / "contract.py", "pure brick may not declare sibling dependencies")
+    if contract.ports:
+        lint.add(brick / "contract.py", "pure brick may not declare ports: it has no sources and no joints")
     stdlib = stdlib_names()
     for path in brick.rglob("*.py"):
         relative = path.relative_to(brick).parts
@@ -815,67 +839,13 @@ def lint_copies(bricks: list[Path], lint: Lint) -> None:
                 )
 
 
-def pass_mode_sibling(node: ast.AST) -> str:
-    """The sibling name when ``node`` is ``pass_mode(<context>, "<sibling>")``, else ''."""
-    if (
-        isinstance(node, ast.Call)
-        and called_name(node) == "pass_mode"
-        and len(node.args) == 2
-        and isinstance(node.args[1], ast.Constant)
-        and isinstance(node.args[1].value, str)
-    ):
-        return node.args[1].value
-    return ""
-
-
-def passes_mode_from_helper(value: ast.AST, key: str, sibling: str, flags: dict[str, str]) -> bool:
-    """True for ``pass_mode(ctx, "<sibling>")["<key>"]`` or ``<name>["<key>"]`` where name came from that call."""
-    if not (isinstance(value, ast.Subscript) and isinstance(value.slice, ast.Constant) and value.slice.value == key):
-        return False
-    if pass_mode_sibling(value.value) == sibling:
-        return True
-    return isinstance(value.value, ast.Name) and flags.get(value.value.id) == sibling
-
-
-def lint_mode_passing_call(
-    path: Path,
-    node: ast.Call,
-    contract: Contract,
-    sibling_runs: dict[str, str],
-    flags: dict[str, str],
-    lint: Lint,
-) -> None:
-    """Mode passing: only a declared, helper-fed call may give a sibling fresh or save."""
-    named = pass_mode_sibling(node)
-    if called_name(node) == "pass_mode" and len(node.args) == 2 and isinstance(node.args[1], ast.Constant):
-        if node.args[1].value not in contract.mode_passing:
-            lint.add(path, f"pass_mode for {node.args[1].value!r}, which is not listed in MODE_PASSING in contract.py")
-        return
+def lint_sibling_run_call(path: Path, node: ast.Call, sibling_runs: dict[str, str], lint: Lint) -> None:
+    """A sibling's run is called with its input and nothing that changes how it runs."""
     target = sibling_runs.get(node.func.id) if isinstance(node.func, ast.Name) else None
-    is_run = target is not None or called_name(node) == "run"
-    if not is_run:
+    if target is None and called_name(node) != "run":
         return
-    forwarded = {word.arg for word in node.keywords} & {"fresh", "save"}
-    spread = any(word.arg is None for word in node.keywords)
-    if target is not None and target in contract.mode_passing:
-        if spread:
-            lint.add(path, "a sibling run that gets the mode may not receive expanded keyword arguments")
-        if forwarded != {"fresh", "save"}:
-            lint.add(path, f"mode passing to {target!r} must give both fresh and save, from pass_mode(ctx, {target!r})")
-        for word in node.keywords:
-            if word.arg in {"fresh", "save"} and not passes_mode_from_helper(word.value, word.arg, target, flags):
-                lint.add(
-                    path,
-                    f"{word.arg}= for {target!r} must be pass_mode(ctx, {target!r})[{word.arg!r}], "
-                    "not a value written here",
-                )
-        return
-    if forwarded:
-        lint.add(
-            path,
-            "sibling run may not receive fresh or save unless the sibling declares LIVE_ADAPTER = True and "
-            "this workflow lists it in MODE_PASSING and takes the flags from pass_mode (README: Live Adapters)",
-        )
+    if {word.arg for word in node.keywords} & {"fresh", "save"}:
+        lint.add(path, "a sibling run may not receive fresh or save; a sibling always replays")
 
 
 def lint_adapter_functions(brick: Path, lint: Lint) -> None:
@@ -946,29 +916,25 @@ def lint_graph(
         return next(brick for brick in bricks if brick.name == name) / "contract.py"
 
     for name, contract in contracts.items():
-        for dependency in contract.dependencies:
+        for dependency, port in contract.joints.items():
             if dependency == name:
-                lint.add(next(brick for brick in bricks if brick.name == name) / "contract.py", "brick may not depend on itself")
+                lint.add(where(name), "brick may not depend on itself")
             elif dependency not in names:
-                lint.add(next(brick for brick in bricks if brick.name == name) / "contract.py", f"unknown sibling dependency {dependency!r}")
+                lint.add(where(name), f"joint {dependency!r} names a brick that does not exist")
             else:
                 if contracts[dependency].lane == "workflow":
                     lint.add(
-                        next(brick for brick in bricks if brick.name == name) / "contract.py",
-                        f"sibling dependency {dependency!r} is a workflow brick; a workflow is invoked as a whole, not depended on",
+                        where(name),
+                        f"joint {dependency!r} is a workflow brick; a workflow is invoked as a whole, not depended on",
+                    )
+                pin, version = port.get("pin"), contracts[dependency].version
+                if isinstance(pin, int) and version and pin != version:
+                    lint.add(
+                        where(name),
+                        f"joint {dependency!r} pins version {pin}, but {dependency!r} is at version {version}; "
+                        "update the adapter and the pin together",
                     )
                 graph[name].add(dependency)
-        for target_name in contract.mode_passing:
-            if target_name not in contract.dependencies:
-                lint.add(where(name), f"MODE_PASSING names {target_name!r}, which is not a sibling dependency")
-            elif contract.dependencies[target_name] != "orchestrated":
-                lint.add(where(name), f"MODE_PASSING names {target_name!r}, which must be an orchestrated dependency")
-            elif target_name in contracts and contracts[target_name].live_adapter is not True:
-                lint.add(
-                    where(name),
-                    f"MODE_PASSING names {target_name!r}, which does not declare LIVE_ADAPTER = True; "
-                    "a sibling opts in to receiving a mode",
-                )
         for resource in contract.owned_state:
             if resource in owners:
                 lint.add(
@@ -984,7 +950,7 @@ def lint_graph(
     def visit(name: str, trail: tuple[str, ...]) -> None:
         if name in visiting:
             cycle = " -> ".join((*trail, name))
-            lint.add(lint.root / "bricks", f"sibling dependency cycle: {cycle}")
+            lint.add(lint.root / "bricks", f"joint cycle: {cycle}")
             return
         if name in visited:
             return
