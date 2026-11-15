@@ -14,7 +14,8 @@ This repository uses Python file boilerplate to organize one codebase as discret
 - Optimize for human and agent visibility, not framework machinery.
 - A brick may be complex inside `src/`, but its inputs and recent runs must make its behavior understandable.
 - Keep this repository as boilerplate. Do not add shared runtimes, generators, dependencies, or heavier enforcement unless the user explicitly requests them.
-- Keep enforcement in `tools/lint_bricks.py` lightweight and standard-library-only.
+- Keep enforcement in `tools/lint_bricks.py` lightweight and standard-library-only. Experience checks there are warnings: they say what to do instead.
+- A file copied into every brick (`input/evidence.py`, `runner/run.py`, `runner/rng.py`) is boilerplate, not a shared runtime: it carries `# BOILERPLATE: <id>@<n>` and each brick owns its copy.
 
 ## Non-negotiable rules
 
@@ -26,7 +27,7 @@ This repository uses Python file boilerplate to organize one codebase as discret
 - Every sibling dependency declares its consistency policy as `eventual` or `orchestrated`. Dependency cycles are not allowed; introduce or reshape a parent brick instead.
 - Every persistent application-state resource has exactly one owning brick. Brick-local evidence folders are owned implicitly by their brick.
 - Bricks are used only inside this repository. Do not package or expose them for outside consumers.
-- Saved adapter examples and run records are local, bounded by configuration, and tracked in Git.
+- Saved adapter examples and run records are local, bounded by configuration, and tracked in Git. Test-run records (`BRICK_RUN_KIND=test`) are local and gitignored.
 - Keep only a small number of high-level smoke tests, while allowing focused tests for complex `src/` logic.
 
 ## Contract placement and precedence

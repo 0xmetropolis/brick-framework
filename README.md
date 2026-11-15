@@ -28,6 +28,7 @@ bricks/<brick_name>/
 ```python
 CONTRACT_VERSION = 1
 LANE = "strict"
+DETERMINISTIC = True
 SIBLING_DEPENDENCIES = {"another_brick": "eventual"}
 OWNED_STATE = ("database:example-records",)
 
@@ -93,4 +94,8 @@ Render the declared sibling-dependency graph as Mermaid with:
 python3 tools/graph_bricks.py
 ```
 
-Each node lists the state its brick owns. A solid arrow is an `orchestrated` dependency and a dashed arrow is an `eventual` one. Bricks that no sibling depends on are drawn with a thicker border; those are the top-level flows that may carry smoke tests.
+Each node lists the state its brick owns, and says `nondeterministic` when the brick declares `DETERMINISTIC = False`. A solid arrow is an `orchestrated` dependency and a dashed arrow is an `eventual` one. Bricks that no sibling depends on are drawn with a thicker border; those are the top-level flows that may carry smoke tests.
+
+`tools/brick_contract.py` reads a brick's `contract.py` without importing it; repo-local checks should use `contract_value(brick, "NAME")` rather than a regular expression on config. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
+
+The linter warns, and never fails, on experience problems: a mode-like environment variable in an adapter, an adapter with no saved mode, `src/` reading or overriding the run mode, evidence near its size limit, boilerplate copies that have drifted, and smoke tests that do not mark their records as tests.
