@@ -447,6 +447,14 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                     "src filesystem access must use an adapter (in memory is fine: "
                     "x.open(io.BytesIO(data)) is allowed when the buffer is built in the call)",
                 )
+            if adapter and isinstance(node, ast.Call) and called_name(node) == "Transcript":
+                if not any(keyword.arg == "fingerprint" for keyword in node.keywords):
+                    lint.add(
+                        path,
+                        "Transcript is created without fingerprint=; name what the source is (game version, "
+                        "build, protocol) so a recording made against another version is found stale",
+                        warning=True,
+                    )
             if adapter and isinstance(node, ast.Call):
                 lint_mode_passing_call(path, node, contract, sibling_runs, pass_mode_flags, lint)
         if adapter and not imports_sibling and not calls & SAVED_MODE_CALLS:

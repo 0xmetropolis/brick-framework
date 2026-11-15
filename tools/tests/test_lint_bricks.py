@@ -159,6 +159,23 @@ RECORDING_ADAPTER = (
 )
 
 
+class FingerprintLintTests(Fixture):
+    def test_a_transcript_without_a_fingerprint_warns(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/game.py").write_text(
+            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c')\n", encoding="utf-8"
+        )
+        self.assertTrue(any("game.py: Transcript is created without fingerprint=" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_a_transcript_with_one_is_clean(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/game.py").write_text(
+            "from ..evidence import Transcript\n\n\ndef open_session(ctx):\n    return Transcript(ctx, 'g', 'c', fingerprint={'v': 1})\n", encoding="utf-8"
+        )
+        self.assertClean()
+
+
 class ModePassingTests(Fixture):
     def pair(self, *, adapter: str = PASSING_ADAPTER, policy: str = "orchestrated", opt_in: bool = True, listed: bool = True) -> tuple[Path, Path]:
         game = self.brick("game")
@@ -483,7 +500,7 @@ class AdapterExperienceTests(Fixture):
     def test_through_and_transcript_count_as_a_saved_mode(self) -> None:
         brick = self.brick()
         self.adapter(brick, "a", "from ..evidence import through\n\n\ndef f(ctx):\n    return through(ctx, 'a', 'c', {}, dict)\n")
-        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c')\n")
+        self.adapter(brick, "b", "from ..evidence import Transcript\n\n\ndef f(ctx):\n    return Transcript(ctx, 'b', 'c', fingerprint={'v': 1})\n")
         self.assertTrue(all("never calls" not in w for w in self.warnings()))
 
     def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:

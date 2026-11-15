@@ -83,6 +83,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(text, json.dumps(json.loads(text), indent=2, sort_keys=True) + "\n")
 
 
+FP = {"game": "0.71", "protocol": "p1"}
+
+
 def ctx(mode: str, run_id: str = "run-2", max_bytes: int | None = None) -> dict:
     config = {"limits": {"max_evidence_bytes": max_bytes}} if max_bytes else {}
     return {"mode": mode, "run_id": run_id, "config": config}
@@ -147,7 +150,7 @@ class TranscriptTests(unittest.TestCase):
 
     def record(self, record=True) -> list:
         log = []
-        script = evidence.Transcript(ctx("save"), "game", "year", record)
+        script = evidence.Transcript(ctx("save"), "game", "year", record, fingerprint=FP)
         script.begin("w0", {"protocol": "p1", "after": "d0"})
         log.append(script.op("call", {"cmd": "state"}, lambda: {"day": 1}))
         log.append(script.op("advance", {"days": 1}, lambda: {"day": 2}))
@@ -160,7 +163,7 @@ class TranscriptTests(unittest.TestCase):
         self.record()
         names = sorted(path.stem for path in evidence.DATA_DIR.glob("game/*.json"))
         self.assertEqual(names, ["year-w0", "year-w1"])
-        script = evidence.Transcript(ctx("saved"), "game", "year")
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
         prov = script.begin("w0", {"protocol": "p1", "after": "d0"})
         self.assertEqual(prov["recorded"], True)
         self.assertEqual(script.op("call", {"cmd": "state"}, lambda: 1 / 0), {"day": 1})
@@ -168,14 +171,14 @@ class TranscriptTests(unittest.TestCase):
 
     def test_a_stale_window_is_found_alone_by_its_request(self) -> None:
         self.record()
-        script = evidence.Transcript(ctx("saved"), "game", "year")
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
         with self.assertRaises(evidence.EvidenceError) as caught:
             script.begin("w1", {"protocol": "p2", "after": "d1"})
         self.assertIn('protocol: saved "p1", requested "p2"', str(caught.exception))
 
     def test_a_changed_operation_names_the_field_and_the_operation(self) -> None:
         self.record()
-        script = evidence.Transcript(ctx("saved"), "game", "year")
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
         script.begin("w0", {"protocol": "p1", "after": "d0"})
         script.op("call", {"cmd": "state"}, lambda: 1 / 0)
         with self.assertRaises(evidence.EvidenceError) as caught:
@@ -187,12 +190,12 @@ class TranscriptTests(unittest.TestCase):
 
     def test_a_different_kind_and_an_extra_operation_are_errors(self) -> None:
         self.record()
-        script = evidence.Transcript(ctx("saved"), "game", "year")
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
         script.begin("w1", {"protocol": "p1", "after": "d1"})
         with self.assertRaises(evidence.EvidenceError) as kind:
             script.op("advance", {"days": 1}, lambda: 1 / 0)
         self.assertIn("recorded a call, requested a advance", str(kind.exception))
-        script = evidence.Transcript(ctx("saved"), "game", "year")
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
         script.begin("w1", {"protocol": "p1", "after": "d1"})
         script.op("call", {"cmd": "state"}, lambda: 1 / 0)
         with self.assertRaises(evidence.EvidenceError) as extra:
@@ -204,7 +207,7 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(sorted(path.stem for path in evidence.DATA_DIR.glob("game/*.json")), ["year-w1"])
 
     def test_fresh_records_nothing(self) -> None:
-        script = evidence.Transcript(ctx("fresh"), "game", "year")
+        script = evidence.Transcript(ctx("fresh"), "game", "year", fingerprint=FP)
         script.begin("w0", {})
         self.assertEqual(script.op("call", {}, lambda: {"ok": 1}), {"ok": 1})
         script.end()
@@ -232,6 +235,89 @@ class PassModeTests(unittest.TestCase):
         for name in ("game", "model", "game"):
             evidence.pass_mode(context, name)
         self.assertEqual(context["fresh_siblings"], ["game", "model"])
+
+
+class FingerprintTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(evidence, "DATA_DIR", Path(tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def record(self, fingerprint: dict) -> None:
+        script = evidence.Transcript(ctx("save"), "game", "year", fingerprint=fingerprint)
+        script.begin("w0", {"after": "d0"})
+        script.op("call", {"cmd": "state"}, lambda: {"day": 1})
+        script.end()
+
+    def test_a_transcript_needs_a_fingerprint(self) -> None:
+        with self.assertRaises(TypeError):
+            evidence.Transcript(ctx("saved"), "game", "year")
+        for empty in ({}, None, "v1"):
+            with self.assertRaises(evidence.EvidenceError):
+                evidence.Transcript(ctx("saved"), "game", "year", fingerprint=empty)
+
+    def test_the_fingerprint_is_in_every_saved_window_request(self) -> None:
+        self.record(FP)
+        saved = json.loads((evidence.DATA_DIR / "game/year-w0.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["request"]["fingerprint"], FP)
+        self.assertEqual(saved["request"]["window"], "w0")
+
+    def test_replay_against_a_changed_fingerprint_is_a_clear_stale_error(self) -> None:
+        self.record(FP)
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint={**FP, "game": "0.72"})
+        with self.assertRaises(evidence.EvidenceError) as caught:
+            script.begin("w0", {"after": "d0"})
+        self.assertIn('fingerprint.game: saved "0.71", requested "0.72"', str(caught.exception))
+        self.assertNotIsInstance(caught.exception, evidence.SourceMismatch)
+
+    def test_replay_with_the_recorded_fingerprint_works(self) -> None:
+        self.record(FP)
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
+        script.begin("w0", {"after": "d0"})
+        self.assertEqual(script.op("call", {"cmd": "state"}, lambda: 1 / 0), {"day": 1})
+
+    def test_a_request_may_not_set_the_fingerprint_itself(self) -> None:
+        script = evidence.Transcript(ctx("save"), "game", "year", fingerprint=FP)
+        with self.assertRaises(evidence.EvidenceError):
+            script.begin("w0", {"fingerprint": {"x": 1}})
+
+    def test_saved_mode_connects_to_nothing_so_nothing_is_checked(self) -> None:
+        script = evidence.Transcript(ctx("saved"), "game", "year", fingerprint=FP)
+        script.check_source({"game": "9.9"})
+
+    def test_fresh_refuses_a_source_that_differs(self) -> None:
+        script = evidence.Transcript(ctx("fresh"), "game", "year", fingerprint=FP)
+        with self.assertRaises(evidence.SourceMismatch) as caught:
+            script.check_source({"game": "0.72", "protocol": "p1"})
+        message = str(caught.exception)
+        self.assertIn('game: recorded against "0.71", the source reports "0.72"', message)
+        self.assertNotIn("protocol", message)
+        self.assertIn("re-record with save", message)
+
+    def test_save_refuses_too_and_a_missing_report_is_named(self) -> None:
+        script = evidence.Transcript(ctx("save"), "game", "year", fingerprint=FP)
+        with self.assertRaises(evidence.SourceMismatch) as caught:
+            script.check_source({"protocol": "p1"})
+        self.assertIn("game: recorded against \"0.71\", the source reports nothing", str(caught.exception))
+
+    def test_a_matching_source_may_report_more(self) -> None:
+        script = evidence.Transcript(ctx("fresh"), "game", "year", fingerprint=FP)
+        script.check_source({"game": "0.71", "protocol": "p1", "heapMb": 12})
+
+    def test_through_merges_a_fingerprint_into_the_request(self) -> None:
+        evidence.through(ctx("save"), "feed", "c", {"q": 1}, lambda: {"a": 1}, fingerprint={"api": "v2"})
+        saved = json.loads((evidence.DATA_DIR / "feed/c.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["request"], {"fingerprint": {"api": "v2"}, "q": 1})
+        with self.assertRaises(evidence.EvidenceError) as caught:
+            evidence.through(ctx("saved"), "feed", "c", {"q": 1}, dict, fingerprint={"api": "v3"})
+        self.assertIn('fingerprint.api: saved "v2", requested "v3"', str(caught.exception))
+
+    def test_through_without_a_fingerprint_is_unchanged(self) -> None:
+        evidence.through(ctx("save"), "feed", "plain", {"q": 1}, lambda: {"a": 1})
+        saved = json.loads((evidence.DATA_DIR / "feed/plain.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["request"], {"q": 1})
 
 
 if __name__ == "__main__":
