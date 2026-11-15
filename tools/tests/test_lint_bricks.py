@@ -139,6 +139,102 @@ class ModeReadTests(Fixture):
         self.assertClean()
 
 
+SIBLING_ADAPTER = (
+    "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request)\n"
+)
+ADAPTER_WITH_SAVED_MODE = (
+    "from ..evidence import load_example\n\n\n"
+    "def fetch(request, ctx):\n{body}    return load_example('feed', 'default', request)['response']\n"
+)
+
+
+class AdapterExperienceTests(Fixture):
+    def adapter(self, brick: Path, name: str, text: str) -> None:
+        (brick / "input/adapters" / f"{name}.py").write_text(text, encoding="utf-8")
+
+    def test_env_switch_in_an_adapter_warns(self) -> None:
+        brick = self.brick()
+        self.adapter(
+            brick, "feed",
+            ADAPTER_WITH_SAVED_MODE.format(body="    if os.environ.get('SYX_FEED_REPLAY'):\n        pass\n")
+            .replace("from ..evidence", "import os\nfrom ..evidence"),
+        )
+        self.assertTrue(any("environment variable 'SYX_FEED_REPLAY'" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_getenv_and_subscript_forms_warn(self) -> None:
+        brick = self.brick()
+        self.adapter(
+            brick, "feed",
+            "import os\nfrom ..evidence import load_example\n\n\ndef fetch(request, ctx):\n"
+            "    a = os.getenv('FEED_LIVE')\n    b = os.environ['FEED_OFFLINE']\n"
+            "    return load_example('feed', 'default', request)\n",
+        )
+        hits = [w for w in self.warnings() if "environment variable" in w]
+        self.assertEqual(len(hits), 2)
+
+    def test_credentials_and_paths_in_the_environment_are_fine(self) -> None:
+        brick = self.brick()
+        self.adapter(
+            brick, "feed",
+            "import os\nfrom ..evidence import load_example\n\n\ndef fetch(request, ctx):\n"
+            "    token = os.environ.get('FEED_TOKEN')\n    root = os.getenv('FEED_ROOT')\n"
+            "    return load_example('feed', 'default', request)\n",
+        )
+        self.assertTrue(all("environment variable" not in w for w in self.warnings()))
+
+    def test_adapter_with_no_saved_mode_warns(self) -> None:
+        brick = self.brick()
+        self.adapter(brick, "tool", "import subprocess\n\n\ndef encode(request, ctx):\n    return {}\n")
+        self.assertTrue(any("tool.py: adapter never calls load_example" in w for w in self.warnings()))
+
+    def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.contract(brick, SIBLING_DEPENDENCIES='{"other": "eventual"}')
+        self.adapter(brick, "other", SIBLING_ADAPTER)
+        self.assertTrue(all("never calls load_example" not in w for w in self.warnings()))
+
+    def test_src_overriding_the_mode_warns(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def second(ctx):\n    return dict(ctx, mode='fresh')\n", encoding="utf-8"
+        )
+        self.assertTrue(any("src overrides the run mode" in w for w in self.warnings()))
+
+    def test_in_memory_open_is_allowed_in_src(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "import io\n\n\ndef decode(image, data):\n    return image.open(io.BytesIO(data))\n"
+            "\n\ndef text(image, data):\n    return image.open(StringIO(data))\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(all("src/logic.py" not in item for item in self.errors()))
+
+    def test_open_on_anything_else_is_still_a_file_access(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def a(image, path):\n    return image.open(path)\n"
+            "\n\ndef b(path):\n    return open(path)\n"
+            "\n\ndef c(image, buf):\n    return image.open(buf)\n"
+            "\n\ndef d(data):\n    return open(BytesIO(data))\n",
+            encoding="utf-8",
+        )
+        hits = [item for item in self.errors() if "src filesystem access must use an adapter" in item]
+        self.assertEqual(len(hits), 4)
+
+    def test_forwarding_fresh_to_a_sibling_explains_what_to_do(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.contract(brick, SIBLING_DEPENDENCIES='{"other": "eventual"}')
+        self.adapter(
+            brick, "other",
+            "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request, fresh=True)\n",
+        )
+        self.assertError("a sibling always replays")
+        self.assertError("Sources several bricks share")
+
+
 class DeterminismTests(Fixture):
     def test_template_declares_determinism(self) -> None:
         self.assertIn("DETERMINISTIC = True", (ROOT / "bricks/example_brick/contract.py").read_text(encoding="utf-8"))

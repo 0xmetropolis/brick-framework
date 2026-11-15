@@ -47,6 +47,9 @@ DIRECT_IO = {
 }
 # Names a run context goes by in src/ and adapters.
 CONTEXT_NAMES = {"ctx", "context", "run_context"}
+# An environment variable that switches behavior is a mode the run does not record.
+ENV_SWITCH = re.compile(r"(?i)replay|fresh|save|mode|live|offline|record")
+IN_MEMORY = {"BytesIO", "StringIO"}
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
     "headers", "password", "refresh_token", "secret", "set-cookie", "token", "x-api-key",
@@ -98,6 +101,52 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     if isinstance(node, ast.Import):
         return [alias.name for alias in node.names]
     return ["." * node.level + (node.module or "")]
+
+
+def mode_override(node: ast.AST) -> bool:
+    """True for ``dict(ctx, mode=...)``: src building a context with another mode."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "dict"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in CONTEXT_NAMES
+        and any(keyword.arg == "mode" for keyword in node.keywords)
+    )
+
+
+def env_switch(node: ast.AST) -> str:
+    """The variable name when ``node`` reads a mode-like environment variable, else ''."""
+
+    def is_environ(value: ast.AST) -> bool:
+        return isinstance(value, ast.Attribute) and value.attr == "environ"
+
+    key = None
+    if isinstance(node, ast.Subscript) and is_environ(node.value):
+        key = node.slice
+    elif isinstance(node, ast.Call) and node.args:
+        if isinstance(node.func, ast.Attribute) and (
+            (node.func.attr == "get" and is_environ(node.func.value)) or node.func.attr == "getenv"
+        ):
+            key = node.args[0]
+    if isinstance(key, ast.Constant) and isinstance(key.value, str) and ENV_SWITCH.search(key.value):
+        return key.value
+    return ""
+
+
+def opens_a_file(node: ast.Call) -> bool:
+    """A call named ``open``, except ``x.open(BytesIO(...))``, which cannot reach a file."""
+    if called_name(node) != "open":
+        return False
+    in_memory = (
+        isinstance(node.func, ast.Attribute)
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Call)
+        and called_name(node.args[0]) in IN_MEMORY
+    )
+    return not in_memory
 
 
 def called_name(node: ast.Call) -> str:
@@ -222,7 +271,11 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
         relative = path.relative_to(brick).parts
         role = relative[0] if len(relative) > 1 else "entry"
         adapter = relative[:2] == ("input", "adapters")
+        calls: set[str] = set()
+        imports_sibling = False
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                calls.add(called_name(node))
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 if isinstance(node, ast.ImportFrom):
                     package_depth = len(relative[:-1])
@@ -241,6 +294,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, f"src imports direct-I/O module {parts[0]!r}")
                     if len(parts) > 1 and parts[0] == "bricks" and parts[1] != brick.name:
                         actual_dependencies.add(parts[1])
+                        imports_sibling = True
                         if not adapter:
                             lint.add(path, "only an input adapter may import a sibling brick")
                         elif (
@@ -258,12 +312,44 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                     "so label recorded data by what the adapter returned (input/AGENTS.md, Recorded data)",
                     warning=True,
                 )
-            if role == "src" and isinstance(node, ast.Call) and called_name(node) == "open":
-                lint.add(path, "src filesystem access must use an adapter")
+            if role == "src" and mode_override(node):
+                lint.add(
+                    path,
+                    "src overrides the run mode; the mode belongs to the run and its adapters. To use a "
+                    "source live or recorded independently, make it its own sibling brick "
+                    "(input/AGENTS.md, Recorded data)",
+                    warning=True,
+                )
+            if adapter and env_switch(node):
+                lint.add(
+                    path,
+                    f"adapter switches behavior on environment variable {env_switch(node)!r}; that is a mode "
+                    "no run record shows. Put the source in its own sibling brick (it always replays), or "
+                    "pass the choice in the brick input",
+                    warning=True,
+                )
+            if role == "src" and isinstance(node, ast.Call) and opens_a_file(node):
+                lint.add(
+                    path,
+                    "src filesystem access must use an adapter (in memory is fine: "
+                    "x.open(io.BytesIO(data)) is allowed when the buffer is built in the call)",
+                )
             if adapter and isinstance(node, ast.Call) and called_name(node) == "run":
                 forwarded = {word.arg for word in node.keywords} & {"fresh", "save"}
                 if forwarded:
-                    lint.add(path, "sibling run may not receive fresh or save")
+                    lint.add(
+                        path,
+                        "sibling run may not receive fresh or save; a sibling always replays. To reach a "
+                        "source live from this brick, give this brick its own adapter for it "
+                        "(input/AGENTS.md, Sources several bricks share)",
+                    )
+        if adapter and not imports_sibling and "load_example" not in calls:
+            lint.add(
+                path,
+                "adapter never calls load_example, so it has no saved mode; a file or tool adapter "
+                "replays a recorded manifest (input/AGENTS.md, Recorded data)",
+                warning=True,
+            )
 
     for dependency in contract.dependencies.keys() - actual_dependencies:
         lint.add(brick / "contract.py", f"declared dependency {dependency!r} has no static adapter import", warning=True)
