@@ -4,7 +4,7 @@ This folder owns orchestration, brick-local run identity, run history, and smoke
 
 ## Brick entry point
 
-- `run.py` contains the brick's only repository-internal entry point: `run`. The template's `run.py` and `rng.py` are working code, copied with the brick like `input/evidence.py` and marked `# BOILERPLATE: runner.run@1`; only the imports of `execute` and the contract types are brick-specific, so copies stay identical.
+- `run.py` contains the brick's only repository-internal entry point: `run`. The template's `run.py` and `rng.py` are working code, copied with the brick like `input/evidence.py` and marked `# BOILERPLATE: runner.run@<n>`; only the imports of `execute` and the contract types are brick-specific, so copies stay identical.
 - Annotate `run` with the brick's `BrickInput` and `BrickOutput` types from `contract.py`.
 - `run` accepts ordinary inputs plus keyword-only `fresh` and `save` options. `save=True` implies a fresh call.
 - `run` creates a run ID through `rng.py`, resolves configuration, builds a plain run context, calls `src/`, records the run outcome, and returns the result.
@@ -18,6 +18,7 @@ This folder owns orchestration, brick-local run identity, run history, and smoke
 - Record every run, including failures and tests, under `runs/` using its brick-local run ID. With `BRICK_RUN_KIND=test` the record is `<run id>.test.json`: still recorded and bounded (its own retention), but gitignored by `runs/.gitignore`, so tests do not churn tracked history.
 - Each run-outcome record includes the run ID, kind (`run` or `test`), mode (`saved`, `fresh`, or `save`), input, output or error, and timestamp.
 - Input evidence captured by an explicit save operation carries the same run ID and can be joined outside the runner.
+- `run` may be called from several threads at once (a workflow's threads calling one sibling). Recording and pruning must tolerate a record another call already removed.
 - Retain only the configured number of recent runs. Prune after recording the new run.
 - Enforce `max_run_record_bytes` before writing a run record.
 - Tracked run records are intentionally in Git (test records are not). A brick called very often by siblings, such as a pure brick, may set `retention.runs: 1` in `config.yml`; calling it once per tick is better avoided. The human or agent operating the repository commits the resulting bounded history changes.

@@ -1,4 +1,4 @@
-# BOILERPLATE: runner.run@1
+# BOILERPLATE: runner.run@2
 """The brick's repository-internal entry point.
 
 A working runner, copied with the brick like ``input/evidence.py``: it creates
@@ -112,7 +112,8 @@ def _record(record: dict[str, Any], config: dict[str, Any]) -> None:
         path for path in RUNS.glob("*.json") if path.name.endswith(TEST_SUFFIX) == (suffix == TEST_SUFFIX)
     )
     for old in mine[:-retained]:
-        old.unlink()
+        # Another thread's run may have pruned the same record already.
+        old.unlink(missing_ok=True)
 
 
 def _bounded(record: dict[str, Any], limit: int) -> bytes:

@@ -109,6 +109,27 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([record["input"]["i"] for record in self.records("[0-9]*[0-9a-f].json")], ["tracked"])
         self.assertEqual(self.records("*.test.json")[0]["kind"], "test")
 
+    def test_concurrent_runs_all_return_their_output(self) -> None:
+        import threading
+
+        self.config(runs=3)
+        errors: list[str] = []
+
+        def work() -> None:
+            for index in range(40):
+                try:
+                    self.module.run({"i": index})
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=work) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertGreaterEqual(len(self.records()), 1)
+
     def test_the_runs_folder_ignores_test_records(self) -> None:
         self.assertIn("*.test.json", (self.brick / "runner/runs/.gitignore").read_text(encoding="utf-8"))
 
