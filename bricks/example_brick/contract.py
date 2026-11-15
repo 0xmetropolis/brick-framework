@@ -11,6 +11,9 @@ CONTRACT_VERSION = 1
 # "strict".
 LANE = "strict"
 
+# Meaning: the same input and the same adapter answers give the same output.
+# What an adapter returns (a game state, a model answer) is an input to src/, so a
+# brick that calls a live source can still say True; the promise is about src/.
 # True: src/ takes the clock, randomness and generated IDs as input and the
 # linter holds it to that (no random, time, threading, uuid, secrets, .now()).
 # False: nondeterminism is intended (a throughput or load flow); say why in a
