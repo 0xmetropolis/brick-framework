@@ -148,6 +148,92 @@ ADAPTER_WITH_SAVED_MODE = (
 )
 
 
+class IoBanTests(Fixture):
+    def src(self, brick: Path, text: str, name: str = "helpers.py") -> None:
+        (brick / "src" / name).write_text(text, encoding="utf-8")
+
+    def test_modules_that_do_io_are_banned_in_src(self) -> None:
+        brick = self.brick()
+        modules = ["http.client", "tempfile", "glob", "ssl", "asyncio", "ctypes", "multiprocessing", "shelve", "webbrowser", "builtins"]
+        self.src(brick, "".join(f"import {name}\n" for name in modules))
+        for name in modules:
+            self.assertError(f"src imports direct-I/O module {name.split('.')[0]!r}")
+
+    def test_logging_handlers_are_banned_but_logging_is_not(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import logging\nimport logging.handlers\n")
+        errors = [item for item in self.errors() if "helpers.py" in item]
+        self.assertEqual(errors, ["bricks/example_brick/src/helpers.py: src imports direct-I/O module 'logging.handlers'"])
+
+    def test_dynamic_import_eval_and_exec_are_banned_in_src(self) -> None:
+        brick = self.brick()
+        self.src(brick, "def a():\n    return __import__('os')\n\n\ndef b(x):\n    return eval(x)\n\n\ndef c(x):\n    exec(x)\n")
+        for name in ("__import__", "eval", "exec"):
+            self.assertError(f"src may not call {name}()")
+
+    def test_importlib_is_banned_in_src(self) -> None:
+        self.src(self.brick(), "import importlib\n")
+        self.assertError("src imports direct-I/O module 'importlib'")
+
+    def test_sys_modules_and_builtins_are_banned_in_src(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import sys\n\n\ndef a():\n    return sys.modules['os']\n\n\ndef b():\n    return __builtins__\n")
+        self.assertError("src may not use sys.modules")
+        self.assertError("src may not use __builtins__")
+
+    def test_importing_sys_for_other_things_is_fine(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import sys\n\n\ndef limit():\n    return sys.maxsize\n")
+        self.assertClean()
+
+    def test_importlib_in_an_adapter_is_a_hidden_dependency(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/dyn.py").write_text(
+            "import importlib\nfrom ..evidence import load_example\n\n\ndef f(ctx):\n    load_example('a', 'b', {})\n    return importlib.import_module('bricks.other')\n",
+            encoding="utf-8",
+        )
+        self.assertError("dyn.py: dynamic imports hide brick boundaries")
+
+    def test_runner_may_still_import_what_it_needs(self) -> None:
+        self.brick()
+        self.assertClean()
+
+    def test_pure_brick_may_import_only_allowlisted_standard_library(self) -> None:
+        brick = self.pure_brick()
+        self.src(brick, "import json\nimport re\nimport io\nimport operator\nimport sys\nimport logging\nimport inspect\n")
+        self.assertError("pure brick imports standard-library module 'sys', which is not on the pure allowlist")
+        self.assertError("standard-library module 'logging'")
+        self.assertError("standard-library module 'inspect'")
+        self.assertFalse([item for item in self.errors() if "'json'" in item or "'re'" in item or "'io'" in item or "'operator'" in item])
+
+    def test_pure_brick_may_use_third_party_libraries(self) -> None:
+        brick = self.pure_brick()
+        self.src(brick, "import numpy\n")
+        self.assertClean()
+
+    def test_pure_brick_bans_escape_hatches_outside_src_too(self) -> None:
+        brick = self.pure_brick()
+        (brick / "input/loader.py").write_text("def f(x):\n    return __import__(x)\n", encoding="utf-8")
+        self.assertError("loader.py: pure brick may not call __import__()")
+
+    def test_pure_brick_bans_logging_handlers_outside_src(self) -> None:
+        brick = self.pure_brick()
+        (brick / "input/loader.py").write_text("import logging.handlers\n", encoding="utf-8")
+        self.assertError("loader.py: pure brick imports 'logging.handlers' outside runner/")
+
+    def test_door_importing_io_modules_warns(self) -> None:
+        brick = self.brick()
+        self.contract(brick, LANE='"workflow"')
+        (brick / "__main__.py").write_text(
+            "import argparse\nimport os\nimport subprocess\nimport shutil\nfrom pathlib import Path\n\nfrom bricks.example_brick import run\n",
+            encoding="utf-8",
+        )
+        warnings = [w for w in self.warnings() if "__main__.py" in w]
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("'subprocess'" in w for w in warnings) and any("'shutil'" in w for w in warnings))
+        self.assertEqual(self.errors(), [])
+
+
 class AdapterExperienceTests(Fixture):
     def adapter(self, brick: Path, name: str, text: str) -> None:
         (brick / "input/adapters" / f"{name}.py").write_text(text, encoding="utf-8")

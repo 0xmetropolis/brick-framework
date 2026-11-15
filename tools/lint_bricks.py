@@ -42,8 +42,22 @@ CONFIG_DEFAULTS = {
     "max_run_record_bytes": 122_880,
 }
 DIRECT_IO = {
-    "boto3", "ftplib", "httpx", "os", "pathlib", "psycopg", "requests",
-    "shutil", "smtplib", "socket", "sqlite3", "subprocess", "urllib",
+    "asyncio", "boto3", "builtins", "ctypes", "fcntl", "fileinput", "ftplib", "glob", "http", "httpx",
+    "imaplib", "importlib", "mmap", "multiprocessing", "os", "pathlib", "poplib", "psycopg", "requests",
+    "selectors", "shelve", "shutil", "smtplib", "socket", "socketserver", "sqlite3", "ssl", "subprocess",
+    "tempfile", "telnetlib", "urllib", "webbrowser", "xmlrpc",
+}
+# Submodules of an otherwise harmless package that do I/O.
+DIRECT_IO_DOTTED = {"logging.handlers", "logging.config"}
+# Ways to reach a banned module without importing it by name.
+ESCAPE_CALLS = {"__import__", "eval", "exec"}
+# The standard-library modules a pure brick may import: no I/O, clock, randomness, threads or process state.
+PURE_STDLIB = {
+    "__future__", "abc", "array", "ast", "base64", "binascii", "bisect", "calendar", "cmath", "codecs",
+    "collections", "colorsys", "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "difflib",
+    "enum", "fnmatch", "fractions", "functools", "graphlib", "hashlib", "heapq", "hmac", "html", "io",
+    "ipaddress", "itertools", "json", "keyword", "math", "numbers", "operator", "pprint", "re", "reprlib",
+    "shlex", "statistics", "string", "struct", "textwrap", "types", "typing", "unicodedata", "warnings", "zlib",
 }
 # Names a run context goes by in src/ and adapters.
 CONTEXT_NAMES = {"ctx", "context", "run_context"}
@@ -101,6 +115,27 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     if isinstance(node, ast.Import):
         return [alias.name for alias in node.names]
     return ["." * node.level + (node.module or "")]
+
+
+def stdlib_names() -> frozenset[str] | None:
+    """The standard library's top-level module names (Python 3.10+), or None where unknown."""
+    return getattr(sys, "stdlib_module_names", None)
+
+
+def escape_hatches(path: Path, tree: ast.Module, lint: Lint, label: str) -> None:
+    """Dynamic import, eval/exec and ``sys.modules`` reach banned modules without naming them."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and called_name(node) in ESCAPE_CALLS and isinstance(node.func, ast.Name):
+            lint.add(path, f"{label} may not call {called_name(node)}(); it reaches modules the import rules cannot see")
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        ):
+            lint.add(path, f"{label} may not use sys.modules; it reaches modules the import rules cannot see")
+        if isinstance(node, ast.Name) and node.id == "__builtins__":
+            lint.add(path, f"{label} may not use __builtins__; it reaches open() and __import__ unseen")
 
 
 def mode_override(node: ast.AST) -> bool:
@@ -273,6 +308,13 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
         adapter = relative[:2] == ("input", "adapters")
         calls: set[str] = set()
         imports_sibling = False
+        if role == "src":
+            escape_hatches(path, tree, lint, "src")
+        elif role != "runner" and any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "__import__"
+            for node in ast.walk(tree)
+        ):
+            lint.add(path, "dynamic imports hide brick boundaries")
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 calls.add(called_name(node))
@@ -292,6 +334,10 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, "src may not import runner")
                         if parts[0] in DIRECT_IO:
                             lint.add(path, f"src imports direct-I/O module {parts[0]!r}")
+                        elif ".".join(parts[:2]) in DIRECT_IO_DOTTED:
+                            lint.add(path, f"src imports direct-I/O module {'.'.join(parts[:2])!r}")
+                    elif role != "runner" and parts[0] == "importlib":
+                        lint.add(path, "dynamic imports hide brick boundaries")
                     if len(parts) > 1 and parts[0] == "bricks" and parts[1] != brick.name:
                         actual_dependencies.add(parts[1])
                         imports_sibling = True
@@ -541,6 +587,7 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
         lint.add(path, "pure brick may not have adapters")
     if contract.dependencies:
         lint.add(brick / "contract.py", "pure brick may not declare sibling dependencies")
+    stdlib = stdlib_names()
     for path in brick.rglob("*.py"):
         relative = path.relative_to(brick).parts
         if relative[0] == "runner":
@@ -548,10 +595,21 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
         tree = lint.tree(path)
         if not tree:
             continue
+        if relative[0] != "src":
+            escape_hatches(path, tree, lint, "pure brick")
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for module in imported_modules(node):
                     name = module.lstrip(".").split(".")[0]
+                    if (
+                        stdlib is not None
+                        and name in stdlib
+                        and name not in PURE_STDLIB
+                        and name not in PURE_FORBIDDEN
+                    ):
+                        lint.add(path, f"pure brick imports standard-library module {name!r}, which is not on the pure allowlist")
+                    if ".".join(module.lstrip(".").split(".")[:2]) in DIRECT_IO_DOTTED and relative[0] != "src":
+                        lint.add(path, f"pure brick imports {'.'.join(module.split('.')[:2])!r} outside runner/")
                     # src/ already reports DIRECT_IO under the rule every brick gets.
                     if name in PURE_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
                         hint = (
@@ -591,6 +649,14 @@ def lint_workflow(brick: Path, contract: Contract, lint: Lint) -> None:
         for module in imported_modules(node):
             inside = module.startswith(".") or module.split(".")[0] == "bricks"
             if not inside:
+                top = module.split(".")[0]
+                if top in DIRECT_IO - {"os", "pathlib"}:
+                    lint.add(
+                        brick / "__main__.py",
+                        f"__main__ imports direct-I/O module {top!r}; a door parses arguments, calls run and "
+                        "prints or writes what run returned; effects belong in an adapter",
+                        warning=True,
+                    )
                 continue
             names = [item.name for item in node.names]
             if not (isinstance(node, ast.ImportFrom) and module in own_run and names == ["run"]):
