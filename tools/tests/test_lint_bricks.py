@@ -402,6 +402,10 @@ class PureLaneTests(Fixture):
         self.assertError("pure brick may not have adapters")
         self.assertError("input/evidence.py: pure brick imports 'pathlib' outside runner/")
 
+    def test_pure_brick_copied_from_the_template_is_told_to_delete_evidence(self) -> None:
+        self.contract(self.brick(), LANE='"pure"')
+        self.assertError("a pure brick has no saved evidence, so delete input/evidence.py")
+
     def test_pure_brick_may_not_declare_sibling_dependencies(self) -> None:
         self.brick("other")
         self.contract(self.pure_brick(), SIBLING_DEPENDENCIES='{"other": "eventual"}')

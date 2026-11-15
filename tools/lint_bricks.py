@@ -554,7 +554,12 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
                     name = module.lstrip(".").split(".")[0]
                     # src/ already reports DIRECT_IO under the rule every brick gets.
                     if name in PURE_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
-                        lint.add(path, f"pure brick imports {name!r} outside runner/")
+                        hint = (
+                            "; a pure brick has no saved evidence, so delete input/evidence.py"
+                            if relative == ("input", "evidence.py")
+                            else ""
+                        )
+                        lint.add(path, f"pure brick imports {name!r} outside runner/{hint}")
             if isinstance(node, ast.Call) and called_name(node) in CLOCK_CALLS:
                 lint.add(path, f"pure brick reads the clock with {called_name(node)}()")
 
