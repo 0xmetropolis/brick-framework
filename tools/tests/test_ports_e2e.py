@@ -218,5 +218,94 @@ class PortsEndToEnd(unittest.TestCase):
         self.assertTrue(any("joint 'game' pins version 1, but 'game' is at version 2" in e for e in lint_bricks.lint_repo(self.root).errors))
 
 
+PLANNER_LOGIC = """
+from ..contract import BrickInput, BrickOutput
+
+
+def execute(inputs, run_context):
+    return {"steps": [day * 2 for day in range(inputs["days"])]}
+"""
+
+PLAN_ADAPTER = """
+from bricks.planner import run
+
+
+def plan(ctx, days):
+    return run({"days": days})
+"""
+
+SEALED_SCENARIO = """
+import json
+from bricks.flow import run
+from bricks.planner import run as plan
+
+out = {"flow": run({"days": 3}, fresh=True), "planner": plan({"days": 2})}
+try:
+    plan({"days": 1}, fresh={"anything"})
+except ValueError as exc:
+    out["error"] = str(exc)
+print(json.dumps(out))
+"""
+
+
+class SealedEndToEnd(unittest.TestCase):
+    """A sealed brick has no ports, no adapters and no tapes, and an open brick reaches it through a joint."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        shutil.copy(ROOT / "AGENTS.md", self.root / "AGENTS.md")
+        (self.root / "bricks").mkdir()
+        for name in ("AGENTS.md", "__init__.py"):
+            shutil.copy(ROOT / "bricks" / name, self.root / "bricks" / name)
+        template = ROOT / "bricks/example_brick"
+        for name in ("planner", "flow"):
+            shutil.copytree(template, self.root / "bricks" / name, ignore=shutil.ignore_patterns("__pycache__"))
+        planner, flow = self.root / "bricks/planner", self.root / "bricks/flow"
+        for relative in ("input/adapters", "input/tapes"):
+            shutil.rmtree(planner / relative)
+        (planner / "input/tape.py").unlink()
+        PortsEndToEnd.ports(planner, "{}")
+        (planner / "src/logic.py").write_text(PLANNER_LOGIC, encoding="utf-8")
+        (flow / "input/adapters/example_source.py").unlink()
+        shutil.rmtree(flow / "input/tapes")
+        (flow / "input/adapters/planner.py").write_text(PLAN_ADAPTER, encoding="utf-8")
+        PortsEndToEnd.ports(flow, '{"planner": {"kind": "joint", "policy": "eventual", "pin": 1}}')
+        (flow / "src/logic.py").write_text(
+            "from ..input.adapters import planner\n\n\ndef execute(inputs, run_context):\n    return planner.plan(run_context, inputs['days'])\n",
+            encoding="utf-8",
+        )
+
+    def go(self) -> dict:
+        done = subprocess.run(
+            [sys.executable, "-c", SEALED_SCENARIO], cwd=self.root, capture_output=True, text=True, check=False,
+            env={**os.environ, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_repository_lints_clean_and_the_shapes_are_what_they_should_be(self) -> None:
+        lint = lint_bricks.lint_repo(self.root)
+        self.assertEqual((lint.errors, lint.warnings), ([], []))
+        from tools import brick_contract
+
+        self.assertEqual(brick_contract.brick_shape(self.root / "bricks/planner"), "sealed")
+        self.assertEqual(brick_contract.brick_shape(self.root / "bricks/flow"), "open")
+
+    def test_the_flow_reaches_the_sealed_brick_and_a_sealed_brick_never_tracks_a_clean_run(self) -> None:
+        out = self.go()
+        self.assertEqual(out["flow"], {"steps": [0, 2, 4]})
+        self.assertEqual(out["planner"], {"steps": [0, 2]})
+        ledger = self.root / "bricks/planner/runner/ledger"
+        self.assertEqual(sorted(path.name.endswith(".local.json") for path in ledger.glob("*.json")), [True, True])
+        self.assertEqual(out["error"], "fresh= names 'anything', which is not a source port of this brick or one it follows (known: none)")
+
+    def test_a_sealed_brick_that_gains_a_clock_or_a_port_is_caught(self) -> None:
+        logic = self.root / "bricks/planner/src/logic.py"
+        logic.write_text(logic.read_text(encoding="utf-8") + "\nimport time\n", encoding="utf-8")
+        self.assertTrue(any("sealed brick imports 'time' outside runner/" in e for e in lint_bricks.lint_repo(self.root).errors))
+
+
 if __name__ == "__main__":
     unittest.main()
