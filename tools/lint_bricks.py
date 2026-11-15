@@ -12,6 +12,12 @@ import re
 import sys
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from brick_contract import assigned_literal  # type: ignore[no-redef]
+else:
+    from .brick_contract import assigned_literal
+
 
 REQUIRED = (
     "__init__.py",
@@ -27,6 +33,8 @@ REQUIRED = (
     "runner/runs",
     "src/AGENTS.md",
 )
+# Required paths a lane may leave out, because the lane forbids what they hold.
+LANE_OPTIONAL = {"pure": ("input/adapters",)}
 CONFIG_DEFAULTS = {
     "runs": 10,
     "saved_examples_per_adapter": 3,
@@ -37,6 +45,11 @@ DIRECT_IO = {
     "boto3", "ftplib", "httpx", "os", "pathlib", "psycopg", "requests",
     "shutil", "smtplib", "socket", "sqlite3", "subprocess", "urllib",
 }
+# Names a run context goes by in src/ and adapters.
+CONTEXT_NAMES = {"ctx", "context", "run_context"}
+# An environment variable that switches behavior is a mode the run does not record.
+ENV_SWITCH = re.compile(r"(?i)replay|fresh|save|mode|live|offline|record")
+IN_MEMORY = {"BytesIO", "StringIO"}
 SENSITIVE = {
     "access_token", "api_key", "authorization", "client_secret", "cookie", "cookies",
     "headers", "password", "refresh_token", "secret", "set-cookie", "token", "x-api-key",
@@ -49,6 +62,7 @@ class Contract:
     dependencies: dict[str, str] = field(default_factory=dict)
     owned_state: tuple[str, ...] = ()
     lane: str = "strict"
+    deterministic: bool | None = None
 
 
 class Lint:
@@ -89,6 +103,52 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     return ["." * node.level + (node.module or "")]
 
 
+def mode_override(node: ast.AST) -> bool:
+    """True for ``dict(ctx, mode=...)``: src building a context with another mode."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "dict"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in CONTEXT_NAMES
+        and any(keyword.arg == "mode" for keyword in node.keywords)
+    )
+
+
+def env_switch(node: ast.AST) -> str:
+    """The variable name when ``node`` reads a mode-like environment variable, else ''."""
+
+    def is_environ(value: ast.AST) -> bool:
+        return isinstance(value, ast.Attribute) and value.attr == "environ"
+
+    key = None
+    if isinstance(node, ast.Subscript) and is_environ(node.value):
+        key = node.slice
+    elif isinstance(node, ast.Call) and node.args:
+        if isinstance(node.func, ast.Attribute) and (
+            (node.func.attr == "get" and is_environ(node.func.value)) or node.func.attr == "getenv"
+        ):
+            key = node.args[0]
+    if isinstance(key, ast.Constant) and isinstance(key.value, str) and ENV_SWITCH.search(key.value):
+        return key.value
+    return ""
+
+
+def opens_a_file(node: ast.Call) -> bool:
+    """A call named ``open``, except ``x.open(BytesIO(...))``, which cannot reach a file."""
+    if called_name(node) != "open":
+        return False
+    in_memory = (
+        isinstance(node.func, ast.Attribute)
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Call)
+        and called_name(node.args[0]) in IN_MEMORY
+    )
+    return not in_memory
+
+
 def called_name(node: ast.Call) -> str:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -105,22 +165,20 @@ def annotation_name(node: ast.expr | None) -> str:
     return ""
 
 
-def assigned_literal(tree: ast.Module, name: str) -> Any:
-    for node in tree.body:
-        value = None
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == name for target in node.targets
-        ):
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.target.id == name:
-                value = node.value
-        if value is not None:
-            try:
-                return ast.literal_eval(value)
-            except (TypeError, ValueError):
-                return None
-    return None
+def mode_read(node: ast.AST) -> bool:
+    """True when ``node`` reads ``mode`` from a run context: ``ctx["mode"]`` or ``ctx.get("mode")``."""
+    if isinstance(node, ast.Subscript):
+        target, key = node.value, node.slice
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args:
+        target, key = node.func.value, node.args[0]
+    else:
+        return False
+    return (
+        isinstance(target, ast.Name)
+        and target.id in CONTEXT_NAMES
+        and isinstance(key, ast.Constant)
+        and key.value == "mode"
+    )
 
 
 def lint_contract(brick: Path, lint: Lint) -> Contract:
@@ -133,6 +191,7 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     dependencies = assigned_literal(tree, "SIBLING_DEPENDENCIES")
     owned_state = assigned_literal(tree, "OWNED_STATE")
     lane = assigned_literal(tree, "LANE")
+    deterministic = assigned_literal(tree, "DETERMINISTIC")
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
@@ -151,6 +210,9 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
     ):
         lint.add(path, "OWNED_STATE must contain non-empty resource identifiers")
         owned_state = ()
+    if deterministic is not None and not isinstance(deterministic, bool):
+        lint.add(path, "DETERMINISTIC must be True or False")
+        deterministic = None
     for class_name in ("BrickInput", "BrickOutput"):
         declaration = classes.get(class_name)
         if not declaration or not any(annotation_name(base) == "TypedDict" for base in declaration.bases):
@@ -161,7 +223,7 @@ def lint_contract(brick: Path, lint: Lint) -> Contract:
         lint.add(path, f"LANE must be one of {', '.join(sorted(LANES))}")
         lane = "strict"
 
-    return Contract(version, dict(dependencies), tuple(owned_state), lane)
+    return Contract(version, dict(dependencies), tuple(owned_state), lane, deterministic)
 
 
 def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -209,7 +271,11 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
         relative = path.relative_to(brick).parts
         role = relative[0] if len(relative) > 1 else "entry"
         adapter = relative[:2] == ("input", "adapters")
+        calls: set[str] = set()
+        imports_sibling = False
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                calls.add(called_name(node))
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 if isinstance(node, ast.ImportFrom):
                     package_depth = len(relative[:-1])
@@ -228,6 +294,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, f"src imports direct-I/O module {parts[0]!r}")
                     if len(parts) > 1 and parts[0] == "bricks" and parts[1] != brick.name:
                         actual_dependencies.add(parts[1])
+                        imports_sibling = True
                         if not adapter:
                             lint.add(path, "only an input adapter may import a sibling brick")
                         elif (
@@ -238,12 +305,51 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, "sibling adapter may import only run")
                         if parts[1] not in contract.dependencies:
                             lint.add(path, f"sibling dependency {parts[1]!r} is not declared")
-            if role == "src" and isinstance(node, ast.Call) and called_name(node) == "open":
-                lint.add(path, "src filesystem access must use an adapter")
+            if role == "src" and mode_read(node):
+                lint.add(
+                    path,
+                    "src reads the run mode; each adapter owns saved, fresh and save behavior, "
+                    "so label recorded data by what the adapter returned (input/AGENTS.md, Recorded data)",
+                    warning=True,
+                )
+            if role == "src" and mode_override(node):
+                lint.add(
+                    path,
+                    "src overrides the run mode; the mode belongs to the run and its adapters. To use a "
+                    "source live or recorded independently, make it its own sibling brick "
+                    "(input/AGENTS.md, Recorded data)",
+                    warning=True,
+                )
+            if adapter and env_switch(node):
+                lint.add(
+                    path,
+                    f"adapter switches behavior on environment variable {env_switch(node)!r}; that is a mode "
+                    "no run record shows. Put the source in its own sibling brick (it always replays), or "
+                    "pass the choice in the brick input",
+                    warning=True,
+                )
+            if role == "src" and isinstance(node, ast.Call) and opens_a_file(node):
+                lint.add(
+                    path,
+                    "src filesystem access must use an adapter (in memory is fine: "
+                    "x.open(io.BytesIO(data)) is allowed when the buffer is built in the call)",
+                )
             if adapter and isinstance(node, ast.Call) and called_name(node) == "run":
                 forwarded = {word.arg for word in node.keywords} & {"fresh", "save"}
                 if forwarded:
-                    lint.add(path, "sibling run may not receive fresh or save")
+                    lint.add(
+                        path,
+                        "sibling run may not receive fresh or save; a sibling always replays. To reach a "
+                        "source live from this brick, give this brick its own adapter for it "
+                        "(input/AGENTS.md, Sources several bricks share)",
+                    )
+        if adapter and not imports_sibling and "load_example" not in calls:
+            lint.add(
+                path,
+                "adapter never calls load_example, so it has no saved mode; a file or tool adapter "
+                "replays a recorded manifest (input/AGENTS.md, Recorded data)",
+                warning=True,
+            )
 
     for dependency in contract.dependencies.keys() - actual_dependencies:
         lint.add(brick / "contract.py", f"declared dependency {dependency!r} has no static adapter import", warning=True)
@@ -279,8 +385,17 @@ def lint_records(brick: Path, limits: dict[str, int], lint: Lint) -> None:
         adapter, filename = relative.parts
         case = Path(filename).stem
         counts[adapter] = counts.get(adapter, 0) + 1
-        if path.stat().st_size > limits["max_evidence_bytes"]:
-            lint.add(path, "evidence exceeds max_evidence_bytes")
+        size = path.stat().st_size
+        if size > limits["max_evidence_bytes"]:
+            lint.add(path, "evidence exceeds max_evidence_bytes; store a projection or split it into cases")
+        elif size * 5 > limits["max_evidence_bytes"] * 4:
+            lint.add(
+                path,
+                f"evidence is {size * 100 // limits['max_evidence_bytes']}% of max_evidence_bytes; "
+                "store a projection of the response or split a session into cases per window "
+                "before the next re-record fails",
+                warning=True,
+            )
         record = read_json(path, lint)
         if not isinstance(record, dict):
             continue
@@ -304,10 +419,16 @@ def lint_records(brick: Path, limits: dict[str, int], lint: Lint) -> None:
         check_secrets(path, record, lint)
     for adapter, count in counts.items():
         if count > limits["saved_examples_per_adapter"]:
-            lint.add(data / adapter, "too many saved examples")
+            lint.add(
+                data / adapter,
+                "too many saved examples; a case per window or per instance is fine, but raise "
+                "retention.saved_examples_per_adapter in config.yml deliberately and say why",
+            )
 
     runs = sorted((brick / "runner/runs").glob("*.json"))
-    if len(runs) > limits["runs"]:
+    # Test runs (BRICK_RUN_KIND=test) are local, untracked and bounded on their own.
+    tracked = [path for path in runs if not path.name.endswith(".test.json")]
+    if len(tracked) > limits["runs"]:
         lint.add(brick / "runner/runs", "too many retained run records")
     for path in runs:
         if path.stat().st_size > limits["max_run_record_bytes"]:
@@ -335,6 +456,13 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
             for node in ast.walk(tree)
         ):
             lint.add(path, "contains a skipped smoke test; it proves no integration", warning=True)
+        if "BRICK_RUN_KIND" not in path.read_text(encoding="utf-8"):
+            lint.add(
+                path,
+                "smoke test does not set BRICK_RUN_KIND=test, so its run records land in tracked history; "
+                "set it in setUp with os.environ and restore it in a cleanup",
+                warning=True,
+            )
         calls_run = any(
             isinstance(node, ast.Call) and called_name(node) == "run" for node in ast.walk(tree)
         )
@@ -356,6 +484,44 @@ def lint_strict(brick: Path, contract: Contract, lint: Lint) -> None:
 
 PURE_FORBIDDEN = DIRECT_IO | {"random", "time"}
 CLOCK_CALLS = {"now", "today", "utcnow"}
+# What a brick that declares DETERMINISTIC = True keeps out of src/.
+NONDETERMINISTIC_MODULES = {
+    "concurrent", "multiprocessing", "random", "secrets", "threading", "time", "uuid",
+}
+
+
+def lint_deterministic(brick: Path, contract: Contract, lint: Lint) -> None:
+    """``DETERMINISTIC = True`` is a promise ``src/`` can be held to; ``False`` says it is not made.
+
+    A brick that says nothing makes no promise and gets no check. A brick that
+    declares ``True`` may not reach for the clock, randomness, threads or
+    generated IDs in ``src/`` (adapters are where such things enter, as inputs).
+    The pure lane already holds its whole brick to this, so it may not say ``False``.
+    """
+    if contract.lane == "pure" and contract.deterministic is False:
+        lint.add(brick / "contract.py", "a pure brick is deterministic by definition; remove DETERMINISTIC = False")
+    if contract.deterministic is not True or contract.lane == "pure":
+        return
+    for path in sorted((brick / "src").rglob("*.py")):
+        tree = lint.tree(path)
+        if not tree:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for module in imported_modules(node):
+                    name = module.lstrip(".").split(".")[0]
+                    if name in NONDETERMINISTIC_MODULES:
+                        lint.add(
+                            path,
+                            f"DETERMINISTIC = True, but src imports {name!r}; take it as input through an "
+                            "adapter, or declare DETERMINISTIC = False and say why",
+                        )
+            if isinstance(node, ast.Call) and called_name(node) in CLOCK_CALLS:
+                lint.add(
+                    path,
+                    f"DETERMINISTIC = True, but src reads the clock with {called_name(node)}(); "
+                    "take the time as input, or declare DETERMINISTIC = False and say why",
+                )
 
 
 def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
@@ -388,7 +554,12 @@ def lint_pure(brick: Path, contract: Contract, lint: Lint) -> None:
                     name = module.lstrip(".").split(".")[0]
                     # src/ already reports DIRECT_IO under the rule every brick gets.
                     if name in PURE_FORBIDDEN and not (relative[0] == "src" and name in DIRECT_IO):
-                        lint.add(path, f"pure brick imports {name!r} outside runner/")
+                        hint = (
+                            "; a pure brick has no saved evidence, so delete input/evidence.py"
+                            if relative == ("input", "evidence.py")
+                            else ""
+                        )
+                        lint.add(path, f"pure brick imports {name!r} outside runner/{hint}")
             if isinstance(node, ast.Call) and called_name(node) in CLOCK_CALLS:
                 lint.add(path, f"pure brick reads the clock with {called_name(node)}()")
 
@@ -435,6 +606,9 @@ LANES = {
 
 def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     for relative in REQUIRED:
+        # A pure brick has no adapters, and Git cannot track the empty folder.
+        if relative in LANE_OPTIONAL.get(contract.lane, ()):
+            continue
         if not (brick / relative).exists():
             lint.add(brick / relative, "required brick path is missing")
     config_path = brick / "input/config.yml"
@@ -445,7 +619,51 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_smokes(brick, contract, lint)
     if contract.lane != "workflow" and (brick / "__main__.py").exists():
         lint.add(brick / "__main__.py", "only a workflow brick may have __main__.py")
+    lint_deterministic(brick, contract, lint)
     LANES[contract.lane](brick, contract, lint)
+
+
+COPY_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
+
+
+def lint_copies(bricks: list[Path], lint: Lint) -> None:
+    """Warn when copies of one boilerplate file have drifted apart.
+
+    Some files are copied into every brick on purpose (``input/evidence.py``,
+    the runner files). A copy carries ``# BOILERPLATE: <id>@<n>`` in its first
+    lines. Copies with the same id and version must be byte-identical; copies
+    with different versions say which brick is behind. A deliberate fork bumps
+    ``@n`` or takes a new id, and the warning then names it instead of hiding it.
+    """
+    copies: dict[str, list[tuple[Path, int, bytes]]] = {}
+    for brick in bricks:
+        for path in sorted(brick.rglob("*.py")):
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            for line in data.decode("utf-8", errors="replace").splitlines()[:5]:
+                match = COPY_MARKER.match(line.strip())
+                if match:
+                    copies.setdefault(match.group(1), []).append((path, int(match.group(2)), data))
+                    break
+    for name, found in sorted(copies.items()):
+        first_path, first_version, first_data = found[0]
+        for path, version, data in found[1:]:
+            if version != first_version:
+                lint.add(
+                    path,
+                    f"copy of {name!r} is at @{version} but {first_path.relative_to(lint.root)} is at "
+                    f"@{first_version}; bring the older copy up to date",
+                    warning=True,
+                )
+            elif data != first_data:
+                lint.add(
+                    path,
+                    f"copy of {name!r}@{version} differs from {first_path.relative_to(lint.root)}; "
+                    "sync the copies, or bump @n here to record a deliberate fork",
+                    warning=True,
+                )
 
 
 def lint_graph(
@@ -517,6 +735,7 @@ def lint_repo(root: Path) -> Lint:
         )
         contracts = {brick.name: lint_contract(brick, lint) for brick in brick_paths}
         lint_graph(brick_paths, contracts, lint)
+        lint_copies(brick_paths, lint)
         for brick in brick_paths:
             lint_brick(brick, contracts[brick.name], lint)
     else:

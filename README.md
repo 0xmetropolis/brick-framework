@@ -28,6 +28,7 @@ bricks/<brick_name>/
 ```python
 CONTRACT_VERSION = 1
 LANE = "strict"
+DETERMINISTIC = True
 SIBLING_DEPENDENCIES = {"another_brick": "eventual"}
 OWNED_STATE = ("database:example-records",)
 
@@ -48,7 +49,7 @@ A lane is the enforcement class a brick declares for itself with `LANE` in `cont
 | Lane | What it means | What the linter adds |
 | --- | --- | --- |
 | `strict` | The regular brick. | Nothing beyond the rules every brick gets. |
-| `pure` | Output is a function of input alone. | No adapters and no sibling dependencies. The direct-I/O ban that `src/` already carries widens to the whole brick, plus `random` and `time`, plus any `.now()`, `.today()`, or `.utcnow()` call. `runner/` is exempt because it records runs and owns `rng.py`; `datetime` stays importable for annotations and arithmetic. |
+| `pure` | Output is a function of input alone. | No adapters and no sibling dependencies, so it has no `input/adapters/` folder (Git cannot track an empty one; the linter does not require it for this lane). The direct-I/O ban that `src/` already carries widens to the whole brick, plus `random` and `time`, plus any `.now()`, `.today()`, or `.utcnow()` call. `runner/` is exempt because it records runs and owns `rng.py`; `datetime` stays importable for annotations and arithmetic. |
 | `workflow` | Invoked as a whole operation, never imported for its parts. | No contract may name it as a sibling dependency. It alone may carry a process door, `__main__.py`, and that door may import nothing from the brick tree except the brick's own `run`. Smoke tests belong only here. |
 
 A lane cannot exist without an enforcer: the `LANES` table in `tools/lint_bricks.py` maps each name to the function that checks it, and the linter rejects any other value.
@@ -93,4 +94,8 @@ Render the declared sibling-dependency graph as Mermaid with:
 python3 tools/graph_bricks.py
 ```
 
-Each node lists the state its brick owns. A solid arrow is an `orchestrated` dependency and a dashed arrow is an `eventual` one. Bricks that no sibling depends on are drawn with a thicker border; those are the top-level flows that may carry smoke tests.
+Each node lists the state its brick owns, and says `nondeterministic` when the brick declares `DETERMINISTIC = False`. A solid arrow is an `orchestrated` dependency and a dashed arrow is an `eventual` one. Bricks that no sibling depends on are drawn with a thicker border; those are the top-level flows that may carry smoke tests.
+
+`tools/brick_contract.py` reads a brick's `contract.py` without importing it; repo-local checks should use `contract_value(brick, "NAME")` rather than a regular expression on config. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
+
+The linter warns, and never fails, on experience problems: a mode-like environment variable in an adapter, an adapter with no saved mode, `src/` reading or overriding the run mode, evidence near its size limit, boilerplate copies that have drifted, and smoke tests that do not mark their records as tests.

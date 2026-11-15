@@ -116,10 +116,284 @@ class LaneTests(Fixture):
         self.assertError("LANE must be one of")
 
 
+class ModeReadTests(Fixture):
+    def test_src_reading_the_mode_warns_and_does_not_fail(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def decide(ctx):\n    return ctx['mode'] == 'saved' or ctx.get('mode')\n", encoding="utf-8"
+        )
+        warnings = [item for item in self.warnings() if "src/logic.py: src reads the run mode" in item]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(self.errors(), [])
+
+    def test_adapter_reading_the_mode_is_its_job(self) -> None:
+        self.brick()
+        self.assertClean()
+
+    def test_src_reading_a_mode_field_of_its_input_does_not_warn(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def decide(inputs, ctx):\n    return inputs['mode'], ctx['config'], ctx['run_id']\n",
+            encoding="utf-8",
+        )
+        self.assertClean()
+
+
+SIBLING_ADAPTER = (
+    "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request)\n"
+)
+ADAPTER_WITH_SAVED_MODE = (
+    "from ..evidence import load_example\n\n\n"
+    "def fetch(request, ctx):\n{body}    return load_example('feed', 'default', request)['response']\n"
+)
+
+
+class AdapterExperienceTests(Fixture):
+    def adapter(self, brick: Path, name: str, text: str) -> None:
+        (brick / "input/adapters" / f"{name}.py").write_text(text, encoding="utf-8")
+
+    def test_env_switch_in_an_adapter_warns(self) -> None:
+        brick = self.brick()
+        self.adapter(
+            brick, "feed",
+            ADAPTER_WITH_SAVED_MODE.format(body="    if os.environ.get('SYX_FEED_REPLAY'):\n        pass\n")
+            .replace("from ..evidence", "import os\nfrom ..evidence"),
+        )
+        self.assertTrue(any("environment variable 'SYX_FEED_REPLAY'" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_getenv_and_subscript_forms_warn(self) -> None:
+        brick = self.brick()
+        self.adapter(
+            brick, "feed",
+            "import os\nfrom ..evidence import load_example\n\n\ndef fetch(request, ctx):\n"
+            "    a = os.getenv('FEED_LIVE')\n    b = os.environ['FEED_OFFLINE']\n"
+            "    return load_example('feed', 'default', request)\n",
+        )
+        hits = [w for w in self.warnings() if "environment variable" in w]
+        self.assertEqual(len(hits), 2)
+
+    def test_credentials_and_paths_in_the_environment_are_fine(self) -> None:
+        brick = self.brick()
+        self.adapter(
+            brick, "feed",
+            "import os\nfrom ..evidence import load_example\n\n\ndef fetch(request, ctx):\n"
+            "    token = os.environ.get('FEED_TOKEN')\n    root = os.getenv('FEED_ROOT')\n"
+            "    return load_example('feed', 'default', request)\n",
+        )
+        self.assertTrue(all("environment variable" not in w for w in self.warnings()))
+
+    def test_adapter_with_no_saved_mode_warns(self) -> None:
+        brick = self.brick()
+        self.adapter(brick, "tool", "import subprocess\n\n\ndef encode(request, ctx):\n    return {}\n")
+        self.assertTrue(any("tool.py: adapter never calls load_example" in w for w in self.warnings()))
+
+    def test_sibling_adapter_needs_no_saved_mode_of_its_own(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.contract(brick, SIBLING_DEPENDENCIES='{"other": "eventual"}')
+        self.adapter(brick, "other", SIBLING_ADAPTER)
+        self.assertTrue(all("never calls load_example" not in w for w in self.warnings()))
+
+    def test_src_overriding_the_mode_warns(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def second(ctx):\n    return dict(ctx, mode='fresh')\n", encoding="utf-8"
+        )
+        self.assertTrue(any("src overrides the run mode" in w for w in self.warnings()))
+
+    def test_in_memory_open_is_allowed_in_src(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "import io\n\n\ndef decode(image, data):\n    return image.open(io.BytesIO(data))\n"
+            "\n\ndef text(image, data):\n    return image.open(StringIO(data))\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(all("src/logic.py" not in item for item in self.errors()))
+
+    def test_open_on_anything_else_is_still_a_file_access(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "def a(image, path):\n    return image.open(path)\n"
+            "\n\ndef b(path):\n    return open(path)\n"
+            "\n\ndef c(image, buf):\n    return image.open(buf)\n"
+            "\n\ndef d(data):\n    return open(BytesIO(data))\n",
+            encoding="utf-8",
+        )
+        hits = [item for item in self.errors() if "src filesystem access must use an adapter" in item]
+        self.assertEqual(len(hits), 4)
+
+    def test_forwarding_fresh_to_a_sibling_explains_what_to_do(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.contract(brick, SIBLING_DEPENDENCIES='{"other": "eventual"}')
+        self.adapter(
+            brick, "other",
+            "from bricks.other import run\n\n\ndef fetch(request, ctx):\n    return run(request, fresh=True)\n",
+        )
+        self.assertError("a sibling always replays")
+        self.assertError("Sources several bricks share")
+
+
+class EvidenceSizeTests(Fixture):
+    def evidence(self, brick: Path, case: str, padding: int) -> Path:
+        import json
+
+        record = {
+            "adapter": "feed", "capture_run_id": "r1", "case": case, "contract_version": 1,
+            "request": {}, "response": {"pad": "x" * padding}, "schema_version": 1,
+        }
+        folder = brick / "input/data/feed"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{case}.json"
+        path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
+    def test_evidence_near_the_limit_warns(self) -> None:
+        brick = self.brick()
+        self.evidence(brick, "big", 105_000)
+        self.assertTrue(any("big.json: evidence is 8" in w and "% of max_evidence_bytes" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_small_evidence_is_quiet(self) -> None:
+        brick = self.brick()
+        self.evidence(brick, "small", 1_000)
+        self.assertClean()
+
+    def test_evidence_over_the_limit_is_an_error_with_a_hint(self) -> None:
+        brick = self.brick()
+        self.evidence(brick, "huge", 130_000)
+        self.assertError("evidence exceeds max_evidence_bytes; store a projection or split it into cases")
+
+    def test_too_many_cases_says_it_is_a_deliberate_choice(self) -> None:
+        brick = self.brick()
+        for index in range(4):
+            self.evidence(brick, f"w{index}", 10)
+        self.assertError("raise retention.saved_examples_per_adapter in config.yml deliberately")
+
+
+class RunRecordTests(Fixture):
+    def test_test_records_do_not_count_toward_retention(self) -> None:
+        brick = self.brick()
+        runs = brick / "runner/runs"
+        for index in range(12):
+            (runs / f"20260101-0000{index:02d}.test.json").write_text("{}\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_tracked_records_still_have_a_limit(self) -> None:
+        brick = self.brick()
+        runs = brick / "runner/runs"
+        for index in range(12):
+            (runs / f"20260101-0000{index:02d}.json").write_text("{}\n", encoding="utf-8")
+        self.assertError("too many retained run records")
+
+    def test_the_template_runs_folder_ignores_test_records(self) -> None:
+        self.assertIn("*.test.json", (ROOT / "bricks/example_brick/runner/runs/.gitignore").read_text(encoding="utf-8"))
+
+
+class CopyDriftTests(Fixture):
+    def marked(self, brick: Path, name: str, version: int, body: str = "x = 1\n") -> Path:
+        path = brick / "input" / f"{name}.py"
+        path.write_text(f"# BOILERPLATE: {name}@{version}\n{body}", encoding="utf-8")
+        return path
+
+    def test_identical_copies_are_clean(self) -> None:
+        self.marked(self.brick("a"), "shared", 1)
+        self.marked(self.brick("b"), "shared", 1)
+        self.assertClean()
+
+    def test_same_version_with_different_content_warns(self) -> None:
+        self.marked(self.brick("a"), "shared", 1)
+        self.marked(self.brick("b"), "shared", 1, "x = 2\n")
+        self.assertTrue(any("copy of 'shared'@1 differs" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_different_versions_name_the_older_copy(self) -> None:
+        self.marked(self.brick("a"), "shared", 2)
+        self.marked(self.brick("b"), "shared", 1, "x = 2\n")
+        self.assertTrue(any("bricks/b/input/shared.py: copy of 'shared' is at @1" in w for w in self.warnings()))
+
+    def test_unmarked_files_are_not_compared(self) -> None:
+        (self.brick("a") / "input/loose.py").write_text("x = 1\n", encoding="utf-8")
+        (self.brick("b") / "input/loose.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertClean()
+
+
+class DeterminismTests(Fixture):
+    def test_template_declares_determinism(self) -> None:
+        self.assertIn("DETERMINISTIC = True", (ROOT / "bricks/example_brick/contract.py").read_text(encoding="utf-8"))
+
+    def test_determinism_must_be_a_bool(self) -> None:
+        self.contract(self.brick(), DETERMINISTIC='"yes"')
+        self.assertError("DETERMINISTIC must be True or False")
+
+    def test_deterministic_src_may_not_use_randomness_threads_or_ids(self) -> None:
+        brick = self.brick()
+        (brick / "src/helpers.py").write_text("import random\nimport uuid\nfrom threading import Thread\n", encoding="utf-8")
+        for name in ("random", "uuid", "threading"):
+            self.assertError(f"DETERMINISTIC = True, but src imports {name!r}")
+
+    def test_deterministic_src_may_not_read_the_clock(self) -> None:
+        brick = self.brick()
+        (brick / "src/logic.py").write_text(
+            "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n", encoding="utf-8"
+        )
+        self.assertError("DETERMINISTIC = True, but src reads the clock with now()")
+
+    def test_nondeterminism_can_be_declared(self) -> None:
+        brick = self.brick()
+        self.contract(brick, DETERMINISTIC="False")
+        (brick / "src/helpers.py").write_text("import random\nimport time\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_saying_nothing_makes_no_promise(self) -> None:
+        brick = self.brick()
+        path = brick / "contract.py"
+        text = path.read_text(encoding="utf-8").replace("DETERMINISTIC = True\n", "")
+        path.write_text(text, encoding="utf-8")
+        (brick / "src/helpers.py").write_text("import random\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_adapters_may_bring_in_the_clock(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/clock.py").write_text(
+            "import time\n\n\ndef now(ctx):\n    return ctx['io']\n", encoding="utf-8"
+        )
+        self.assertFalse([item for item in self.errors() if "DETERMINISTIC" in item])
+
+    def test_a_pure_brick_may_not_declare_nondeterminism(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, DETERMINISTIC="False")
+        self.assertError("a pure brick is deterministic by definition")
+
+
 class PureLaneTests(Fixture):
     def test_pure_brick_lints_clean(self) -> None:
         self.pure_brick()
         self.assertClean()
+
+    def test_pure_brick_needs_no_adapters_folder(self) -> None:
+        brick = self.pure_brick()
+        shutil.rmtree(brick / "input/adapters")
+        self.assertClean()
+
+    def test_strict_brick_still_needs_adapters_folder(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, LANE='"strict"')
+        shutil.rmtree(brick / "input/adapters")
+        self.assertError("input/adapters: required brick path is missing")
+
+    def test_workflow_brick_still_needs_adapters_folder(self) -> None:
+        brick = self.pure_brick()
+        self.contract(brick, LANE='"workflow"')
+        shutil.rmtree(brick / "input/adapters")
+        self.assertError("input/adapters: required brick path is missing")
+
+    def test_pure_brick_without_the_folder_still_may_not_gain_adapters(self) -> None:
+        brick = self.pure_brick()
+        self.assertTrue((brick / "input/adapters").is_dir())
+        (brick / "input/adapters/other.py").write_text("x = 1\n", encoding="utf-8")
+        self.assertError("pure brick may not have adapters")
 
     def test_template_is_not_pure(self) -> None:
         # The template ships one adapter and a filesystem evidence loader:
@@ -127,6 +401,10 @@ class PureLaneTests(Fixture):
         self.contract(self.brick(), LANE='"pure"')
         self.assertError("pure brick may not have adapters")
         self.assertError("input/evidence.py: pure brick imports 'pathlib' outside runner/")
+
+    def test_pure_brick_copied_from_the_template_is_told_to_delete_evidence(self) -> None:
+        self.contract(self.brick(), LANE='"pure"')
+        self.assertError("a pure brick has no saved evidence, so delete input/evidence.py")
 
     def test_pure_brick_may_not_declare_sibling_dependencies(self) -> None:
         self.brick("other")
@@ -172,8 +450,9 @@ class PureLaneTests(Fixture):
         )
         self.assertClean()
 
-    def test_strict_brick_may_read_the_clock_in_src(self) -> None:
+    def test_strict_brick_may_read_the_clock_in_src_when_it_says_so(self) -> None:
         brick = self.brick()
+        self.contract(brick, DETERMINISTIC="False")
         (brick / "src/logic.py").write_text(
             "from datetime import datetime\n\n\ndef stamp():\n    return datetime.now()\n",
             encoding="utf-8",
@@ -182,8 +461,12 @@ class PureLaneTests(Fixture):
 
 
 SMOKE = (
-    "import unittest\n\nfrom bricks.example_brick import run\n\n\n"
+    "import os\nimport unittest\nfrom unittest import mock\n\nfrom bricks.example_brick import run\n\n\n"
     "class SmokeTest(unittest.TestCase):\n"
+    "    def setUp(self) -> None:\n"
+    "        patcher = mock.patch.dict(os.environ, {'BRICK_RUN_KIND': 'test'})\n"
+    "        patcher.start()\n"
+    "        self.addCleanup(patcher.stop)\n\n"
     "    def test_run(self) -> None:\n"
     "        with self.assertRaises(NotImplementedError):\n"
     "            run({})\n"
@@ -240,6 +523,14 @@ class WorkflowLaneTests(Fixture):
     def test_smoke_tests_belong_to_workflows(self) -> None:
         self.smoke(self.workflow_brick())
         self.assertClean()
+
+    def test_smoke_test_that_forgets_the_test_kind_warns(self) -> None:
+        brick = self.workflow_brick()
+        self.smoke(brick)
+        text = (brick / "runner/tests/test_smoke.py").read_text(encoding="utf-8")
+        (brick / "runner/tests/test_smoke.py").write_text(text.replace("BRICK_RUN_KIND", "OTHER"), encoding="utf-8")
+        self.assertTrue(any("does not set BRICK_RUN_KIND=test" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
 
     def test_strict_brick_may_not_carry_smoke_tests(self) -> None:
         # Before lanes this was derived: a brick nothing depended on could carry

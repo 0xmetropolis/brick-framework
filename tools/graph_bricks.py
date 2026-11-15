@@ -9,38 +9,31 @@ from pathlib import Path
 import sys
 from typing import Any
 
-
-def assigned_literal(tree: ast.Module, name: str) -> Any:
-    """Return the literal assigned to a module-level name, or None."""
-    for node in tree.body:
-        value = None
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == name for target in node.targets
-        ):
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.target.id == name:
-                value = node.value
-        if value is not None:
-            try:
-                return ast.literal_eval(value)
-            except (TypeError, ValueError):
-                return None
-    return None
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from brick_contract import assigned_literal  # type: ignore[no-redef]
+else:
+    from .brick_contract import assigned_literal
 
 
-def read_contract(brick: Path) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Read one brick's declared sibling dependencies and owned state."""
+Contract = tuple[dict[str, str], tuple[str, ...], "bool | None"]
+
+
+def read_contract(brick: Path) -> Contract:
+    """Read one brick's declared sibling dependencies, owned state and determinism."""
     path = brick / "contract.py"
     if not path.is_file():
-        return {}, ()
+        return {}, (), None
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, SyntaxError):
-        return {}, ()
+        return {}, (), None
 
     dependencies = assigned_literal(tree, "SIBLING_DEPENDENCIES")
     owned_state = assigned_literal(tree, "OWNED_STATE")
+    deterministic = assigned_literal(tree, "DETERMINISTIC")
+    if not isinstance(deterministic, bool):
+        deterministic = None
     if not isinstance(dependencies, dict):
         dependencies = {}
     if not isinstance(owned_state, (tuple, list)):
@@ -52,6 +45,7 @@ def read_contract(brick: Path) -> tuple[dict[str, str], tuple[str, ...]]:
             if isinstance(name, str) and isinstance(mode, str)
         },
         tuple(item for item in owned_state if isinstance(item, str) and item),
+        deterministic,
     )
 
 
@@ -60,18 +54,20 @@ def escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', "&quot;")
 
 
-def node_label(name: str, owned_state: tuple[str, ...]) -> str:
-    """Build the node label, listing the state the brick owns."""
+def node_label(name: str, owned_state: tuple[str, ...], deterministic: "bool | None" = None) -> str:
+    """Build the node label, listing the state the brick owns and a declared nondeterminism."""
     lines = [escape(name), *(escape(resource) for resource in owned_state)]
+    if deterministic is False:
+        lines.append("nondeterministic")
     return "<br/>".join(lines)
 
 
-def render(contracts: dict[str, tuple[dict[str, str], tuple[str, ...]]]) -> str:
+def render(contracts: dict[str, Contract]) -> str:
     """Render the declared graph as a Mermaid flowchart."""
     names = sorted(contracts)
     depended_on = {
         dependency
-        for dependencies, _ in contracts.values()
+        for dependencies, _, _ in contracts.values()
         for dependency in dependencies
         if dependency in contracts
     }
@@ -81,8 +77,8 @@ def render(contracts: dict[str, tuple[dict[str, str], tuple[str, ...]]]) -> str:
         "flowchart TD",
     ]
     for name in names:
-        _, owned_state = contracts[name]
-        lines.append(f'    {name}["{node_label(name, owned_state)}"]')
+        _, owned_state, deterministic = contracts[name]
+        lines.append(f'    {name}["{node_label(name, owned_state, deterministic)}"]')
 
     edges = [
         f"    {name} {'-.->' if mode == 'eventual' else '-->'} {dependency}"

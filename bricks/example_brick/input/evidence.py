@@ -1,3 +1,4 @@
+# BOILERPLATE: evidence@1
 """Small, Git-stable saved-example storage for this brick.
 
 Copy this file with the brick boilerplate. It deliberately has no dependency
@@ -6,6 +7,7 @@ outside the Python standard library and no knowledge of the runner.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,14 +47,26 @@ def load_example(adapter: str, case: str, request: dict[str, Any]) -> dict[str, 
     """Load a saved example and require its request to match exactly."""
     path = _example_path(adapter, case)
     if not path.is_file():
-        raise EvidenceError(f"saved example does not exist: {path}")
+        known = sorted(item.stem for item in path.parent.glob("*.json")) if path.parent.is_dir() else []
+        raise EvidenceError(
+            f"saved example does not exist: {path} (cases saved for {adapter}: {', '.join(known) or 'none'}); "
+            "record it once with run(..., save=True)"
+        )
 
     record = json.loads(path.read_text(encoding="utf-8"))
     if record.get("contract_version") != CONTRACT_VERSION:
-        raise EvidenceError(f"saved example contract version does not match: {path}")
+        raise EvidenceError(
+            f"saved example contract version {record.get('contract_version')} does not match "
+            f"{CONTRACT_VERSION}: {path}; re-record it with run(..., save=True)"
+        )
     normalized_request = _redact(_normalize(request))
     if record.get("request") != normalized_request:
-        raise EvidenceError(f"saved request does not match case {adapter}/{case}")
+        differences = request_diff(record.get("request"), normalized_request)
+        raise EvidenceError(
+            f"saved request does not match case {adapter}/{case}, captured by run "
+            f"{record.get('capture_run_id')}: {'; '.join(differences)}. If a version or protocol field "
+            "changed, the example is stale: re-record it with run(..., save=True)"
+        )
     if ("response" in record) == ("error" in record):
         raise EvidenceError(f"saved example must contain response or error: {path}")
     return record
@@ -88,7 +102,9 @@ def save_example(
     payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if len(payload) > max_bytes:
         raise EvidenceError(
-            f"saved evidence is {len(payload)} bytes; limit is {max_bytes} bytes"
+            f"saved evidence is {len(payload)} bytes; limit is {max_bytes} bytes. Store a projection "
+            "of the response (the fields src uses), split a long session into cases per window, or "
+            "raise limits.max_evidence_bytes in config.yml and say why in the same change"
         )
 
     path = _example_path(adapter, case)
@@ -104,6 +120,38 @@ def save_example(
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
+
+
+def request_diff(saved: Any, requested: Any, limit: int = 5) -> list[str]:
+    """Where two normalized requests first differ, as ``path: saved X, requested Y`` lines."""
+    found: list[str] = []
+
+    def walk(left: Any, right: Any, path: str) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(left.keys() | right.keys()):
+                walk(left.get(key, _MISSING), right.get(key, _MISSING), f"{path}.{key}" if path else key)
+        elif isinstance(left, list) and isinstance(right, list) and len(left) == len(right):
+            for index, (a, b) in enumerate(zip(left, right)):
+                walk(a, b, f"{path}[{index}]")
+        elif left != right:
+            show = lambda value: "absent" if value is _MISSING else json.dumps(value)[:80]
+            found.append(f"{path or 'request'}: saved {show(left)}, requested {show(right)}")
+
+    walk(saved, requested, "")
+    return found or ["requests differ"]
+
+
+def digest(value: Any) -> str:
+    """A short stable digest of a JSON value, for requests that carry large state."""
+    canonical = json.dumps(_normalize(value), sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def provenance(record: dict[str, Any]) -> dict[str, Any]:
+    """What an adapter returns beside a saved response so src can say it was recorded."""
+    return {"recorded": True, "capture_run_id": record["capture_run_id"]}
 
 
 def _example_path(adapter: str, case: str) -> Path:

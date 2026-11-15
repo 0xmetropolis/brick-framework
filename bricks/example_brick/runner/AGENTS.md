@@ -4,7 +4,7 @@ This folder owns orchestration, brick-local run identity, run history, and smoke
 
 ## Brick entry point
 
-- `run.py` contains the brick's only repository-internal entry point: `run`.
+- `run.py` contains the brick's only repository-internal entry point: `run`. The template's `run.py` and `rng.py` are working code, copied with the brick like `input/evidence.py` and marked `# BOILERPLATE: runner.run@1`; only the imports of `execute` and the contract types are brick-specific, so copies stay identical.
 - Annotate `run` with the brick's `BrickInput` and `BrickOutput` types from `contract.py`.
 - `run` accepts ordinary inputs plus keyword-only `fresh` and `save` options. `save=True` implies a fresh call.
 - `run` creates a run ID through `rng.py`, resolves configuration, builds a plain run context, calls `src/`, records the run outcome, and returns the result.
@@ -15,19 +15,19 @@ This folder owns orchestration, brick-local run identity, run history, and smoke
 
 ## Run records
 
-- Record every run, including failures and tests, under `runs/` using its brick-local run ID.
+- Record every run, including failures and tests, under `runs/` using its brick-local run ID. With `BRICK_RUN_KIND=test` the record is `<run id>.test.json`: still recorded and bounded (its own retention), but gitignored by `runs/.gitignore`, so tests do not churn tracked history.
 - Each run-outcome record includes the run ID, kind (`run` or `test`), mode (`saved`, `fresh`, or `save`), input, output or error, and timestamp.
 - Input evidence captured by an explicit save operation carries the same run ID and can be joined outside the runner.
 - Retain only the configured number of recent runs. Prune after recording the new run.
 - Enforce `max_run_record_bytes` before writing a run record.
-- Run records are intentionally tracked in Git. The human or agent operating the repository commits the resulting bounded history changes.
+- Tracked run records are intentionally in Git (test records are not). A brick called very often by siblings, such as a pure brick, may set `retention.runs: 1` in `config.yml`; calling it once per tick is better avoided. The human or agent operating the repository commits the resulting bounded history changes.
 
 ## Tests
 
 - Smoke tests prove integration through the public brick boundary. Focused `src` tests prove domain correctness.
 - `runner/tests/` is optional and reserved for bricks that declare `LANE = "workflow"`: the flows invoked as a whole, which no other brick depends on.
 - Do not add smoke tests to every brick. A workflow may have at most three smoke-test files, each defining an explicit input and calling only the brick's top-level `run`.
-- Default tests use saved examples. A fresh test affects only its own brick; it never makes sibling runs fresh.
+- Smoke tests set `BRICK_RUN_KIND=test` in `setUp` (the linter warns when they do not). Default tests use saved examples. A fresh test affects only its own brick; it never makes sibling runs fresh.
 - Use a save test only when deliberately replacing reviewed committed examples.
 - Focused tests under `src/tests/` are optional and may directly test private domain logic. Organize them only when the logic warrants it.
 - If `runner/tests/` exists, keep its `__init__.py` so sibling bricks retain distinct test import paths during discovery.

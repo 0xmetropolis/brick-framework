@@ -11,6 +11,12 @@ CONTRACT_VERSION = 1
 # "strict".
 LANE = "strict"
 
+# True: src/ takes the clock, randomness and generated IDs as input and the
+# linter holds it to that (no random, time, threading, uuid, secrets, .now()).
+# False: nondeterminism is intended (a throughput or load flow); say why in a
+# comment. Omit it and the brick makes no promise and gets no check.
+DETERMINISTIC = True
+
 # Map sibling brick names to "eventual" or "orchestrated".
 SIBLING_DEPENDENCIES: dict[str, str] = {}
 

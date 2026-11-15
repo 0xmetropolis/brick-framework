@@ -21,7 +21,7 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 ## Boundaries
 
 - The brick's top-level `__init__.py` exposes only the repository-internal `run` entry point from `runner/run.py`.
-- `contract.py` declares `CONTRACT_VERSION`, typed `BrickInput` and `BrickOutput`, `SIBLING_DEPENDENCIES`, and `OWNED_STATE`. It may also declare `LANE`: `strict` (the default), `pure`, or `workflow`. A lane only adds rules; see the README.
+- `contract.py` declares `CONTRACT_VERSION`, typed `BrickInput` and `BrickOutput`, `SIBLING_DEPENDENCIES`, and `OWNED_STATE`. It may declare `DETERMINISTIC` (`True`: `src/` takes the clock, randomness and generated IDs as input and the linter holds it to that; `False`: nondeterminism on purpose; omitted: no promise, no check). It may also declare `LANE`: `strict` (the default), `pure`, or `workflow`. A lane only adds rules; see the README.
 - `contract.py` is not a second public surface. Sibling adapters import only `run`; its annotations carry the boundary types, and the adapter translates into its owning brick's types.
 - `SIBLING_DEPENDENCIES` maps each sibling name to `eventual` or `orchestrated`. `eventual` accepts independently committed state and possible lag. `orchestrated` means the importing, dependent brick is responsible for sequencing and compensation; it does not imply a distributed transaction.
 - The declared sibling graph must be acyclic. A cycle is a signal to merge responsibilities or introduce a parent brick.
@@ -38,5 +38,15 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 - Invocation mode and run identity never propagate across a brick boundary. A sibling adapter calls the sibling `run` with ordinary inputs and no `fresh` or `save` option; the sibling creates its own run ID and uses its default saved mode.
 - Do not import another brick's `src/`, `runner/`, configuration, or saved data.
 - Do not package bricks for, or expose them to, consumers outside this repository.
+
+A `pure` brick has no adapters, so it omits `input/adapters/`; every other lane requires the folder.
+
+## Adding a brick
+
+1. `cp -r bricks/example_brick bricks/<name>`; clear `runner/runs/*.json`; set `config.yml`'s `brick:`.
+2. Edit `contract.py`: `LANE`, `DETERMINISTIC`, dependencies, owned state, the two TypedDicts.
+3. Write `src/logic.py`'s `execute`. Add one adapter per source under `input/adapters/`, each with a saved mode (`load_example`).
+4. A `pure` brick also deletes `input/evidence.py`, `input/adapters/` and the example adapter; it has no sources.
+5. Run `python3 tools/lint_bricks.py`. Keep boilerplate copies (`# BOILERPLATE:` files) identical to the template unless you bump `@n` on purpose.
 
 Do not add `__init__.py` merely to mark folders. Keep the repository `bricks/` file for discovery, the brick-level file for the internal entry point, and `runner/__init__.py`. Add `runner/tests/__init__.py` only when a `workflow` brick has smoke tests. The other folders use namespace-package behavior.
