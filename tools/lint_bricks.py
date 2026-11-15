@@ -385,8 +385,17 @@ def lint_records(brick: Path, limits: dict[str, int], lint: Lint) -> None:
         adapter, filename = relative.parts
         case = Path(filename).stem
         counts[adapter] = counts.get(adapter, 0) + 1
-        if path.stat().st_size > limits["max_evidence_bytes"]:
-            lint.add(path, "evidence exceeds max_evidence_bytes")
+        size = path.stat().st_size
+        if size > limits["max_evidence_bytes"]:
+            lint.add(path, "evidence exceeds max_evidence_bytes; store a projection or split it into cases")
+        elif size * 5 > limits["max_evidence_bytes"] * 4:
+            lint.add(
+                path,
+                f"evidence is {size * 100 // limits['max_evidence_bytes']}% of max_evidence_bytes; "
+                "store a projection of the response or split a session into cases per window "
+                "before the next re-record fails",
+                warning=True,
+            )
         record = read_json(path, lint)
         if not isinstance(record, dict):
             continue
@@ -410,7 +419,11 @@ def lint_records(brick: Path, limits: dict[str, int], lint: Lint) -> None:
         check_secrets(path, record, lint)
     for adapter, count in counts.items():
         if count > limits["saved_examples_per_adapter"]:
-            lint.add(data / adapter, "too many saved examples")
+            lint.add(
+                data / adapter,
+                "too many saved examples; a case per window or per instance is fine, but raise "
+                "retention.saved_examples_per_adapter in config.yml deliberately and say why",
+            )
 
     runs = sorted((brick / "runner/runs").glob("*.json"))
     if len(runs) > limits["runs"]:

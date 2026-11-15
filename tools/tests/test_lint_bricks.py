@@ -235,6 +235,43 @@ class AdapterExperienceTests(Fixture):
         self.assertError("Sources several bricks share")
 
 
+class EvidenceSizeTests(Fixture):
+    def evidence(self, brick: Path, case: str, padding: int) -> Path:
+        import json
+
+        record = {
+            "adapter": "feed", "capture_run_id": "r1", "case": case, "contract_version": 1,
+            "request": {}, "response": {"pad": "x" * padding}, "schema_version": 1,
+        }
+        folder = brick / "input/data/feed"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{case}.json"
+        path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
+    def test_evidence_near_the_limit_warns(self) -> None:
+        brick = self.brick()
+        self.evidence(brick, "big", 105_000)
+        self.assertTrue(any("big.json: evidence is 8" in w and "% of max_evidence_bytes" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
+
+    def test_small_evidence_is_quiet(self) -> None:
+        brick = self.brick()
+        self.evidence(brick, "small", 1_000)
+        self.assertClean()
+
+    def test_evidence_over_the_limit_is_an_error_with_a_hint(self) -> None:
+        brick = self.brick()
+        self.evidence(brick, "huge", 130_000)
+        self.assertError("evidence exceeds max_evidence_bytes; store a projection or split it into cases")
+
+    def test_too_many_cases_says_it_is_a_deliberate_choice(self) -> None:
+        brick = self.brick()
+        for index in range(4):
+            self.evidence(brick, f"w{index}", 10)
+        self.assertError("raise retention.saved_examples_per_adapter in config.yml deliberately")
+
+
 class CopyDriftTests(Fixture):
     def marked(self, brick: Path, name: str, version: int, body: str = "x = 1\n") -> Path:
         path = brick / "input" / f"{name}.py"
