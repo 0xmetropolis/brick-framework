@@ -12,6 +12,12 @@ import re
 import sys
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from brick_contract import assigned_literal  # type: ignore[no-redef]
+else:
+    from .brick_contract import assigned_literal
+
 
 REQUIRED = (
     "__init__.py",
@@ -123,24 +129,6 @@ def mode_read(node: ast.AST) -> bool:
         and isinstance(key, ast.Constant)
         and key.value == "mode"
     )
-
-
-def assigned_literal(tree: ast.Module, name: str) -> Any:
-    for node in tree.body:
-        value = None
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == name for target in node.targets
-        ):
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.target.id == name:
-                value = node.value
-        if value is not None:
-            try:
-                return ast.literal_eval(value)
-            except (TypeError, ValueError):
-                return None
-    return None
 
 
 def lint_contract(brick: Path, lint: Lint) -> Contract:
