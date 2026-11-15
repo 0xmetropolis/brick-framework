@@ -426,7 +426,9 @@ def lint_records(brick: Path, limits: dict[str, int], lint: Lint) -> None:
             )
 
     runs = sorted((brick / "runner/runs").glob("*.json"))
-    if len(runs) > limits["runs"]:
+    # Test runs (BRICK_RUN_KIND=test) are local, untracked and bounded on their own.
+    tracked = [path for path in runs if not path.name.endswith(".test.json")]
+    if len(tracked) > limits["runs"]:
         lint.add(brick / "runner/runs", "too many retained run records")
     for path in runs:
         if path.stat().st_size > limits["max_run_record_bytes"]:
@@ -454,6 +456,13 @@ def lint_smokes(brick: Path, contract: Contract, lint: Lint) -> None:
             for node in ast.walk(tree)
         ):
             lint.add(path, "contains a skipped smoke test; it proves no integration", warning=True)
+        if "BRICK_RUN_KIND" not in path.read_text(encoding="utf-8"):
+            lint.add(
+                path,
+                "smoke test does not set BRICK_RUN_KIND=test, so its run records land in tracked history; "
+                "set it in setUp with os.environ and restore it in a cleanup",
+                warning=True,
+            )
         calls_run = any(
             isinstance(node, ast.Call) and called_name(node) == "run" for node in ast.walk(tree)
         )

@@ -272,6 +272,25 @@ class EvidenceSizeTests(Fixture):
         self.assertError("raise retention.saved_examples_per_adapter in config.yml deliberately")
 
 
+class RunRecordTests(Fixture):
+    def test_test_records_do_not_count_toward_retention(self) -> None:
+        brick = self.brick()
+        runs = brick / "runner/runs"
+        for index in range(12):
+            (runs / f"20260101-0000{index:02d}.test.json").write_text("{}\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_tracked_records_still_have_a_limit(self) -> None:
+        brick = self.brick()
+        runs = brick / "runner/runs"
+        for index in range(12):
+            (runs / f"20260101-0000{index:02d}.json").write_text("{}\n", encoding="utf-8")
+        self.assertError("too many retained run records")
+
+    def test_the_template_runs_folder_ignores_test_records(self) -> None:
+        self.assertIn("*.test.json", (ROOT / "bricks/example_brick/runner/runs/.gitignore").read_text(encoding="utf-8"))
+
+
 class CopyDriftTests(Fixture):
     def marked(self, brick: Path, name: str, version: int, body: str = "x = 1\n") -> Path:
         path = brick / "input" / f"{name}.py"
@@ -438,8 +457,12 @@ class PureLaneTests(Fixture):
 
 
 SMOKE = (
-    "import unittest\n\nfrom bricks.example_brick import run\n\n\n"
+    "import os\nimport unittest\nfrom unittest import mock\n\nfrom bricks.example_brick import run\n\n\n"
     "class SmokeTest(unittest.TestCase):\n"
+    "    def setUp(self) -> None:\n"
+    "        patcher = mock.patch.dict(os.environ, {'BRICK_RUN_KIND': 'test'})\n"
+    "        patcher.start()\n"
+    "        self.addCleanup(patcher.stop)\n\n"
     "    def test_run(self) -> None:\n"
     "        with self.assertRaises(NotImplementedError):\n"
     "            run({})\n"
@@ -496,6 +519,14 @@ class WorkflowLaneTests(Fixture):
     def test_smoke_tests_belong_to_workflows(self) -> None:
         self.smoke(self.workflow_brick())
         self.assertClean()
+
+    def test_smoke_test_that_forgets_the_test_kind_warns(self) -> None:
+        brick = self.workflow_brick()
+        self.smoke(brick)
+        text = (brick / "runner/tests/test_smoke.py").read_text(encoding="utf-8")
+        (brick / "runner/tests/test_smoke.py").write_text(text.replace("BRICK_RUN_KIND", "OTHER"), encoding="utf-8")
+        self.assertTrue(any("does not set BRICK_RUN_KIND=test" in w for w in self.warnings()))
+        self.assertEqual(self.errors(), [])
 
     def test_strict_brick_may_not_carry_smoke_tests(self) -> None:
         # Before lanes this was derived: a brick nothing depended on could carry
