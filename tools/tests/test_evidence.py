@@ -135,6 +135,26 @@ class ThroughTests(unittest.TestCase):
             evidence.through(ctx("saved"), "feed", "c", {}, boom)
         self.assertIn("saved adapter error: {'type': 'ValueError'}", str(caught.exception))
 
+    def test_record_errors_false_leaves_a_good_example_alone_on_failure(self) -> None:
+        evidence.through(ctx("save"), "feed", "c", {"q": 1}, lambda: {"a": 1})
+
+        def boom():
+            raise ValueError("transient")
+
+        with self.assertRaises(ValueError):
+            evidence.through(ctx("save"), "feed", "c", {"q": 1}, boom, record_errors=False)
+        again, _ = evidence.through(ctx("saved"), "feed", "c", {"q": 1}, dict)
+        self.assertEqual(again, {"a": 1})
+
+    def test_the_default_still_records_a_failure(self) -> None:
+        def boom():
+            raise ValueError("x")
+
+        with self.assertRaises(ValueError):
+            evidence.through(ctx("save"), "feed", "c2", {"q": 1}, boom)
+        with self.assertRaises(RuntimeError):
+            evidence.through(ctx("saved"), "feed", "c2", {"q": 1}, dict)
+
     def test_the_size_limit_comes_from_the_run_context(self) -> None:
         with self.assertRaises(evidence.EvidenceError):
             evidence.through(ctx("save", max_bytes=100), "feed", "c", {}, lambda: {"x": "y" * 500})

@@ -1,4 +1,4 @@
-# BOILERPLATE: evidence@4
+# BOILERPLATE: evidence@5
 """Small, Git-stable saved-example storage for this brick.
 
 Copy this file with the brick boilerplate. It deliberately has no dependency
@@ -226,13 +226,15 @@ def _max_bytes(run_context: dict[str, Any]) -> int:
 
 def through(
     run_context: dict[str, Any], adapter: str, case: str, request: dict[str, Any], live: Any,
-    *, fingerprint: dict[str, Any] | None = None,
+    *, fingerprint: dict[str, Any] | None = None, record_errors: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     """The saved / fresh / save contract for one adapter call: returns ``(response, provenance)``.
 
     saved  replay the example for ``case`` (request must match; a recorded error is raised)
     fresh  call ``live()``; nothing is written
     save   call ``live()`` and atomically replace the example, a failure included
+           (pass ``record_errors=False`` for a paid or hard-to-repeat call: a failure then
+           raises and leaves the saved example as it was)
     ``live`` takes no arguments and returns a JSON value. A ``fingerprint`` (a game version, a
     build, a protocol) is merged into the request, so an example recorded against another
     source version is stale and says which field changed.
@@ -247,7 +249,7 @@ def through(
     try:
         response = live()
     except Exception as exc:
-        if mode == "save":
+        if mode == "save" and record_errors:
             save_example(adapter, case, run_context["run_id"], request, error={"type": type(exc).__name__}, max_bytes=_max_bytes(run_context))
         raise
     if mode == "save":
