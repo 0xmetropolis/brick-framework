@@ -41,6 +41,10 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 
 A `BrickInput` field named `op`, `flow`, `action`, `operation` or `kind` is the split signal: one run is one operation, so each value becomes its own brick (a pure brick included). The linter warns on such a field, and on a `total=False` input with more than six fields.
 
+## The process door
+
+A workflow's `__main__.py` is a door, not a place for logic. It parses arguments, calls `run` once with `fresh` and `save` taken from flags, prints, and writes the files `run` returned. It makes no decisions about the result beyond the exit status (for example, `0` when `passed` is true), computes nothing, and imports no I/O module other than `os` and `pathlib` (the linter warns). A failure that is a missing or stale saved example should print its one-line message and exit with a status, not a traceback. An effect the door would need (an encoder, an upload) is an adapter of the workflow. To run a brick that has no door, use `python3 tools/run_brick.py`.
+
 A `pure` brick has no adapters, so it omits `input/adapters/`; every other lane requires the folder.
 
 ## Adding a brick
