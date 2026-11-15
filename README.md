@@ -99,3 +99,11 @@ Each node lists the state its brick owns, and says `nondeterministic` when the b
 `tools/brick_contract.py` reads a brick's `contract.py` without importing it; repo-local checks should use `contract_value(brick, "NAME")` rather than a regular expression on config. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
 
 The linter warns, and never fails, on experience problems: a mode-like environment variable in an adapter, an adapter with no saved mode, `src/` reading or overriding the run mode, evidence near its size limit, boilerplate copies that have drifted, and smoke tests that do not mark their records as tests.
+
+Run any brick, in any mode, from the command line (this is how to record or refresh a brick that has no process door, since only a workflow may carry `__main__.py`):
+
+```sh
+python3 tools/run_brick.py <brick> --input request.json [--fresh | --save] [--test]
+```
+
+The input is JSON from a file or stdin, `--save` implies fresh, `--test` writes a local test record, and a failure is one line with a nonzero status. The tool lives outside the bricks and calls only the brick's `run`.
