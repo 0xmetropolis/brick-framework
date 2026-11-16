@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import brick_contract, lint_bricks
 
@@ -841,10 +843,101 @@ class CopiesAreNotComparedTests(Fixture):
             (self.brick(name) / "src/helpers.py").write_text(f"# BOILERPLATE: shared@1\n{body}", encoding="utf-8")
         self.assertClean()
 
-    def test_a_template_file_edited_in_one_brick_does_not_make_another_warn(self) -> None:
+
+class BoilerplateVersionTests(Fixture):
+    """Each brick's template files are compared with the framework's version table, never with each other."""
+
+    def framework_at(self, **versions: int):
+        table = {name: (path, versions.get(name, version)) for name, (path, version) in lint_bricks.BOILERPLATE.items()}
+        return mock.patch.dict(lint_bricks.BOILERPLATE, table)
+
+    def mark(self, brick: Path, name: str, version: int) -> None:
+        path = brick / lint_bricks.BOILERPLATE[name][0]
+        text = path.read_text(encoding="utf-8")
+        path.write_text(re.sub(rf"(# BOILERPLATE: {re.escape(name)})@\d+", rf"\g<1>@{version}", text, count=1), encoding="utf-8")
+
+    def boilerplate_warnings(self) -> list[str]:
+        return [w for w in self.warnings() if "boilerplate" in w]
+
+    def test_the_table_matches_the_templates_markers_exactly(self) -> None:
+        found = {}
+        for path in sorted((ROOT / "bricks/example_brick").rglob("*.py")):
+            for line in path.read_text(encoding="utf-8").splitlines()[:5]:
+                match = lint_bricks.BOILERPLATE_MARKER.match(line.strip())
+                if match:
+                    found[match.group(1)] = (path.relative_to(ROOT / "bricks/example_brick").as_posix(), int(match.group(2)))
+        self.assertEqual(found, lint_bricks.BOILERPLATE)
+
+    def test_a_brick_at_the_frameworks_version_is_clean(self) -> None:
+        self.brick("a")
+        self.brick("b")
+        self.assertClean()
+
+    def test_editing_one_bricks_copy_does_not_make_another_brick_warn(self) -> None:
         first, second = self.brick("a"), self.brick("b")
-        (first / "input/tape.py").write_text((first / "input/tape.py").read_text(encoding="utf-8") + "\n# local change\n", encoding="utf-8")
-        self.assertEqual([w for w in self.warnings() if "tape" in w], [])
+        for brick in (first, second):
+            path = brick / "input/tape.py"
+            path.write_text(path.read_text(encoding="utf-8") + f"\n# local change in {brick.name}\n", encoding="utf-8")
+        (first / "runner/run.py").write_text((first / "runner/run.py").read_text(encoding="utf-8") + "\n# more\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_a_brick_upgraded_ahead_of_the_others_is_not_blamed_whichever_sorts_first(self) -> None:
+        for upgraded, stale in (("a", "b"), ("b", "a")):
+            with self.subTest(upgraded=upgraded):
+                shutil.rmtree(self.root / "bricks", ignore_errors=True)
+                (self.root / "bricks").mkdir()
+                shutil.copy(ROOT / "bricks/AGENTS.md", self.root / "bricks/AGENTS.md")
+                shutil.copy(ROOT / "bricks/__init__.py", self.root / "bricks/__init__.py")
+                self.mark(self.brick(upgraded), "tape", 2)
+                self.brick(stale)
+                with self.framework_at(tape=2):
+                    warnings = self.boilerplate_warnings()
+                self.assertEqual(
+                    warnings,
+                    [f"bricks/{stale}/input/tape.py: boilerplate 'tape' is at @1, behind the framework's @2; copy input/tape.py from bricks/example_brick"],
+                )
+
+    def test_copies_that_are_all_equally_stale_still_warn(self) -> None:
+        self.brick("a")
+        self.brick("b")
+        with self.framework_at(tape=2, **{"runner.run": 6}):
+            warnings = self.boilerplate_warnings()
+        self.assertEqual(len(warnings), 4)
+        self.assertTrue(all("behind the framework's" in w for w in warnings))
+        self.assertTrue(any("bricks/a/runner/run.py: boilerplate 'runner.run' is at @5, behind the framework's @6" in w for w in warnings))
+        self.assertEqual(self.errors(), [])
+
+    def test_a_copy_newer_than_the_framework_says_the_framework_is_the_older_one(self) -> None:
+        self.mark(self.brick("a"), "runner.rng", 9)
+        self.assertEqual(
+            self.boilerplate_warnings(),
+            ["bricks/a/runner/rng.py: boilerplate 'runner.rng' is at @9, newer than the @1 this framework knows; update the framework's tools"],
+        )
+
+    def test_only_the_framework_boilerplate_ids_at_their_own_paths_are_checked(self) -> None:
+        brick = self.brick("a")
+        (brick / "src/helpers.py").write_text("# BOILERPLATE: tape@0\nx = 1\n", encoding="utf-8")
+        (brick / "src/other.py").write_text("# BOILERPLATE: mine@0\nx = 1\n", encoding="utf-8")
+        rng = brick / "runner/rng.py"
+        rng.write_text(rng.read_text(encoding="utf-8").replace("runner.rng@1", "my.rng@0"), encoding="utf-8")
+        self.assertClean()
+
+    def test_a_file_without_a_marker_or_a_sealed_brick_without_the_file_is_not_the_frameworks_to_check(self) -> None:
+        brick = self.brick("a")
+        run = brick / "runner/run.py"
+        run.write_text("".join(run.read_text(encoding="utf-8").splitlines(keepends=True)[1:]), encoding="utf-8")
+        self.sealed_brick("b")
+        self.assertClean()
+
+    def test_a_marker_beyond_the_first_lines_is_not_read(self) -> None:
+        brick = self.brick("a")
+        rng = brick / "runner/rng.py"
+        rng.write_text("\n" * 6 + rng.read_text(encoding="utf-8"), encoding="utf-8")
+        with self.framework_at(**{"runner.rng": 3}):
+            self.assertEqual(self.boilerplate_warnings(), [])
+
+    def test_the_marker_is_for_the_framework_not_a_lint_between_bricks(self) -> None:
+        self.assertFalse(hasattr(lint_bricks, "lint_copies"))
 
 
 class DeterminismTests(Fixture):

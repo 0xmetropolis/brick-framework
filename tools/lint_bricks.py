@@ -67,6 +67,15 @@ CONTEXT_NAMES = {"ctx", "context", "run_context"}
 # An environment variable that switches behavior is a mode the run does not record.
 ENV_SWITCH = re.compile(r"(?i)replay|fresh|record|mode|live|offline")
 IN_MEMORY = {"BytesIO", "StringIO"}
+# The files every brick copies from the template, and the version of each the framework is at. A copy
+# carries ``# BOILERPLATE: <id>@<n>`` in its first lines; a test keeps this table in step with the
+# template's markers, so changing a template file means bumping its marker and this table together.
+BOILERPLATE = {
+    "tape": ("input/tape.py", 1),
+    "runner.run": ("runner/run.py", 5),
+    "runner.rng": ("runner/rng.py", 1),
+}
+BOILERPLATE_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
 PORT_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 SOURCE_FIELDS = {"kind", "epoch", "label", "followable"}
 JOINT_FIELDS = {"kind", "policy", "pin", "follow"}
@@ -826,6 +835,42 @@ def lint_entry(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(brick / "__main__.py", "__main__ may import only this brick's run")
 
 
+def lint_boilerplate(brick: Path, lint: Lint) -> None:
+    """Warn when one of the brick's framework boilerplate files is not at the framework's version.
+
+    Each file in ``BOILERPLATE`` carries ``# BOILERPLATE: <id>@<n>`` in its first lines. The one
+    thing compared is that ``n`` against the version the framework is at: never another brick's
+    copy, and not the file's content, so an edit at the same ``@n`` is the brick's own business.
+    A file with no marker, with another id, or that does not exist (a sealed brick has no
+    ``tape.py``) is not the framework's to check.
+    """
+    for name, (relative, current) in sorted(BOILERPLATE.items()):
+        path = brick / relative
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:5]
+        except OSError:
+            continue
+        for line in lines:
+            match = BOILERPLATE_MARKER.match(line.strip())
+            if match and match.group(1) == name:
+                version = int(match.group(2))
+                if version < current:
+                    lint.add(
+                        path,
+                        f"boilerplate {name!r} is at @{version}, behind the framework's @{current}; "
+                        f"copy {relative} from bricks/example_brick",
+                        warning=True,
+                    )
+                elif version > current:
+                    lint.add(
+                        path,
+                        f"boilerplate {name!r} is at @{version}, newer than the @{current} this framework knows; "
+                        "update the framework's tools",
+                        warning=True,
+                    )
+                break
+
+
 def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     required = list(REQUIRED)
     if contract.ports:
@@ -841,6 +886,7 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_python(brick, contract, lint)
     lint_records(brick, contract, limits, lint)
     lint_smokes(brick, contract, lint)
+    lint_boilerplate(brick, lint)
     lint_adapter_functions(brick, lint)
     lint_deterministic(brick, contract, lint)
     if contract.sealed:

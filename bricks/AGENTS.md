@@ -55,6 +55,6 @@ A sealed brick has no ports, so it has no `input/adapters/` and no `input/tapes/
 2. Edit `contract.py`: `DETERMINISTIC`, `PORTS`, owned state, the two TypedDicts.
 3. Write `src/logic.py`'s `execute`. Add one adapter per port under `input/adapters/`, named for the port; a source adapter plays its tape with `tape.once` or `tape.session`.
 4. A sealed brick has `PORTS = {}`, so it also deletes `input/tape.py`, `input/adapters/` and `input/tapes/`.
-5. Run `python3 tools/lint_bricks.py`.
+5. Run `python3 tools/lint_bricks.py`. A warning that a boilerplate file is behind the framework means copy the current file from `bricks/example_brick`; an edit you make to your own copy is yours.
 
 Do not add `__init__.py` merely to mark folders. Keep the repository `bricks/` file for discovery, the brick-level file for the internal entry point, and `runner/__init__.py`. Add `runner/tests/__init__.py` only when an entry brick has smoke tests. The other folders use namespace-package behavior.
