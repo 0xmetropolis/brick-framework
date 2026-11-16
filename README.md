@@ -203,7 +203,7 @@ Replaying the same project and input gives the same bytes: the report carries no
 
 `tools/brick_contract.py` reads a brick's `contract.py` without importing it and computes its shape; repo-local checks should use `contract_value(brick, "NAME")`, `brick_ports(brick)` and `brick_shape(brick)` rather than a regular expression. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
 
-The linter warns, and never fails, on experience problems: a mode-like environment variable in an adapter, an adapter that never plays a tape, `src/` reading or overriding the run plan, a session on a source with no label, takes near their size limit, boilerplate copies that have drifted, and smoke tests that do not mark their runs as tests.
+The linter warns, and never fails, on experience problems: a mode-like environment variable in an adapter, an adapter that never plays a tape, `src/` reading or overriding the run plan, a session on a source with no label, takes near their size limit, and smoke tests that do not mark their runs as tests.
 
 Run any brick, naming the ports to go fresh or record, from the command line (this is how to record or refresh a brick that has no `__main__.py`):
 
@@ -217,7 +217,7 @@ The input is JSON from a file or stdin. `--fresh` or `--record` alone means ever
 
 A project built on the previous version moves over in one cut, by hand. There is no compatibility mode: a brick in the old format fails the lint with a message that says what the new format is and points here, and old manifests, takes and run records are never read. Do the steps below for every brick, then lint and test; merge only when both are clean.
 
-Start from this framework's files: `tools/`, `review/`, the `AGENTS.md` files, and the `# BOILERPLATE:` files of `bricks/example_brick`. Then, for each brick:
+Start from this framework's files: `tools/`, `review/`, the `AGENTS.md` files, and the boilerplate files of `bricks/example_brick` (`input/tape.py`, `runner/run.py`, `runner/rng.py`). Then, for each brick:
 
 1. **Boilerplate.** Delete `input/evidence.py`. Copy `input/tape.py` (not for a brick that will have no ports), `runner/run.py` and `runner/rng.py` from `bricks/example_brick`. Rename the keys in `input/config.yml`: `retention.runs` to `retention.entries`, `saved_examples_per_adapter` to `takes_per_tape`, `max_evidence_bytes` to `max_take_bytes`, `max_run_record_bytes` to `max_entry_bytes`.
 2. **One adapter file per port.** Each outside source gets `input/adapters/<source>.py`, named for the port; each sibling the brick calls gets `input/adapters/<sibling>.py`, named for the sibling and importing only that sibling's `run`. Delete any adapter helper that is not a port (move it into the adapter that uses it).

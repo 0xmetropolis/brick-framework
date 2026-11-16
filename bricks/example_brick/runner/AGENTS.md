@@ -4,7 +4,7 @@ This folder owns orchestration, brick-local run identity, the run ledger, and sm
 
 ## Brick entry point
 
-- `run.py` contains the brick's only repository-internal entry point: `run`. The template's `run.py` and `rng.py` are working code, copied with the brick like `input/tape.py` and marked `# BOILERPLATE: runner.run@<n>`; only the imports of `execute` and the contract are brick-specific, so copies stay identical.
+- `run.py` contains the brick's only repository-internal entry point: `run`. The template's `run.py` and `rng.py` are working code, copied with the brick like `input/tape.py`; only the imports of `execute` and the contract are brick-specific, so copies stay identical.
 - Annotate `run` with the brick's `BrickInput` and `BrickOutput` types from `contract.py`.
 - `run` accepts ordinary inputs plus keyword-only `fresh` and `record` options. Each takes `False`, `True` (every source port of this brick), or port names (`"rates"`, `"assistant.xai"`, `"*"`); `record` implies fresh for the same names, and an unknown name is an error.
 - `run` creates a run ID through `rng.py`, resolves configuration, turns `fresh` and `record` into the run's plan, builds a plain run context, calls `src/`, closes whatever the run left open, writes the ledger entry, and returns the result.

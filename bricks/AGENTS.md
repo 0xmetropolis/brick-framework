@@ -25,6 +25,7 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 - `contract.py` is not a second public surface. Joint adapters import only `run`; its annotations carry the boundary types, and the adapter translates into its owning brick's types.
 - `PORTS` maps each port name to its declaration. A **source** port (`epoch`, optional `label`, optional `followable`) reaches an outside system. A **joint** port, named for the sibling (`policy`, `pin`, optional `follow`), reaches a sibling brick. `eventual` accepts independently committed state and possible lag. `orchestrated` means the importing, dependent brick is responsible for sequencing and compensation; it does not imply a distributed transaction. `pin` is the sibling's `CONTRACT_VERSION` this brick was written against.
 - For a sealed sibling the policy has nothing to say (it has no state), so declare `eventual`; `orchestrated` is for a sibling whose effects the importing brick must sequence or compensate.
+- Logic that several bricks need goes in a sealed brick, reached over a joint. Anything else inside a brick's own files is the author's business: the framework compares nothing between bricks.
 - The declared joint graph must be acyclic. A cycle is a signal to merge responsibilities or introduce a parent brick.
 - `OWNED_STATE` lists stable application-resource identifiers. No identifier may be owned by two bricks. A brick that reads or writes a resource another brick owns (a folder, a file a path in `config.yml` points at) does not do it behind the owner's back: it asks the owner through a joint `run`, or the resource has one owner and the others receive its content as input. A path in configuration that names another brick's owned folder is a missing joint. Local takes in `input/tapes/` and entries in `runner/ledger/` do not need to be listed.
 - `runner/` creates the run context, calls private `src/` logic, and writes the run's ledger entry.
@@ -54,6 +55,6 @@ A sealed brick has no ports, so it has no `input/adapters/` and no `input/tapes/
 2. Edit `contract.py`: `DETERMINISTIC`, `PORTS`, owned state, the two TypedDicts.
 3. Write `src/logic.py`'s `execute`. Add one adapter per port under `input/adapters/`, named for the port; a source adapter plays its tape with `tape.once` or `tape.session`.
 4. A sealed brick has `PORTS = {}`, so it also deletes `input/tape.py`, `input/adapters/` and `input/tapes/`.
-5. Run `python3 tools/lint_bricks.py`. Keep boilerplate copies (`# BOILERPLATE:` files) identical to the template unless you bump `@n` on purpose.
+5. Run `python3 tools/lint_bricks.py`.
 
 Do not add `__init__.py` merely to mark folders. Keep the repository `bricks/` file for discovery, the brick-level file for the internal entry point, and `runner/__init__.py`. Add `runner/tests/__init__.py` only when an entry brick has smoke tests. The other folders use namespace-package behavior.

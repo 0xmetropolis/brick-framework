@@ -849,49 +849,6 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
         lint_entry(brick, contract, lint)
 
 
-COPY_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
-
-
-def lint_copies(bricks: list[Path], lint: Lint) -> None:
-    """Warn when copies of one boilerplate file have drifted apart.
-
-    Some files are copied into every brick on purpose (``input/tape.py``,
-    the runner files). A copy carries ``# BOILERPLATE: <id>@<n>`` in its first
-    lines. Copies with the same id and version must be byte-identical; copies
-    with different versions say which brick is behind. A deliberate fork bumps
-    ``@n`` or takes a new id, and the warning then names it instead of hiding it.
-    """
-    copies: dict[str, list[tuple[Path, int, bytes]]] = {}
-    for brick in bricks:
-        for path in sorted(brick.rglob("*.py")):
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
-            for line in data.decode("utf-8", errors="replace").splitlines()[:5]:
-                match = COPY_MARKER.match(line.strip())
-                if match:
-                    copies.setdefault(match.group(1), []).append((path, int(match.group(2)), data))
-                    break
-    for name, found in sorted(copies.items()):
-        first_path, first_version, first_data = found[0]
-        for path, version, data in found[1:]:
-            if version != first_version:
-                lint.add(
-                    path,
-                    f"copy of {name!r} is at @{version} but {first_path.relative_to(lint.root)} is at "
-                    f"@{first_version}; bring the older copy up to date",
-                    warning=True,
-                )
-            elif data != first_data:
-                lint.add(
-                    path,
-                    f"copy of {name!r}@{version} differs from {first_path.relative_to(lint.root)}; "
-                    "sync the copies, or bump @n here to record a deliberate fork",
-                    warning=True,
-                )
-
-
 def tape_source(node: ast.Call) -> str:
     """The source port a tape call names with a literal, else ''."""
     position = SOURCE_ARGUMENT.get(called_name(node))
@@ -1123,7 +1080,6 @@ def lint_repo(root: Path) -> Lint:
         )
         contracts = {brick.name: lint_contract(brick, lint) for brick in brick_paths}
         lint_graph(brick_paths, contracts, lint)
-        lint_copies(brick_paths, lint)
         for brick in brick_paths:
             lint_brick(brick, contracts[brick.name], lint)
     else:
