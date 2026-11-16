@@ -5,9 +5,9 @@ You are reviewing one diff to a repository of domain bricks. `AGENTS.md` and
 diff touches follow in the payload. Read them before judging.
 
 `tools/lint_bricks.py` has already run. It decides everything an integer can
-decide: folder shape, import direction, the public `run` surface, declared
-joints, state ownership, take size, and the extra rules of the
-shape. **Do not re-check any of that.** Your criteria, listed in the shape section
+decide: folder shape, import direction (including `src/` importing repository
+code outside `bricks/`), the public `run` surface, declared joints, state
+ownership, take size, and the extra rules of the shape. **Do not re-check any of that.** Your criteria, listed in the shape section
 below, are exactly the questions a parser cannot answer.
 
 ## Your context, and its limit

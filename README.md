@@ -18,6 +18,7 @@ bricks/<brick_name>/
 - Declare every crossing of the brick boundary as a **port** in `contract.py`, and implement it with one file of the same name under `input/adapters/`.
 - `src/` reaches outside sources and sibling bricks only through its own `input/` adapters.
 - Expose only `run` to sibling bricks through the brick's top-level `__init__.py`.
+- A brick's code lives in the brick. `src/` may not import code from elsewhere in the repository outside `bricks/` (the linter errors); code that several bricks need is a sealed brick, reached over a joint. The check finds a top-level `.py` file or Python folder in the repository root; it cannot see an installed package, a module reached through `sys.path` or `PYTHONPATH`, a nested folder, or a file that shadows a standard-library name, and it leaves adapters alone.
 - Keep recorded answers under `input/tapes/<source>/<take>.json` and the run ledger under `runner/ledger/`.
 - Sibling calls are fully brick-contained: they create their own run IDs and replay unless a joint follows a source (below).
 - Declare every joint and its `eventual` or `orchestrated` consistency policy in `contract.py`. The declared graph must be acyclic.

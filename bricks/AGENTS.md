@@ -38,7 +38,7 @@ Keep `bricks/__init__.py` so the standard-library test runner can discover smoke
 - A sibling brick may be reached only through a joint adapter that calls the sibling's `run` entry point, in a file named for the sibling.
 - Every joint adapter must correspond to a declared joint, and every declared port has exactly one adapter file.
 - Run identity never propagates across a brick boundary, and neither does `fresh` or `record`, with one exception named following: a joint that is `orchestrated` may list in `follow` the sources the sibling marked `followable`, and its adapter takes the flags from `tape.follow(run_context, "<sibling>")`. Every other sibling call uses ordinary inputs, no `fresh` or `record`, and replays. See the README, Source ports.
-- Do not import another brick's `src/`, `runner/`, configuration, or tapes.
+- Do not import another brick's `src/`, `runner/`, configuration, or tapes, and do not import from `src/` code that lives elsewhere in the repository outside `bricks/`: that code is outside every boundary rule, is not in the graph, and is not copied with the brick (the linter errors; see `src/AGENTS.md` for what it can and cannot see).
 - Do not package bricks for, or expose them to, consumers outside this repository.
 
 A `BrickInput` field named `op`, `flow`, `action`, `operation` or `kind` is the split signal: one run is one operation, so each value becomes its own brick (a sealed brick included). The linter warns on such a field, and on a `total=False` input with more than six fields.

@@ -940,6 +940,106 @@ class BoilerplateVersionTests(Fixture):
         self.assertFalse(hasattr(lint_bricks, "lint_copies"))
 
 
+class RepoCodeOutsideBricksTests(Fixture):
+    """``src/`` may not import code from elsewhere in the repository: a brick's code lives in the brick."""
+
+    MESSAGE = "code in this repository outside bricks/; a brick's code lives in the brick, and code shared by several bricks is a sealed brick reached over a joint"
+
+    def repo_package(self, name: str = "helpers") -> None:
+        (self.root / name).mkdir()
+        (self.root / name / "__init__.py").write_text("", encoding="utf-8")
+        (self.root / name / "answer.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
+
+    def src(self, brick: Path, text: str, name: str = "helpers_user.py") -> None:
+        (brick / "src" / name).write_text(text, encoding="utf-8")
+
+    def test_every_import_form_of_a_repo_package_is_an_error_in_src(self) -> None:
+        self.repo_package()
+        brick = self.brick()
+        for index, line in enumerate((
+            "import helpers",
+            "import helpers.answer",
+            "from helpers import answer",
+            "from helpers.answer import parse",
+            "import helpers.answer as a",
+        )):
+            with self.subTest(line=line):
+                self.src(brick, line + "\n", f"user{index}.py")
+                self.assertError(f"user{index}.py: src imports 'helpers', {self.MESSAGE}")
+
+    def test_a_top_level_file_in_the_repo_is_caught_too(self) -> None:
+        (self.root / "shared.py").write_text("X = 1\n", encoding="utf-8")
+        self.src(self.brick(), "from shared import X\n")
+        self.assertError(f"src imports 'shared', {self.MESSAGE}")
+
+    def test_a_folder_of_python_files_without_an_init_is_caught(self) -> None:
+        (self.root / "lib/deep").mkdir(parents=True)
+        (self.root / "lib/deep/x.py").write_text("", encoding="utf-8")
+        self.src(self.brick(), "import lib\n")
+        self.assertError(f"src imports 'lib', {self.MESSAGE}")
+
+    def test_it_is_an_error_in_a_sealed_brick_too(self) -> None:
+        self.repo_package()
+        self.src(self.sealed_brick(), "from helpers.answer import parse\n")
+        self.assertError(f"src imports 'helpers', {self.MESSAGE}")
+
+    def test_a_helper_that_does_io_is_not_a_way_around_the_bans(self) -> None:
+        (self.root / "helpers").mkdir()
+        (self.root / "helpers/__init__.py").write_text("", encoding="utf-8")
+        (self.root / "helpers/shared.py").write_text("import os, socket\nfrom bricks.example_brick.src import logic\n", encoding="utf-8")
+        brick = self.sealed_brick()
+        (brick / "src/logic.py").write_text("from helpers.shared import peek\n\n\ndef execute(inputs, ctx):\n    return {}\n", encoding="utf-8")
+        self.assertError("src imports 'helpers'")
+
+    def test_the_brick_own_files_by_relative_import_are_fine_even_when_the_name_is_a_repo_folder(self) -> None:
+        self.repo_package()
+        brick = self.brick()
+        (brick / "src/helpers.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
+        self.src(brick, "from .helpers import parse\nfrom . import helpers\nfrom .. import contract\n")
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+
+    def test_the_standard_library_a_folder_without_python_and_an_installed_package_are_fine(self) -> None:
+        (self.root / "docs").mkdir()
+        (self.root / "docs/readme.md").write_text("notes\n", encoding="utf-8")
+        (self.root / "json").mkdir()
+        (self.root / "json/__init__.py").write_text("", encoding="utf-8")
+        brick = self.brick()
+        self.src(brick, "import json\nimport docs\nimport numpy\nfrom collections import OrderedDict\n")
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+
+    def test_bricks_itself_is_the_siblings_rule_not_this_one(self) -> None:
+        self.brick("other")
+        self.src(self.brick(), "import bricks.other.src.logic\n")
+        errors = self.errors()
+        self.assertTrue(any("only an input adapter may import a sibling brick" in e for e in errors))
+        self.assertEqual([e for e in errors if "outside bricks/" in e], [])
+
+    def test_adapters_are_left_as_they_were(self) -> None:
+        self.repo_package()
+        brick = self.brick()
+        (brick / "input/adapters/example_source.py").write_text(
+            "from helpers.answer import parse\nfrom ..tape import once\n\n\n"
+            "def fetch(request, ctx, *, take='default'):\n    return once(ctx, 'example_source', take, request, lambda: parse(request))[0]\n",
+            encoding="utf-8",
+        )
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+
+    def test_a_repo_module_is_found_from_the_root_being_linted_not_from_where_the_tool_lives(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import helpers\n")
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+        self.repo_package()
+        self.assertTrue([e for e in self.errors() if "outside bricks/" in e])
+
+    def test_repo_module_says_what_it_resolves_to(self) -> None:
+        self.repo_package()
+        (self.root / "shared.py").write_text("", encoding="utf-8")
+        self.assertEqual(lint_bricks.repo_module(self.root, "helpers"), self.root / "helpers")
+        self.assertEqual(lint_bricks.repo_module(self.root, "shared"), self.root / "shared.py")
+        for name in ("bricks", "json", "numpy", "nothing"):
+            self.assertIsNone(lint_bricks.repo_module(self.root, name), name)
+
+
 class DeterminismTests(Fixture):
     def test_template_declares_determinism(self) -> None:
         self.assertIn("DETERMINISTIC = True", (ROOT / "bricks/example_brick/contract.py").read_text(encoding="utf-8"))

@@ -149,6 +149,28 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     return ["." * node.level + (node.module or "")]
 
 
+def repo_module(root: Path, name: str) -> Path | None:
+    """The file or folder in the repository root that ``import <name>`` would find, or None.
+
+    A top-level ``<name>.py``, or a folder ``<name>/`` that is a package or holds Python files.
+    ``bricks`` and the standard library are not repository code here. What this cannot see: an
+    installed third-party package (allowed, as before), a module found through ``sys.path``,
+    ``PYTHONPATH`` or a ``.pth`` file, a folder nested below the root (``lib/shared/x.py``
+    imported as ``shared.x`` works only if ``lib`` is on the path), and a repository file that
+    shadows a standard-library name.
+    """
+    stdlib = stdlib_names()
+    if name == "bricks" or (stdlib is not None and name in stdlib):
+        return None
+    file = root / f"{name}.py"
+    if file.is_file():
+        return file
+    folder = root / name
+    if folder.is_dir() and ((folder / "__init__.py").is_file() or next(folder.rglob("*.py"), None) is not None):
+        return folder
+    return None
+
+
 def stdlib_names() -> frozenset[str] | None:
     """The standard library's top-level module names (Python 3.10+), or None where unknown."""
     return getattr(sys, "stdlib_module_names", None)
@@ -477,6 +499,12 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, f"src imports direct-I/O module {parts[0]!r}")
                         elif ".".join(parts[:2]) in DIRECT_IO_DOTTED:
                             lint.add(path, f"src imports direct-I/O module {'.'.join(parts[:2])!r}")
+                        if not module.startswith(".") and repo_module(lint.root, parts[0]):
+                            lint.add(
+                                path,
+                                f"src imports {parts[0]!r}, code in this repository outside bricks/; a brick's code lives "
+                                "in the brick, and code shared by several bricks is a sealed brick reached over a joint",
+                            )
                     elif role != "runner" and parts[0] == "importlib":
                         lint.add(path, "dynamic imports hide brick boundaries")
                     if len(parts) > 1 and parts[0] == "bricks" and parts[1] != brick.name:
