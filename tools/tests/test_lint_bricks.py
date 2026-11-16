@@ -991,7 +991,7 @@ class SiblingImportFormTests(Fixture):
 
     def test_a_brick_may_name_itself(self) -> None:
         brick = self.brick()
-        (brick / "src/me.py").write_text("from bricks import example_brick\nimport bricks.example_brick.contract\n", encoding="utf-8")
+        (brick / "src/me.py").write_text("from bricks import example_brick\nimport bricks.example_brick.contract as contract\n", encoding="utf-8")
         self.assertEqual([e for e in self.errors() if "me.py" in e], [])
 
     def test_a_declared_joint_imported_the_new_way_counts_as_imported(self) -> None:
@@ -999,6 +999,92 @@ class SiblingImportFormTests(Fixture):
         brick = self.brick()
         self.adapter(brick, "other", "from bricks import other\n\n\ndef fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
         self.assertFalse([w for w in self.warnings() if "has no static adapter import" in w])
+
+
+class BricksPackageBindingTests(Fixture):
+    """Binding the ``bricks`` package itself reaches every sibling by attribute, so it is refused."""
+
+    MESSAGE = "binds the bricks package itself, which reaches every sibling by attribute"
+
+    def test_every_form_that_binds_the_package_is_an_error_in_src(self) -> None:
+        brick = self.brick()
+        forms = {
+            "import bricks": "bare",
+            "import bricks as b": "alias",
+            "import os, bricks": "second",
+            "import bricks.example_brick.contract": "own",
+            "import bricks.example_brick": "ownpkg",
+        }
+        for line, name in forms.items():
+            with self.subTest(form=line):
+                (brick / "src" / f"bind_{name}.py").write_text(line + "\n", encoding="utf-8")
+                self.assertTrue(
+                    any(f"bind_{name}.py:" in e and self.MESSAGE in e for e in self.errors()), (line, self.errors())
+                )
+
+    def test_the_alias_does_not_hide_it_and_use_of_the_name_is_not_needed_to_flag_it(self) -> None:
+        brick = self.brick("chat")
+        self.brick("assistant")
+        (brick / "src/reach.py").write_text("import bricks as b\n\n\ndef go():\n    return b.assistant.run({})\n", encoding="utf-8")
+        errors = [e for e in self.errors() if "reach.py" in e]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("'bricks' binds the bricks package itself", errors[0])
+
+    def test_forms_that_bind_a_submodule_or_a_name_are_not_this_rule(self) -> None:
+        brick = self.brick()
+        (brick / "src/ok.py").write_text(
+            "import bricks.example_brick.contract as c\nimport bricks.example_brick as me\n"
+            "from bricks import example_brick\nfrom bricks.example_brick import contract\n",
+            encoding="utf-8",
+        )
+        self.assertEqual([e for e in self.errors() if "ok.py" in e], [])
+
+    def test_a_sibling_in_the_path_is_reported_by_the_sibling_rule_not_this_one(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        (brick / "src/sib.py").write_text("import bricks.other.src.logic\n", encoding="utf-8")
+        errors = [e for e in self.errors() if "sib.py" in e]
+        self.assertEqual(len([e for e in errors if "only an input adapter may import a sibling brick" in e]), 1)
+        self.assertFalse([e for e in errors if self.MESSAGE in e])
+
+    def test_it_is_an_error_in_an_adapter_the_runner_and_a_sealed_brick_too(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/example_source.py").write_text(
+            "import bricks\n" + (brick / "input/adapters/example_source.py").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (brick / "runner/helper.py").write_text("import bricks as b\n", encoding="utf-8")
+        (self.sealed_brick("calc") / "src/x.py").write_text("import bricks\n", encoding="utf-8")
+        errors = [e for e in self.errors() if self.MESSAGE in e]
+        self.assertEqual(sorted(e.split(":")[0] for e in errors), [
+            "bricks/calc/src/x.py", "bricks/example_brick/input/adapters/example_source.py", "bricks/example_brick/runner/helper.py",
+        ])
+
+    def test_smoke_tests_and_main_keep_their_own_narrower_rules(self) -> None:
+        brick = self.brick()
+        (brick / "__main__.py").write_text("import bricks\n", encoding="utf-8")
+        tests = brick / "runner/tests"
+        tests.mkdir()
+        (tests / "__init__.py").write_text("", encoding="utf-8")
+        (tests / "test_smoke.py").write_text("import bricks\n", encoding="utf-8")
+        errors = self.errors()
+        self.assertFalse([e for e in errors if self.MESSAGE in e], errors)
+        self.assertTrue(any("__main__.py: __main__ may import only this brick's run" in e for e in errors))
+        self.assertTrue(any("smoke test must use from bricks.<name> import run" in e for e in errors))
+
+    def test_dynamic_ways_to_name_a_sibling_by_string_are_already_banned_in_src(self) -> None:
+        brick = self.brick()
+        forms = {
+            "importlib": "import importlib\nimportlib.import_module('bricks.other')\n",
+            "fromimportlib": "from importlib import import_module\nimport_module('bricks.other')\n",
+            "dunder": "__import__('bricks.other')\n",
+            "builtins": "import builtins\nbuiltins.__import__('bricks.other')\n",
+            "eval": "eval('__import__(\"bricks.other\")')\n",
+            "modules": "import sys\nsys.modules['bricks.other']\n",
+        }
+        for name, text in forms.items():
+            with self.subTest(form=name):
+                (brick / "src" / f"dyn_{name}.py").write_text(text, encoding="utf-8")
+                self.assertTrue([e for e in self.errors() if f"dyn_{name}.py" in e])
 
 
 class RepoCodeOutsideBricksTests(Fixture):

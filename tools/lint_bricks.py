@@ -149,6 +149,26 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     return ["." * node.level + (node.module or "")]
 
 
+def binds_bricks_package(alias: ast.alias, own: str) -> bool:
+    """True when ``import <alias>`` leaves the ``bricks`` package itself bound to a name.
+
+    ``import bricks`` and ``import bricks as b`` do; so does ``import bricks.<own brick>`` without
+    ``as``, which binds ``bricks``. With ``as`` the name is the submodule, and a sibling named in
+    the path is the sibling rule's business, so neither is reported here. Following attribute access
+    on the bound name (``b.assistant``) would need alias and escape analysis that is never complete;
+    the binding has no use inside a brick, so it is the thing to refuse.
+    """
+    if alias.name == "bricks":
+        return True
+    parts = alias.name.split(".")
+    return parts[0] == "bricks" and len(parts) > 1 and alias.asname is None and parts[1] == own
+
+
+def has_own_import_rules(relative: tuple[str, ...]) -> bool:
+    """Files whose imports are checked by their own, narrower rules: smoke tests and ``__main__.py``."""
+    return relative[:2] == ("runner", "tests") or relative == ("__main__.py",)
+
+
 def import_targets(node: ast.Import | ast.ImportFrom) -> list[str]:
     """The modules an import statement reaches, with ``from bricks import x`` read as ``bricks.x``.
 
@@ -497,6 +517,15 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                     package_depth = len(relative[:-1])
                     if node.level > package_depth + 1:
                         lint.add(path, "relative import may not escape the brick")
+                if isinstance(node, ast.Import) and not has_own_import_rules(relative):
+                    for alias in node.names:
+                        if binds_bricks_package(alias, brick.name):
+                            lint.add(
+                                path,
+                                f"{alias.name!r} binds the bricks package itself, which reaches every sibling by attribute "
+                                "and cannot be followed statically; a brick's own files are imported relatively, and a "
+                                "sibling only through its joint adapter (from bricks.<sibling> import run)",
+                            )
                 for module in import_targets(node):
                     parts = module.lstrip(".").split(".")
                     if role == "runner" and "input" in parts:
