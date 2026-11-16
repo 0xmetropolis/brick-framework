@@ -149,6 +149,17 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     return ["." * node.level + (node.module or "")]
 
 
+def import_targets(node: ast.Import | ast.ImportFrom) -> list[str]:
+    """The modules an import statement reaches, with ``from bricks import x`` read as ``bricks.x``.
+
+    ``imported_modules`` gives ``bricks`` for that form, which names no sibling; the names it imports
+    are the bricks it reaches.
+    """
+    if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "bricks":
+        return [f"bricks.{alias.name}" for alias in node.names]
+    return imported_modules(node)
+
+
 def repo_module(root: Path, name: str) -> Path | None:
     """The file or folder in the repository root that ``import <name>`` would find, or None.
 
@@ -486,7 +497,7 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                     package_depth = len(relative[:-1])
                     if node.level > package_depth + 1:
                         lint.add(path, "relative import may not escape the brick")
-                for module in imported_modules(node):
+                for module in import_targets(node):
                     parts = module.lstrip(".").split(".")
                     if role == "runner" and "input" in parts:
                         lint.add(path, "runner may not import input")

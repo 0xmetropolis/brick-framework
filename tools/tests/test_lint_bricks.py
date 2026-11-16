@@ -940,6 +940,67 @@ class BoilerplateVersionTests(Fixture):
         self.assertFalse(hasattr(lint_bricks, "lint_copies"))
 
 
+class SiblingImportFormTests(Fixture):
+    """Every way of writing an import that reaches another brick is the same crossing."""
+
+    FORMS = {
+        "import bricks.other.src.logic": "import bricks.other.src.logic\n",
+        "from bricks.other import run": "from bricks.other import run\n",
+        "from bricks import other": "from bricks import other\n",
+        "from bricks.other.src import logic": "from bricks.other.src import logic\n",
+    }
+
+    def test_all_four_forms_are_errors_in_src(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        for index, (name, line) in enumerate(self.FORMS.items()):
+            with self.subTest(form=name):
+                (brick / "src" / f"form{index}.py").write_text(line, encoding="utf-8")
+                self.assertError(f"form{index}.py: only an input adapter may import a sibling brick")
+
+    def test_all_four_forms_are_caught_in_the_runner_and_the_main_too(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        for index, line in enumerate(self.FORMS.values()):
+            (brick / "runner" / f"form{index}.py").write_text(line, encoding="utf-8")
+        errors = [e for e in self.errors() if "only an input adapter may import a sibling brick" in e]
+        self.assertEqual(len(errors), 4, errors)
+
+    def test_in_an_adapter_only_the_run_form_is_allowed(self) -> None:
+        self.brick("other")
+        for index, (name, line) in enumerate(self.FORMS.items()):
+            with self.subTest(form=name):
+                brick = self.brick(f"b{index}")
+                self.adapter(brick, "other", line + "\n\ndef fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
+                errors = [e for e in self.errors() if f"bricks/b{index}/" in e and "sibling adapter may import only run" in e]
+                self.assertEqual(len(errors), 0 if name == "from bricks.other import run" else 1, errors)
+
+    def test_from_bricks_import_names_each_sibling_it_reaches(self) -> None:
+        self.brick("other")
+        self.brick("third")
+        brick = self.brick()
+        (brick / "src/many.py").write_text("from bricks import other as o, third\n", encoding="utf-8")
+        errors = [e for e in self.errors() if "many.py: only an input adapter may import a sibling brick" in e]
+        self.assertEqual(len(errors), 2, errors)
+
+    def test_from_bricks_import_of_a_joint_in_an_adapter_is_a_missing_declaration_not_a_free_pass(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "link", "from bricks import other\n\n\ndef fetch(request, ctx):\n    return request\n")
+        self.assertError("joint 'other' is not declared in PORTS")
+
+    def test_a_brick_may_name_itself(self) -> None:
+        brick = self.brick()
+        (brick / "src/me.py").write_text("from bricks import example_brick\nimport bricks.example_brick.contract\n", encoding="utf-8")
+        self.assertEqual([e for e in self.errors() if "me.py" in e], [])
+
+    def test_a_declared_joint_imported_the_new_way_counts_as_imported(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "other", "from bricks import other\n\n\ndef fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
+        self.assertFalse([w for w in self.warnings() if "has no static adapter import" in w])
+
+
 class RepoCodeOutsideBricksTests(Fixture):
     """``src/`` may not import code from elsewhere in the repository: a brick's code lives in the brick."""
 
