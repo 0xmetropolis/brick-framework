@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
-"""Follow one piece of sample data through a brick project and write the transcript. Standard library only.
+"""Show samples of the payloads a brick project passes around, grouped by brick. Standard library only.
 
     python3 tools/transcript_brick.py <brick> [--root PROJECT] [--input FILE|-] [--name NAME]
                                       [--fresh [PORT ...]] [--record [PORT ...]] [--out DIR]
 
-``<brick>`` is the brick the sample enters, usually an entry brick; ``--input`` is one JSON input
-record for it (a file, or stdin). The brick is run once through its own ``run``, with every source
-answering from its tape, and each place the value passes through is written down, in order:
+``<brick>`` is the brick a sample enters, usually an entry brick, and ``--input`` is one JSON input
+record for it (a file, or stdin). The brick is run once through its own ``run``, replaying every
+source from its tape; nothing goes to a live source unless you ask with ``--fresh`` or ``--record``
+(port names as for ``run_brick.py``). The report has one section per brick of the project, in name
+order, and each section shows what that brick handles:
 
-* the entry brick, with the sample input;
-* each joint crossing into a sibling brick, with what crossed, and the sibling's return;
-* each source port touched, with the request, the recorded response, and the take file used;
-* the entry brick's output.
+* **Run**: the brick's own ``run`` calls during this sample, each with its input and its output, and
+  who called it (the sample itself, or a sibling over a joint).
+* **Joints**: for each joint the brick declares, what crossed to the sibling and what came back.
+* **Ports**: for each source port the brick declares, requests and responses taken from the takes on
+  its tape, whichever run recorded them.
 
-Replay is the default. Nothing goes to a live source unless you ask with ``--fresh`` or
-``--record`` (port names as for ``run_brick.py``). The ledger entry of the run is local and
-gitignored (``BRICK_TEST=1``). Two files are written, with the same hops:
+Not every payload is shown: a section shows at most three samples of each kind, chosen by a fixed rule.
+Take the candidates (the calls, the crossings, or the takes), measure each one as the size in bytes
+of its canonical JSON (sorted keys, no spaces), and order them by that size, then by that text, then
+by their order. With one candidate it is shown as ``only``; with two, ``smallest`` and ``largest``;
+with three or more, ``smallest``, ``typical`` (the lower median) and ``largest``. A payload bigger
+than 1000 bytes is trimmed to its top-level keys, each with its type, its size and one short sample
+value; its full size is stated. Nothing else is cut.
 
-    <out>/<brick>-<name>.md     a Mermaid sequenceDiagram and a hop table
-    <out>/<brick>-<name>.json   the hops, for tests and tools
+Two files are written, with the same content:
 
-``--out`` defaults to ``<root>/reports/transcripts`` and ``--name`` to the input file's name, so
-the path is predictable. Replaying the same project and the same input gives the same bytes: the
-report carries no run ID, timestamp or path of this machine. Values are shown in full, with sorted
-keys, never truncated. The flow is followed in the order it runs, so a brick that calls a sibling
-from several threads is not reported in a fixed order.
+    <out>/<brick>-<name>.md     for reading
+    <out>/<brick>-<name>.json   for tests and tools
+
+``--out`` defaults to ``<root>/reports/transcripts`` and ``--name`` to the input file's name. The
+report carries no run ID, timestamp or path of this machine, and replaying the same project and input
+gives the same bytes. The run's ledger entry is local and gitignored (``BRICK_TEST=1``).
 """
 
 from __future__ import annotations
@@ -45,14 +52,16 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from brick_contract import brick_ports, brick_shape  # type: ignore[no-redef]
     from graph_bricks import label_text  # type: ignore[no-redef]
-    from mermaid import escape as mermaid_escape  # type: ignore[no-redef]
 else:
     from .brick_contract import brick_ports, brick_shape
     from .graph_bricks import label_text
-    from .mermaid import escape as mermaid_escape
 
-HOOKED = re.compile(r"bricks\.([a-z][a-z0-9_]*)\.(runner\.run|input\.tape)")
-INLINE_LIMIT = 60
+HOOKED = re.compile(r"bricks\.([a-z][a-z0-9_]*)\.runner\.run")
+# A payload bigger than this many bytes of canonical JSON is trimmed to its top-level keys.
+TRIM_BYTES = 1000
+# The most samples shown of one kind.
+SAMPLE_LABELS = {1: ("only",), 2: ("smallest", "largest"), 3: ("smallest", "typical", "largest")}
+STRING_SAMPLE = 40
 
 
 def plain(value: Any) -> Any:
@@ -66,120 +75,121 @@ def plain(value: Any) -> Any:
     return json.loads(json.dumps(value, default=encode))
 
 
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def size_of(value: Any) -> int:
+    """The size in bytes of a value's canonical JSON: the measure samples are chosen and trimmed by."""
+    return len(canonical(value).encode("utf-8"))
+
+
+def kind_of(value: Any) -> str:
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, bool):
+        return "boolean"
+    if value is None:
+        return "null"
+    return "number"
+
+
+def scalar_sample(value: Any) -> str:
+    """A scalar as it reads in a sample: numbers, booleans and null whole, a long string cut with its length."""
+    if isinstance(value, str) and len(value) > STRING_SAMPLE:
+        return json.dumps(value[:STRING_SAMPLE], ensure_ascii=False)[:-1] + f"…\" ({len(value)} chars)"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def sample_of(value: Any) -> str:
+    """One short sample value of ``value``: itself if a scalar, else its first element or entry."""
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        key = next(iter(sorted(value)))
+        inner = value[key]
+        return f"{json.dumps(key, ensure_ascii=False)}: " + (scalar_sample(inner) if not isinstance(inner, (dict, list)) else describe_short(inner))
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        inner = value[0]
+        return scalar_sample(inner) if not isinstance(inner, (dict, list)) else describe_short(inner)
+    return scalar_sample(value)
+
+
+def describe_short(value: Any) -> str:
+    """A nested container as its type and size, one level, with no sample of its own."""
+    count = len(value)
+    return f"{kind_of(value)} of {count} {'keys' if isinstance(value, dict) else 'items'}"
+
+
+def describe(value: Any) -> dict[str, Any]:
+    """One top-level value of a trimmed payload: its type, its size if it is a container, and one sample value."""
+    entry: dict[str, Any] = {"type": kind_of(value)}
+    if isinstance(value, (dict, list)):
+        entry["size"] = len(value)
+    entry["sample"] = sample_of(value)
+    return entry
+
+
+def present(value: Any) -> dict[str, Any]:
+    """A payload as shown: whole with its size when small, else trimmed to its top-level keys with the full size."""
+    value = plain(value)
+    size = size_of(value)
+    if size <= TRIM_BYTES:
+        return {"bytes": size, "value": value}
+    if isinstance(value, dict):
+        keys = {key: describe(inner) for key, inner in sorted(value.items())}
+    else:
+        keys = {"(the whole value)": describe(value)}
+    return {"bytes": size, "top_level_keys": keys}
+
+
+def choose(candidates: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """The samples shown from a list of candidates, each with its label; see the module docstring for the rule.
+
+    A candidate is a dict with a ``size`` and a ``text`` (its canonical JSON); ties on size are broken by text,
+    then by the order the candidates came in.
+    """
+    ordered = sorted(enumerate(candidates), key=lambda pair: (pair[1]["size"], pair[1]["text"], pair[0]))
+    items = [item for _, item in ordered]
+    if len(items) <= 3:
+        picked = items
+    else:
+        picked = [items[0], items[(len(items) - 1) // 2], items[-1]]
+    return list(zip(SAMPLE_LABELS[len(picked)], picked)) if picked else []
+
+
 class Tracer:
-    """Collects the hops of one run, in order, from hooks on each brick's runner and tape modules."""
+    """Collects the ``run`` calls of one sample, in order, from a hook on each brick's runner module."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.hops: list[dict[str, Any]] = []
+        self.calls: list[dict[str, Any]] = []
         self.stack: list[str] = []
-        self.suppress = 0
-        self._shapes: dict[str, str] = {}
-
-    def shape(self, brick: str) -> str:
-        if brick not in self._shapes:
-            self._shapes[brick] = brick_shape(self.root / "bricks" / brick)
-        return self._shapes[brick]
-
-    def named(self, brick: str) -> str:
-        return f"{brick} ({self.shape(brick)})"
-
-    def hop(self, kind: str, where: str, start: str, end: str, how: str, take: str | None, value: Any, request: Any = None) -> None:
-        hop: dict[str, Any] = {
-            "n": len(self.hops) + 1, "kind": kind, "where": where, "from": start, "to": end,
-            "how": how, "take": take, "value": plain(value),
-        }
-        if request is not None:
-            hop["request"] = plain(request)
-        self.hops.append(hop)
-
-    def enter(self, brick: str, inputs: Any) -> None:
-        if not self.stack:
-            self.hop("input", self.named(brick), brick, brick, "sample input", None, inputs)
-        else:
-            caller = self.stack[-1]
-            port = brick_ports(self.root / "bricks" / caller).get(brick, {})
-            how = f"joint from {caller}, {port.get('policy', '?')}, pin v{port.get('pin', '?')}"
-            if port.get("follow"):
-                how += ", follows " + ", ".join(str(item) for item in port["follow"])
-            self.hop("joint", f"{self.named(caller)} → {self.named(brick)}", caller, brick, how, None, inputs)
-        self.stack.append(brick)
-
-    def leave(self, brick: str, output: Any, *, raised: bool = False) -> None:
-        self.stack.pop()
-        if not self.stack:
-            self.hop("error" if raised else "output", self.named(brick), brick, brick, "raised" if raised else "output", None, output)
-        else:
-            caller = self.stack[-1]
-            self.hop("error" if raised else "return", f"{self.named(brick)} → {self.named(caller)}", brick, caller, "raised" if raised else "returned", None, output)
-
-    def source(self, brick: str, module: Any, source: str, take: str, request: Any, response: Any, how: str, detail: str = "") -> None:
-        port = module.PORTS.get(source, {})
-        text = f"source epoch {port.get('epoch', '?')}"
-        label = label_text(port.get("label"))
-        if label:
-            text += f" label {label}"
-        path = None
-        if how in ("replay", "record"):
-            path = (Path(module.TAPE_DIR) / source / f"{take}.json").resolve().relative_to(self.root).as_posix()
-        elif how == "fresh":
-            text += ", fresh (no take used)"
-        if how == "record":
-            text += ", recorded"
-        self.hop("source", f"{self.named(brick)} → {source}", brick, f"{brick}.{source}", text + detail, path, response, request)
 
     def patch_runner(self, brick: str, module: Any) -> None:
         tracer, real = self, module.execute
 
         def execute(inputs: Any, context: Any) -> Any:
-            tracer.enter(brick, inputs)
+            call = {"brick": brick, "from": tracer.stack[-1] if tracer.stack else None, "input": plain(inputs)}
+            tracer.calls.append(call)
+            tracer.stack.append(brick)
             try:
                 output = real(inputs, context)
             except BaseException as exc:
-                tracer.leave(brick, {"error": {"type": type(exc).__name__, "message": str(exc)}}, raised=True)
+                call["error"] = {"type": type(exc).__name__, "message": str(exc)}
                 raise
-            tracer.leave(brick, output)
+            finally:
+                tracer.stack.pop()
+            call["output"] = plain(output)
             return output
 
         module.execute = execute
-
-    def patch_tape(self, brick: str, module: Any) -> None:
-        tracer = self
-        real_once, real_load, real_take, real_call = module.once, module.load, module.Session.take, module.Session.call
-
-        def once(context: Any, source: str, take: str, request: Any, fetch: Any, **options: Any) -> Any:
-            tracer.suppress += 1
-            try:
-                result = real_once(context, source, take, request, fetch, **options)
-            except BaseException as exc:
-                tracer.suppress -= 1
-                tracer.source(brick, module, source, take, request, {"error": {"type": type(exc).__name__, "message": str(exc)}}, module.mode(context, source), ", raised")
-                raise
-            tracer.suppress -= 1
-            tracer.source(brick, module, source, take, request, result[0], module.mode(context, source))
-            return result
-
-        def load(source: str, take: str, request: Any) -> Any:
-            record = real_load(source, take, request)
-            if not tracer.suppress:
-                tracer.source(brick, module, source, take, request, record.get("response", record.get("error")), "replay")
-            return record
-
-        def session_take(self: Any, window: str, request: Any) -> Any:
-            tracer.suppress += 1
-            try:
-                return real_take(self, window, request)
-            finally:
-                tracer.suppress -= 1
-
-        def session_call(self: Any, kind: str, request: Any, fetch: Any) -> Any:
-            response = real_call(self, kind, request, fetch)
-            take = f"{self.name}-{self.window}"
-            tracer.source(brick, module, self.source, take, request, response, self.mode, f", session {self.name}, window {self.window}, {kind}")
-            return response
-
-        module.once, module.load = once, load
-        module.Session.take, module.Session.call = session_take, session_call
 
 
 class _Loader(importlib.abc.Loader):
@@ -212,8 +222,7 @@ class _Finder(importlib.abc.MetaPathFinder):
             self.busy.discard(fullname)
         if spec is None or spec.loader is None:
             return None
-        patch = self.tracer.patch_runner if match.group(2) == "runner.run" else self.tracer.patch_tape
-        spec.loader = _Loader(spec.loader, lambda module, brick=match.group(1), patch=patch: patch(brick, module))
+        spec.loader = _Loader(spec.loader, lambda module, brick=match.group(1): self.tracer.patch_runner(brick, module))
         return spec
 
 
@@ -236,98 +245,175 @@ def trace(root: Path, brick: str, inputs: Any, fresh: Any = False, record: Any =
     return tracer, error
 
 
-def html(text: str) -> str:
-    """Text safe inside a table cell: HTML-escaped, with the pipe that would end the cell, and no raw newline."""
-    return (
-        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;").replace("\n", "&#10;")
-    )
+def call_candidate(call: dict[str, Any]) -> dict[str, Any]:
+    outcome = {"error": call["error"]} if "error" in call else {"output": call.get("output")}
+    payload = {"input": call["input"], **outcome}
+    return {"size": size_of(payload), "text": canonical(payload), "call": call}
 
 
-def value_cell(value: Any) -> str:
-    """The full value: inline if short, else pretty-printed in a <details> block. Keys are sorted; nothing is cut."""
-    compact = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(", ", ": "))
-    if len(compact) <= INLINE_LIMIT:
-        return f"<code>{html(compact)}</code>"
-    pretty = json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2)
-    return f"<details><summary>{pretty.count(chr(10)) + 1} lines</summary><pre>{html(pretty)}</pre></details>"
+def read_takes(root: Path, brick: str, source: str) -> tuple[list[dict[str, Any]], int]:
+    """The takes on a source's tape as candidates, and how many files were not readable takes."""
+    folder = root / "bricks" / brick / "input" / "tapes" / source
+    candidates: list[dict[str, Any]] = []
+    skipped = 0
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else ():
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            skipped += 1
+            continue
+        if not isinstance(record, dict) or "request" not in record or ("response" in record) == ("error" in record):
+            skipped += 1
+            continue
+        payload = {"request": record["request"], **({"response": record["response"]} if "response" in record else {"error": record["error"]})}
+        candidates.append({"size": size_of(payload), "text": canonical(payload) + path.name, "take": path.relative_to(root).as_posix(), "payload": payload})
+    return candidates, skipped
 
 
-def sequence(hops: list[dict[str, Any]], shapes: dict[str, str]) -> str:
-    """The Mermaid sequenceDiagram: a participant per brick (first-touched order) and per source port, one arrow per hop."""
-    bricks: list[str] = []
-    ports: list[str] = []
-    for hop in hops:
-        for element in (hop["from"], hop["to"]):
-            target = ports if "." in element else bricks
-            if element not in target:
-                target.append(element)
-    ids = {name: f"p{index}" for index, name in enumerate(bricks, start=1)}
-    ids.update({name: f"s{index}" for index, name in enumerate(ports, start=1)})
-    lines = ["sequenceDiagram"]
-    for name in bricks:
-        lines.append("    participant %s as %s" % (ids[name], mermaid_escape(f"{name} ({shapes[name]})")))
-    for name in ports:
-        lines.append("    participant %s as %s" % (ids[name], mermaid_escape(name + " (source)")))
-    for hop in hops:
-        start, end, n, how = ids[hop["from"]], ids[hop["to"]], hop["n"], hop["how"]
-        if hop["kind"] in ("input", "output"):
-            lines.append("    Note over %s: %s" % (start, mermaid_escape(f"{n} {how}")))
-        elif hop["kind"] == "joint":
-            text = how.replace(f"joint from {hop['from']}, ", f"joint {hop['to']}: ", 1)
-            lines.append("    %s->>%s: %s" % (start, end, mermaid_escape(f"{n} {text}")))
-        elif hop["kind"] == "source":
-            port = hop["to"].split(".", 1)[1]
-            detail = how.removeprefix("source ")
-            take = hop["take"] or "none"
-            lines.append("    %s->>%s: %s" % (start, end, mermaid_escape(f"{n} {port}: {detail}, take {take}")))
+def selected(candidates: list[dict[str, Any]], shape: Any) -> list[dict[str, Any]]:
+    """The labelled samples of a list of candidates, each as ``shape(item)`` plus its label and its size."""
+    return [{"label": label, "bytes": item["size"], **shape(item)} for label, item in choose(candidates)]
+
+
+def build(root: Path, entry: str, tracer: Tracer, error: str | None, name: str, plan: dict[str, list[str]]) -> dict[str, Any]:
+    """The report as plain data: one entry per brick of the project, in name order."""
+    names = sorted(path.name for path in (root / "bricks").iterdir() if path.is_dir() and not path.name.startswith((".", "__")))
+    bricks = []
+    for brick in names:
+        folder = root / "bricks" / brick
+        ports = brick_ports(folder)
+        own = [call_candidate(call) for call in tracer.calls if call["brick"] == brick]
+
+        def run_sample(item: dict[str, Any]) -> dict[str, Any]:
+            call = item["call"]
+            sample: dict[str, Any] = {"from": call["from"] or "sample input", "input": present(call["input"])}
+            sample["error" if "error" in call else "output"] = present(call["error"] if "error" in call else call.get("output"))
+            return sample
+
+        joints = []
+        for joint, port in sorted(ports.items()):
+            if port.get("kind") != "joint":
+                continue
+            crossings = [call_candidate(call) for call in tracer.calls if call["brick"] == joint and call["from"] == brick]
+            joints.append({
+                "name": joint, "policy": port.get("policy"), "pin": port.get("pin"), "follow": list(port.get("follow") or ()),
+                "crossings": len(crossings), "samples": selected(crossings, run_sample),
+            })
+        sources = []
+        for source, port in sorted(ports.items()):
+            if port.get("kind") != "source":
+                continue
+            takes, skipped = read_takes(root, brick, source)
+
+            def take_sample(item: dict[str, Any]) -> dict[str, Any]:
+                payload = item["payload"]
+                sample: dict[str, Any] = {"take": item["take"], "request": present(payload["request"])}
+                sample["error" if "error" in payload else "response"] = present(payload["error"] if "error" in payload else payload["response"])
+                return sample
+
+            sources.append({
+                "name": source, "epoch": port.get("epoch"), "label": port.get("label") or {}, "followable": bool(port.get("followable")),
+                "takes": len(takes), "unreadable": skipped, "samples": selected(takes, take_sample),
+            })
+        bricks.append({
+            "name": brick, "shape": brick_shape(folder),
+            "run": {"calls": len(own), "samples": selected(own, run_sample)},
+            "joints": joints, "ports": sources,
+        })
+    document: dict[str, Any] = {"brick": entry, "name": name, "mode": plan, "trim_bytes": TRIM_BYTES, "bricks": bricks}
+    if error:
+        document["error"] = error
+    return document
+
+
+def show(payload: dict[str, Any]) -> list[str]:
+    """A payload as Markdown lines: pretty JSON when whole, else one line per top-level key."""
+    if "value" in payload:
+        return ["```json", *json.dumps(payload["value"], sort_keys=True, ensure_ascii=False, indent=2).splitlines(), "```"]
+    keys = payload["top_level_keys"]
+    width = max(len(key) for key in keys)
+    lines = [f"trimmed to its top-level keys (full size {payload['bytes']:,} bytes)", "", "```text"]
+    for key, entry in keys.items():
+        shape = entry["type"] + (f" of {entry['size']:,} {'keys' if entry['type'] == 'object' else 'items'}" if "size" in entry else "")
+        lines.append(f"{key.ljust(width)}  {shape}, e.g. {entry['sample']}")
+    lines.append("```")
+    return lines
+
+
+def labelled(title: str, payload: dict[str, Any]) -> list[str]:
+    """A titled payload: its name and size, then the payload."""
+    return [f"**{title}** ({payload['bytes']:,} bytes)", "", *show(payload), ""]
+
+
+def markdown(document: dict[str, Any]) -> str:
+    plan = document["mode"]
+    if not plan["fresh"] and not plan["record"]:
+        mode = "replay (every source answered from its tape; nothing went to a live source)"
+    else:
+        mode = "; ".join(f"{label}: {', '.join(plan[label])}" for label in ("fresh", "record") if plan[label]) + " (everything else replayed)"
+    shapes = {brick["name"]: brick["shape"] for brick in document["bricks"]}
+    lines = [
+        f"# Payload samples: `{document['brick']}` / `{document['name']}`",
+        "",
+        f"- Sample enters: `{document['brick']}` ({shapes.get(document['brick'], 'open')})",
+        f"- Mode: {mode}",
+        f"- Bricks: {len(document['bricks'])}",
+        "- Samples: at most three of each kind, `smallest`, `typical` (lower median) and `largest` by the size of their canonical JSON; "
+        f"a payload over {document['trim_bytes']:,} bytes is trimmed to its top-level keys.",
+    ]
+    if "error" in document:
+        lines.append(f"- The run failed: `{document['error']}`")
+    lines.append("")
+    for brick in document["bricks"]:
+        lines += [f"## {brick['name']} ({brick['shape']})", "", "### Run", ""]
+        run = brick["run"]
+        if not run["calls"]:
+            lines += ["Not called by this sample.", ""]
         else:
-            lines.append("    %s-->>%s: %s" % (start, end, mermaid_escape(f"{n} {how}")))
-    return "\n".join(lines)
+            lines += [f"{run['calls']} call{'s' if run['calls'] != 1 else ''} during this sample; {len(run['samples'])} shown.", ""]
+            for sample in run["samples"]:
+                lines += [f"#### {sample['label']}: from {sample['from']}", ""]
+                lines += labelled("input", sample["input"])
+                lines += labelled("error" if "error" in sample else "output", sample.get("error") or sample["output"])
+        lines += ["### Joints", ""]
+        if not brick["joints"]:
+            lines += ["None declared.", ""]
+        for joint in brick["joints"]:
+            follows = f", follows {', '.join(joint['follow'])}" if joint["follow"] else ""
+            lines += [f"#### to `{joint['name']}` ({joint['policy']}, pin v{joint['pin']}{follows})", ""]
+            if not joint["crossings"]:
+                lines += ["Not crossed by this sample.", ""]
+                continue
+            lines += [f"{joint['crossings']} crossing{'s' if joint['crossings'] != 1 else ''}; {len(joint['samples'])} shown.", ""]
+            for sample in joint["samples"]:
+                lines += [f"##### {sample['label']}", ""]
+                lines += labelled("crossed", sample["input"])
+                lines += labelled("came back" if "output" in sample else "failed", sample.get("output") or sample["error"])
+        lines += ["### Ports", ""]
+        if not brick["ports"]:
+            lines += ["None declared.", ""]
+        for port in brick["ports"]:
+            label = label_text(port["label"])
+            details = f"epoch {port['epoch']}" + (f", label {label}" if label else "") + (", followable" if port["followable"] else "")
+            lines += [f"#### source `{port['name']}` ({details})", ""]
+            note = f"{port['takes']} take{'s' if port['takes'] != 1 else ''} on the tape; {len(port['samples'])} shown."
+            if port["unreadable"]:
+                note += f" {port['unreadable']} file{'s' if port['unreadable'] != 1 else ''} in the folder {'are' if port['unreadable'] != 1 else 'is'} not a readable take."
+            lines += [note, ""]
+            for sample in port["samples"]:
+                lines += [f"##### {sample['label']}: `{sample['take']}`", ""]
+                lines += labelled("request", sample["request"])
+                lines += labelled("error" if "error" in sample else "response", sample.get("error") or sample["response"])
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def markdown(brick: str, name: str, mode: str, hops: list[dict[str, Any]], shapes: dict[str, str]) -> str:
-    rows = []
-    for hop in hops:
-        value = value_cell(hop["value"])
-        if "request" in hop:
-            value = f"request: {value_cell(hop['request'])}<br>response: {value}"
-        take = f"<code>{html(hop['take'])}</code>" if hop["take"] else "none"
-        rows.append(f"| {hop['n']} | {html(hop['where'])} | {html(hop['how'])} | {take} | {value} |")
-    return "\n".join(
-        [
-            f"# Transcript report: `{brick}` / `{name}`",
-            "",
-            f"- Entry brick: `{brick}` ({shapes[brick]})",
-            f"- Mode: {mode}",
-            f"- Hops: {len(hops)}",
-            "",
-            "## Sequence",
-            "",
-            "```mermaid",
-            sequence(hops, shapes),
-            "```",
-            "",
-            "## Hops",
-            "",
-            "| # | where | how it got here | tape take | value |",
-            "|---|---|---|---|---|",
-            *rows,
-            "",
-        ]
-    )
-
-
-def mode_text(fresh: Any, record: Any) -> tuple[str, dict[str, list[str]]]:
+def mode_plan(fresh: Any, record: Any) -> dict[str, list[str]]:
     def names(option: Any) -> list[str]:
         if option is False or option is None:
             return []
         return ["(every source of the entry brick)"] if option is True else sorted(set(option))
 
-    plan = {"fresh": names(fresh), "record": names(record)}
-    if not plan["fresh"] and not plan["record"]:
-        return "replay (every source answered from its tape; nothing went to a live source)", plan
-    parts = [f"{label}: {', '.join(plan[label])}" for label in ("fresh", "record") if plan[label]]
-    return "; ".join(parts) + " (everything else replayed)", plan
+    return {"fresh": names(fresh), "record": names(record)}
 
 
 def ports(option: list[str] | None) -> Any:
@@ -361,19 +447,17 @@ def main(argv: list[str] | None = None) -> int:
 
     fresh, record = ports(args.fresh), ports(args.record)
     tracer, error = trace(root, args.brick, inputs, fresh, record)
-    shapes = {brick: tracer.shape(brick) for brick in {args.brick, *(h["from"].split(".")[0] for h in tracer.hops), *(h["to"].split(".")[0] for h in tracer.hops)}}
-    mode, plan = mode_text(fresh, record)
+    document = build(root, args.brick, tracer, error, name, mode_plan(fresh, record))
 
     out = (args.out or root / "reports" / "transcripts").resolve()
     out.mkdir(parents=True, exist_ok=True)
-    document = {"brick": args.brick, "name": name, "mode": plan, "shapes": dict(sorted(shapes.items())), "hops": tracer.hops}
     (out / f"{args.brick}-{name}.json").write_bytes((json.dumps(document, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-    (out / f"{args.brick}-{name}.md").write_bytes(markdown(args.brick, name, mode, tracer.hops, shapes).encode("utf-8"))
+    (out / f"{args.brick}-{name}.md").write_bytes(markdown(document).encode("utf-8"))
     try:
         shown = out.relative_to(root).as_posix()
     except ValueError:
         shown = out.as_posix()
-    print(f"wrote {shown}/{args.brick}-{name}.md and .json ({len(tracer.hops)} hops)")
+    print(f"wrote {shown}/{args.brick}-{name}.md and .json ({len(document['bricks'])} bricks)")
     if error:
         print(f"error: the run failed: {error}", file=sys.stderr)
         return 1

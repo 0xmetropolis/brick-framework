@@ -181,27 +181,31 @@ It prints Mermaid (which GitHub renders in a Markdown file) by default, or Graph
 
 Names and labels are escaped for Mermaid, and ids are prefixed and cleaned, so a brick called `end` or `a-b.c` cannot break the diagram.
 
-### The transcript report
+### The payload report
 
-Follow one piece of sample data through a project, hop by hop:
+See what a project's bricks actually handle, by brick:
 
 ```sh
 python3 tools/transcript_brick.py <brick> --root <project> --input sample.json [--name NAME] [--out DIR]
                                   [--fresh [PORT ...]] [--record [PORT ...]]
 ```
 
-`<brick>` is the brick the sample enters (usually an entry brick) and `sample.json` is one input record for it (or `-` for stdin). The tool runs that brick once through its own `run`, with every source answering from its tape, and writes down each place the value passes through, in order: the entry brick with the sample, each joint crossing into a sibling (what crossed, then what the sibling returned), each source port touched (the request, the recorded response and the take file used), and the entry brick's output. It works on any brick project and needs no change to the bricks.
+`<brick>` is the brick a sample enters (usually an entry brick) and `sample.json` is one input record for it (or `-` for stdin). The tool runs that brick once through its own `run`, replaying every source from its tape (nothing reaches a live source unless you pass `--fresh` or `--record` with port names, as for `run_brick.py`; the run's ledger entry is local and gitignored), and writes a report with **one section per brick of the project**, in name order, headed by its computed shape. It is about the payloads, not the flow: each section has three parts.
 
-Replay is the default, so nothing reaches a live source unless you pass `--fresh` or `--record` with port names (as for `run_brick.py`). The run's ledger entry is local and gitignored (`BRICK_TEST=1`). Two files are written, with the same hops:
+- **Run**: the brick's own `run` calls during this sample, each with its **input** and **output** (or the error), and who called it: the sample itself, or a sibling over a joint. A brick the sample did not reach says so.
+- **Joints**: for each joint the brick declares, with its policy, pin and follow, what **crossed** to the sibling and what **came back**. These are the same payloads as the sibling's run calls, shown where the traffic is.
+- **Ports**: for each source port the brick declares, with its epoch, label and followable, the **request** and **response** (or error) of takes on its tape. These come from the takes on disk, whichever run recorded them, so a port's section shows what it has been recorded with even when this sample never touched it.
+
+Not every payload is shown. Each kind shows **at most three samples**, chosen by one fixed rule so the report is deterministic. The candidates are the calls, the crossings, or the takes; each is measured as the size in bytes of its canonical JSON (sorted keys, no spaces), and they are ordered by that size, then by that text, then by the order they came in. One candidate is shown as `only`; two as `smallest` and `largest`; three or more as `smallest`, `typical` (the lower median) and `largest`. Each section says how many candidates there were and how many are shown.
+
+A payload bigger than **1000 bytes** is **trimmed to its top-level keys**, each with its type, its size if it is a list or object, and one short sample value (the first element or entry; a long string is cut at 40 characters with its length); the full size in bytes is stated. A game state of 900 KB becomes a dozen lines. Nothing else is cut: smaller payloads are shown whole as pretty JSON with sorted keys.
 
 ```text
-<out>/<brick>-<name>.md     a Mermaid sequenceDiagram and a hop table
-<out>/<brick>-<name>.json   the hops, for tests and tools
+<out>/<brick>-<name>.md     for reading
+<out>/<brick>-<name>.json   the same content as data, for tests and tools
 ```
 
-`--out` defaults to `<project>/reports/transcripts` and `--name` to the input file's name (`stdin` for `-`), so the path is predictable. The Markdown has a `sequenceDiagram` with one participant per brick (in the order the sample first touched them) and one per source port touched, and one arrow per hop labelled with the joint or port, its policy and pin or its epoch and label, and the take used. Under it is a table with the columns `#`, `where` (a brick, or brick to port, with its shape), `how it got here` (sample input, joint from X with policy and pin, source epoch and label, returned, output), `tape take` (the take path, or none) and `value`. The value is the **full** value at that hop, with sorted keys and no truncation or digest: inline when it is short, pretty-printed in a `<details>` block when it is long; a source hop shows its request and its response. A failed run is still reported, ending in the hop where it raised, and the command exits 1.
-
-Replaying the same project and input gives the same bytes: the report carries no run ID, timestamp or path of this machine, and a test runs it twice, and over a copy of the project at another path, and fails on any difference. The flow is followed in the order it runs, so a brick that calls a sibling from several threads is not reported in a fixed order.
+`--out` defaults to `<project>/reports/transcripts` and `--name` to the input file's name (`stdin` for `-`), so the path is predictable. A failed run is still reported, with the calls it made and the error, and the command exits 1. Replaying the same project and input gives the same bytes: the report carries no run ID, timestamp or path of this machine, and a test runs it twice, and over a copy of the project at another path, and fails on any difference. A brick that calls a sibling from several threads is not reported in a fixed order.
 
 `tools/brick_contract.py` reads a brick's `contract.py` without importing it and computes its shape; repo-local checks should use `contract_value(brick, "NAME")`, `brick_ports(brick)` and `brick_shape(brick)` rather than a regular expression. Framework tests: `python3 -m unittest discover -s tools/tests -t .`.
 

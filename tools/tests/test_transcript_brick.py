@@ -1,9 +1,10 @@
-"""Tests for tools/transcript_brick.py: one sample followed through a multi-brick project, hop by hop."""
+"""Tests for tools/transcript_brick.py: samples of the payloads a project passes around, grouped by brick."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,14 @@ def run_tool(root: Path, *args: str, sample: object = SAMPLE) -> subprocess.Comp
     )
 
 
+def write_take(root: Path, brick: str, source: str, take: str, request: dict, **result: object) -> Path:
+    record = {"epoch": 1, "recorded_in": "r1", "request": request, "schema_version": 2, "source": source, "take": take, **result}
+    path = root / "bricks" / brick / "input/tapes" / source / f"{take}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 class Project(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -38,94 +47,346 @@ class Project(unittest.TestCase):
         folder = self.root / "reports/transcripts"
         return (folder / f"chat-{name}.md").read_text(encoding="utf-8"), json.loads((folder / f"chat-{name}.json").read_text(encoding="utf-8"))
 
+    def brick(self, document: dict, name: str) -> dict:
+        return next(brick for brick in document["bricks"] if brick["name"] == name)
+
     def takes(self) -> dict[str, bytes]:
         return {p.relative_to(self.root).as_posix(): p.read_bytes() for p in sorted(self.root.rglob("tapes/*/*.json"))}
 
 
-class HopTests(Project):
-    def test_the_hops_come_in_the_order_the_value_travels_with_their_values(self) -> None:
+class GroupingTests(Project):
+    def test_there_is_one_section_per_brick_in_name_order_with_its_shape(self) -> None:
         done = run_tool(self.root)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.strip(), "wrote reports/transcripts/chat-stdin.md and .json (8 hops)")
-        _, document = self.report()
-        hops = document["hops"]
-        self.assertEqual(
-            [(h["n"], h["kind"], h["where"]) for h in hops],
-            [
-                (1, "input", "chat (entry)"),
-                (2, "source", "chat (entry) → history"),
-                (3, "joint", "chat (entry) → planner (sealed)"),
-                (4, "return", "planner (sealed) → chat (entry)"),
-                (5, "joint", "chat (entry) → assistant (open)"),
-                (6, "source", "assistant (open) → xai"),
-                (7, "return", "assistant (open) → chat (entry)"),
-                (8, "output", "chat (entry)"),
-            ],
-        )
-        self.assertEqual([h["from"] for h in hops], ["chat", "chat", "chat", "planner", "chat", "assistant", "assistant", "chat"])
-        self.assertEqual([h["to"] for h in hops], ["chat", "chat.history", "planner", "chat", "assistant", "assistant.xai", "chat", "chat"])
-        self.assertEqual(hops[0]["value"], SAMPLE)
-        self.assertEqual(hops[1]["request"], {"user": "ada"})
-        self.assertEqual(hops[1]["value"], {"turns": 3})
-        self.assertEqual(hops[2]["value"], {"goal": "ship"})
-        self.assertEqual(hops[3]["value"], {"steps": ["ship-one", "ship-two"]})
-        self.assertEqual(hops[4]["value"], {"steps": ["ship-one", "ship-two"], "user": "ada"})
-        self.assertEqual(hops[5]["request"], {"steps": ["ship-one", "ship-two"], "user": "ada"})
-        self.assertEqual(hops[5]["value"], {"text": "hello ada, ship-one, ship-two"})
-        self.assertEqual(hops[6]["value"], {"text": "hello ada, ship-one, ship-two"})
-        self.assertEqual(hops[7]["value"], {"greeting": "hello ada, ship-one, ship-two", "steps": ["ship-one", "ship-two"], "turns": 3})
+        self.assertEqual(done.stdout.strip(), "wrote reports/transcripts/chat-stdin.md and .json (3 bricks)")
+        markdown, document = self.report()
+        self.assertEqual([b["name"] for b in document["bricks"]], ["assistant", "chat", "planner"])
+        self.assertEqual([b["shape"] for b in document["bricks"]], ["open", "entry", "sealed"])
+        self.assertEqual([line for line in markdown.splitlines() if line.startswith("## ")], ["## assistant (open)", "## chat (entry)", "## planner (sealed)"])
+        for heading in ("### Run", "### Joints", "### Ports"):
+            self.assertEqual(markdown.count(heading), 3)
 
-    def test_how_it_got_here_names_the_joint_policy_pin_follow_and_the_sources_epoch_and_label(self) -> None:
+    def test_each_brick_shows_its_own_run_call_with_input_and_output_and_who_called_it(self) -> None:
         run_tool(self.root)
         _, document = self.report()
-        how = [h["how"] for h in document["hops"]]
-        self.assertEqual(
-            how,
-            [
-                "sample input",
-                "source epoch 1 label store=v1",
-                "joint from chat, eventual, pin v1",
-                "returned",
-                "joint from chat, orchestrated, pin v2, follows xai",
-                "source epoch 2 label model=grok-4",
-                "returned",
-                "output",
-            ],
-        )
+        chat = self.brick(document, "chat")["run"]
+        self.assertEqual((chat["calls"], [s["label"] for s in chat["samples"]], chat["samples"][0]["from"]), (1, ["only"], "sample input"))
+        self.assertEqual(chat["samples"][0]["input"]["value"], SAMPLE)
+        self.assertEqual(chat["samples"][0]["output"]["value"], {"greeting": "hello ada, ship-one, ship-two", "steps": ["ship-one", "ship-two"], "turns": 3})
+        planner = self.brick(document, "planner")["run"]["samples"][0]
+        self.assertEqual((planner["from"], planner["input"]["value"], planner["output"]["value"]), ("chat", {"goal": "ship"}, {"steps": ["ship-one", "ship-two"]}))
+        assistant = self.brick(document, "assistant")["run"]["samples"][0]
+        self.assertEqual(assistant["from"], "chat")
+        self.assertEqual(assistant["input"]["value"], {"steps": ["ship-one", "ship-two"], "user": "ada"})
 
-    def test_each_source_hop_names_the_take_file_it_used_and_the_others_name_none(self) -> None:
+    def test_the_joint_traffic_is_what_crossed_and_what_came_back_and_equals_the_siblings_run_call(self) -> None:
         run_tool(self.root)
         _, document = self.report()
-        self.assertEqual(
-            [h["take"] for h in document["hops"]],
-            [None, "bricks/chat/input/tapes/history/turns.json", None, None, None, "bricks/assistant/input/tapes/xai/reply.json", None, None],
-        )
-        for hop in document["hops"]:
-            if hop["take"]:
-                self.assertTrue((self.root / hop["take"]).is_file())
+        joints = {j["name"]: j for j in self.brick(document, "chat")["joints"]}
+        self.assertEqual(sorted(joints), ["assistant", "planner"])
+        self.assertEqual((joints["assistant"]["policy"], joints["assistant"]["pin"], joints["assistant"]["follow"]), ("orchestrated", 2, ["xai"]))
+        self.assertEqual((joints["planner"]["policy"], joints["planner"]["pin"], joints["planner"]["follow"]), ("eventual", 1, []))
+        for name, joint in joints.items():
+            self.assertEqual(joint["crossings"], 1)
+            callee = self.brick(document, name)["run"]["samples"][0]
+            crossing = joint["samples"][0]
+            self.assertEqual((crossing["input"], crossing["output"]), (callee["input"], callee["output"]))
 
-    def test_the_shapes_of_every_brick_touched_are_in_the_json(self) -> None:
+    def test_each_source_port_shows_requests_and_responses_from_the_takes_on_its_tape(self) -> None:
         run_tool(self.root)
         _, document = self.report()
-        self.assertEqual(document["shapes"], {"assistant": "open", "chat": "entry", "planner": "sealed"})
-        self.assertEqual((document["brick"], document["name"], document["mode"]), ("chat", "stdin", {"fresh": [], "record": []}))
+        (history,) = self.brick(document, "chat")["ports"]
+        self.assertEqual((history["name"], history["epoch"], history["label"], history["followable"]), ("history", 1, {"store": "v1"}, False))
+        self.assertEqual((history["takes"], history["unreadable"]), (1, 0))
+        sample = history["samples"][0]
+        self.assertEqual(sample["take"], "bricks/chat/input/tapes/history/turns.json")
+        self.assertEqual(sample["request"]["value"], {"label": {"store": "v1"}, "user": "ada"})
+        self.assertEqual(sample["response"]["value"], {"turns": 3})
+        (xai,) = self.brick(document, "assistant")["ports"]
+        self.assertEqual((xai["epoch"], xai["followable"]), (2, True))
 
-    def test_replay_is_the_default_and_changes_no_take(self) -> None:
+    def test_a_brick_the_sample_does_not_reach_still_shows_its_tape_and_says_it_was_not_called(self) -> None:
+        idle = sample_project.brick(
+            self.root, "idle", sample_project.ASSISTANT_CONTRACT.replace("CONTRACT_VERSION = 2", "CONTRACT_VERSION = 1"),
+            sample_project.ASSISTANT_LOGIC, {"xai.py": sample_project.ASSISTANT_XAI},
+        )
+        write_take(self.root, "idle", "xai", "reply", {"label": {"model": "grok-4"}, "q": 1}, response={"idle": True})
+        run_tool(self.root)
+        markdown, document = self.report()
+        brick = self.brick(document, "idle")
+        self.assertEqual(brick["run"], {"calls": 0, "samples": []})
+        self.assertEqual(brick["ports"][0]["samples"][0]["response"]["value"], {"idle": True})
+        section = markdown.split("## idle (open)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Not called by this sample.", section)
+        self.assertIn("**response** (13 bytes)", section)
+
+    def test_a_joint_the_sample_never_crossed_says_so(self) -> None:
+        run_tool(self.root, sample=SAMPLE)
+        markdown, _ = self.report()
+        self.assertNotIn("Not crossed by this sample.", markdown)
+        # A run that fails before the joints are reached leaves them uncrossed.
+        broken = self.root / "bricks/chat/src/logic.py"
+        broken.write_text(broken.read_text(encoding="utf-8").replace("    turns = history.fetch", "    raise KeyError('early')\n    turns = history.fetch"), encoding="utf-8")
+        run_tool(self.root)
+        markdown, document = self.report()
+        self.assertEqual(markdown.count("Not crossed by this sample."), 2)
+        self.assertEqual([j["crossings"] for j in self.brick(document, "chat")["joints"]], [0, 0])
+
+    def test_the_report_has_no_flow_diagram_and_no_hop_table(self) -> None:
+        run_tool(self.root)
+        markdown, document = self.report()
+        for gone in ("sequenceDiagram", "mermaid", "| # |", "how it got here", "participant"):
+            self.assertNotIn(gone, markdown)
+        self.assertNotIn("hops", document)
+        for name in ("sequence", "value_cell", "markdown_hops", "Hop"):
+            self.assertFalse(hasattr(transcript_brick, name), name)
+        self.assertNotIn("patch_tape", dir(transcript_brick.Tracer))
+
+    def test_replay_changes_no_take_and_leaves_only_a_local_ledger_entry(self) -> None:
         before = self.takes()
         run_tool(self.root)
         self.assertEqual(before, self.takes())
-        ledger = [p.name for p in (self.root / "bricks/chat/runner/ledger").glob("*.json")]
-        self.assertTrue(ledger and all(name.endswith(".local.json") for name in ledger), ledger)
+        names = [p.name for p in (self.root / "bricks/chat/runner/ledger").glob("*.json")]
+        self.assertTrue(names and all(name.endswith(".local.json") for name in names), names)
 
-    def test_the_report_has_no_run_id_timestamp_or_local_path(self) -> None:
+
+class SelectionTests(unittest.TestCase):
+    def candidates(self, sizes: list[int], texts: list[str] | None = None) -> list[dict]:
+        return [{"size": size, "text": (texts[i] if texts else str(i)), "id": i} for i, size in enumerate(sizes)]
+
+    def picked(self, items: list[dict]) -> list[tuple[str, int]]:
+        return [(label, item["id"]) for label, item in transcript_brick.choose(items)]
+
+    def test_none_one_two_and_three_candidates(self) -> None:
+        self.assertEqual(self.picked([]), [])
+        self.assertEqual(self.picked(self.candidates([5])), [("only", 0)])
+        self.assertEqual(self.picked(self.candidates([9, 2])), [("smallest", 1), ("largest", 0)])
+        self.assertEqual(self.picked(self.candidates([9, 2, 5])), [("smallest", 1), ("typical", 2), ("largest", 0)])
+
+    def test_with_more_than_three_it_is_the_smallest_the_lower_median_and_the_largest(self) -> None:
+        self.assertEqual(self.picked(self.candidates([40, 10, 30, 20])), [("smallest", 1), ("typical", 3), ("largest", 0)])
+        self.assertEqual(self.picked(self.candidates([50, 10, 30, 20, 40])), [("smallest", 1), ("typical", 2), ("largest", 0)])
+        sizes = list(range(100, 0, -1))
+        self.assertEqual([item["size"] for _, item in transcript_brick.choose(self.candidates(sizes))], [1, 50, 100])
+
+    def test_ties_are_broken_by_text_then_by_order_and_the_input_order_never_matters(self) -> None:
+        items = self.candidates([5, 5, 5, 5, 5, 5, 5], texts=["g", "c", "a", "f", "b", "e", "d"])
+        expected = [(label, items[i]["text"]) for label, i in self.picked(items)]
+        self.assertEqual(expected, [("smallest", "a"), ("typical", "d"), ("largest", "g")])
+        for seed in range(20):
+            shuffled = items[:]
+            random.Random(seed).shuffle(shuffled)
+            self.assertEqual([(l, item["text"]) for l, item in transcript_brick.choose(shuffled)], expected)
+        same = self.candidates([5, 5, 5, 5], texts=["x"] * 4)
+        self.assertEqual(self.picked(same), [("smallest", 0), ("typical", 1), ("largest", 3)])
+
+    def test_the_size_is_the_canonical_json_in_bytes(self) -> None:
+        self.assertEqual(transcript_brick.size_of({"b": 1, "a": "é"}), len('{"a":"é","b":1}'.encode("utf-8")))
+        self.assertEqual(transcript_brick.canonical({"b": [1, 2], "a": None}), '{"a":null,"b":[1,2]}')
+
+
+class TrimTests(unittest.TestCase):
+    def test_a_small_payload_is_whole_with_its_size(self) -> None:
+        shown = transcript_brick.present({"a": 1})
+        self.assertEqual(shown, {"bytes": 7, "value": {"a": 1}})
+
+    def test_the_limit_is_in_bytes_of_canonical_json(self) -> None:
+        exact = {"k": "x" * (transcript_brick.TRIM_BYTES - len('{"k":""}'))}
+        self.assertEqual(transcript_brick.size_of(exact), transcript_brick.TRIM_BYTES)
+        self.assertIn("value", transcript_brick.present(exact))
+        over = {"k": "x" * (transcript_brick.TRIM_BYTES - len('{"k":""}') + 1)}
+        self.assertIn("top_level_keys", transcript_brick.present(over))
+
+    def test_a_big_object_becomes_its_top_level_keys_each_with_type_size_and_one_sample(self) -> None:
+        big = {
+            "map": [[row, col] for row in range(40) for col in range(10)],
+            "log": ["turn 1 began"] * 500,
+            "state": {"day": 3, "units": list(range(300))},
+            "name": "x" * 2000,
+            "tick": 41,
+            "empty": [],
+            "none": None,
+            "flag": True,
+            "nested": {"inner": {"a": 1}},
+            "rows": [{"id": 1}] * 400,
+        }
+        shown = transcript_brick.present(big)
+        self.assertEqual(shown["bytes"], transcript_brick.size_of(big))
+        keys = shown["top_level_keys"]
+        self.assertEqual(list(keys), sorted(big))
+        self.assertEqual(keys["map"], {"type": "list", "size": 400, "sample": "list of 2 items"})
+        self.assertEqual(keys["log"], {"type": "list", "size": 500, "sample": '"turn 1 began"'})
+        self.assertEqual(keys["state"], {"type": "object", "size": 2, "sample": '"day": 3'})
+        self.assertEqual(keys["name"], {"type": "string", "sample": '"' + "x" * 40 + '…" (2000 chars)'})
+        self.assertEqual(keys["tick"], {"type": "number", "sample": "41"})
+        self.assertEqual(keys["empty"], {"type": "list", "size": 0, "sample": "[]"})
+        self.assertEqual(keys["none"], {"type": "null", "sample": "null"})
+        self.assertEqual(keys["flag"], {"type": "boolean", "sample": "true"})
+        self.assertEqual(keys["nested"], {"type": "object", "size": 1, "sample": '"inner": object of 1 keys'})
+        self.assertEqual(keys["rows"], {"type": "list", "size": 400, "sample": "object of 1 keys"})
+        for entry in keys.values():
+            self.assertLess(len(entry["sample"]), 80)
+
+    def test_a_big_payload_that_is_not_an_object_is_described_as_a_whole(self) -> None:
+        shown = transcript_brick.present(list(range(2000)))
+        self.assertEqual(shown["top_level_keys"], {"(the whole value)": {"type": "list", "size": 2000, "sample": "0"}})
+        shown = transcript_brick.present("y" * 3000)
+        self.assertEqual(shown["top_level_keys"]["(the whole value)"]["type"], "string")
+
+    def test_bytes_become_a_base64_object_so_nothing_is_lost_or_unprintable(self) -> None:
+        self.assertEqual(transcript_brick.plain({"z": (1, 2), "y": b"\x00\x01"}), {"z": [1, 2], "y": {"base64": "AAE="}})
+
+
+class BigPayloadTests(Project):
+    def big_state(self) -> dict:
+        return {
+            "map": [[row, col, "grass" if (row + col) % 3 else "rock"] for row in range(300) for col in range(100)],
+            "units": [{"id": i, "name": f"unit-{i}", "hp": 100 - i % 7, "pos": [i % 50, i // 50]} for i in range(2500)],
+            "log": [f"turn {i} began and ended without incident" for i in range(3000)],
+            "day": 41,
+            "seed": "a" * 5000,
+        }
+
+    def test_a_game_sized_payload_is_trimmed_to_its_keys_and_the_report_stays_small(self) -> None:
+        state = self.big_state()
+        write_take(self.root, "chat", "history", "turns", {"label": {"store": "v1"}, "user": "ada"}, response={"turns": 3, "state": state})
+        full = transcript_brick.size_of({"request": {"label": {"store": "v1"}, "user": "ada"}, "response": {"turns": 3, "state": state}})
+        self.assertGreater(full, 400_000)
+        blob = {"user": "ada", "goal": "ship", "blob": state}
+        done = run_tool(self.root, sample=blob)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        markdown, document = self.report()
+        json_text = (self.root / "reports/transcripts/chat-stdin.json").read_text(encoding="utf-8")
+        self.assertLess(len(markdown.encode("utf-8")) * 40, full)
+        self.assertLess(len(json_text.encode("utf-8")) * 40, full)
+        history = self.brick(document, "chat")["ports"][0]["samples"][0]
+        self.assertEqual(history["response"]["bytes"], transcript_brick.size_of({"turns": 3, "state": state}))
+        self.assertEqual(sorted(history["response"]["top_level_keys"]), ["state", "turns"])
+        self.assertEqual(history["response"]["top_level_keys"]["state"], {"type": "object", "size": 5, "sample": '"day": 41'})
+        run_input = self.brick(document, "chat")["run"]["samples"][0]["input"]
+        self.assertEqual(sorted(run_input["top_level_keys"]), ["blob", "goal", "user"])
+        self.assertIn("trimmed to its top-level keys (full size", markdown)
+        self.assertNotIn("unit-2499", markdown)
+        self.assertNotIn("a" * 100, markdown)
+        self.assertIn("state  object of 5 keys, e.g. \"day\": 41", markdown)
+
+    def test_the_size_comparison_is_stated_in_the_report_for_every_trimmed_payload(self) -> None:
+        state = self.big_state()
+        write_take(self.root, "chat", "history", "turns", {"label": {"store": "v1"}, "user": "ada"}, response={"turns": 3, "state": state})
         run_tool(self.root)
         markdown, document = self.report()
-        text = markdown + json.dumps(document)
-        self.assertNotIn(str(self.root), text)
-        self.assertNotIn(str(self.tmp), text)
-        self.assertNotRegex(text, r"\d{8}-\d{6}-\d{6}")
-        self.assertNotRegex(text, r"\d{4}-\d{2}-\d{2}")
+        full = self.brick(document, "chat")["ports"][0]["samples"][0]["response"]["bytes"]
+        self.assertIn(f"(full size {full:,} bytes)", markdown)
+        self.assertIn(f"**response** ({full:,} bytes)", markdown)
 
+
+class TapeSampleTests(Project):
+    REQUEST = {"label": {"store": "v1"}}
+
+    def fill(self, sizes: dict[str, int]) -> None:
+        for take, size in sizes.items():
+            write_take(self.root, "chat", "history", take, {**self.REQUEST, "id": take}, response={"pad": "p" * size})
+
+    def test_three_samples_are_chosen_from_many_takes_by_size_and_untouched_takes_count(self) -> None:
+        self.fill({"a": 10, "b": 400, "c": 30, "d": 200, "e": 20, "f": 5})
+        run_tool(self.root)
+        _, document = self.report()
+        history = self.brick(document, "chat")["ports"][0]
+        self.assertEqual(history["takes"], 7)
+        self.assertEqual([s["label"] for s in history["samples"]], ["smallest", "typical", "largest"])
+        takes = [Path(s["take"]).stem for s in history["samples"]]
+        sizes = sorted(
+            (transcript_brick.size_of({"request": {**self.REQUEST, "id": t}, "response": {"pad": "p" * n}}), t)
+            for t, n in {"a": 10, "b": 400, "c": 30, "d": 200, "e": 20, "f": 5}.items()
+        )
+        sizes.append((transcript_brick.size_of({"request": {"label": {"store": "v1"}, "user": "ada"}, "response": {"turns": 3}}), "turns"))
+        ordered = [t for _, t in sorted(sizes)]
+        self.assertEqual(takes, [ordered[0], ordered[(len(ordered) - 1) // 2], ordered[-1]])
+        self.assertEqual(takes[-1], "b")
+
+    def test_the_choice_does_not_depend_on_the_files_order_on_disk_or_the_input(self) -> None:
+        self.fill({"a": 10, "b": 400, "c": 30, "d": 200})
+        run_tool(self.root)
+        first = self.report()[1]["bricks"]
+        shutil.rmtree(self.root / "reports")
+        other = {"user": "ada", "goal": "ship"}
+        run_tool(self.root, sample=other)
+        self.assertEqual(first, self.report()[1]["bricks"])
+
+    def test_an_error_take_is_shown_as_an_error_and_a_session_take_whole_when_small(self) -> None:
+        write_take(self.root, "chat", "history", "bad", {**self.REQUEST, "id": "bad"}, error={"type": "OSError"})
+        write_take(
+            self.root, "chat", "history", "year-w0", {**self.REQUEST, "window": "w0"},
+            response={"transcript": [{"op": "ask", "request": {"q": 1}, "response": {"a": 2}}, {"op": "more", "request": {}, "error": {"type": "OSError"}}]},
+        )
+        run_tool(self.root)
+        _, document = self.report()
+        samples = {Path(s["take"]).stem: s for s in self.brick(document, "chat")["ports"][0]["samples"]}
+        self.assertEqual(samples["bad"]["error"]["value"], {"type": "OSError"})
+        self.assertNotIn("response", samples["bad"])
+        self.assertEqual(samples["year-w0"]["response"]["value"]["transcript"][1]["error"], {"type": "OSError"})
+
+    def test_files_that_are_not_takes_are_counted_and_not_shown(self) -> None:
+        folder = self.root / "bricks/chat/input/tapes/history"
+        (folder / "broken.json").write_text("{nope", encoding="utf-8")
+        (folder / "other.json").write_text('{"schema_version": 2}\n', encoding="utf-8")
+        (folder / "both.json").write_text('{"request": {}, "response": 1, "error": {}}\n', encoding="utf-8")
+        run_tool(self.root)
+        markdown, document = self.report()
+        history = self.brick(document, "chat")["ports"][0]
+        self.assertEqual((history["takes"], history["unreadable"]), (1, 3))
+        self.assertIn("3 files in the folder are not a readable take.", markdown)
+
+    def test_a_port_with_no_takes_says_so(self) -> None:
+        shutil.rmtree(self.root / "bricks/assistant/input/tapes/xai")
+        run_tool(self.root)
+        _, document = self.report()
+        xai = self.brick(document, "assistant")["ports"][0]
+        self.assertEqual((xai["takes"], xai["samples"]), (0, []))
+
+
+class FailureAndModeTests(Project):
+    def test_a_failed_run_is_still_reported_with_the_calls_it_made_and_exits_one(self) -> None:
+        (self.root / "bricks/assistant/input/tapes/xai/reply.json").unlink()
+        done = run_tool(self.root)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("error: the run failed: TapeError: take does not exist", done.stderr)
+        _, document = self.report()
+        self.assertTrue(document["error"].startswith("TapeError: take does not exist"))
+        assistant = self.brick(document, "assistant")["run"]["samples"][0]
+        self.assertEqual(assistant["error"]["value"]["type"], "TapeError")
+        self.assertNotIn("output", assistant)
+        chat = self.brick(document, "chat")["run"]["samples"][0]
+        self.assertEqual(chat["error"]["value"]["type"], "TapeError")
+
+    def test_fresh_and_record_are_passed_to_the_run_and_named_in_the_report(self) -> None:
+        done = run_tool(self.root, "--fresh", "assistant.xai")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        markdown, document = self.report()
+        self.assertEqual(document["mode"], {"fresh": ["assistant.xai"], "record": []})
+        self.assertIn("- Mode: fresh: assistant.xai (everything else replayed)", markdown)
+        (self.root / "bricks/assistant/input/tapes/xai/reply.json").unlink()
+        run_tool(self.root, "--record", "assistant.xai")
+        _, document = self.report()
+        self.assertEqual(document["mode"], {"fresh": [], "record": ["assistant.xai"]})
+        self.assertTrue((self.root / "bricks/assistant/input/tapes/xai/reply.json").is_file())
+        self.assertEqual(self.brick(document, "assistant")["ports"][0]["takes"], 1)
+
+    def test_replay_is_stated_when_nothing_was_asked_for(self) -> None:
+        run_tool(self.root)
+        markdown, document = self.report()
+        self.assertEqual(document["mode"], {"fresh": [], "record": []})
+        self.assertIn("- Mode: replay (every source answered from its tape; nothing went to a live source)", markdown)
+
+    def test_an_unknown_port_is_an_error_and_a_report_of_it_is_still_written(self) -> None:
+        done = run_tool(self.root, "--fresh", "nothing")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("error: the run failed: ValueError: fresh= names 'nothing'", done.stderr)
+        _, document = self.report()
+        self.assertEqual(self.brick(document, "chat")["run"]["calls"], 0)
+
+
+class PathAndCommandTests(Project):
     def test_the_input_file_and_name_decide_the_predictable_path(self) -> None:
         sample = self.tmp / "Order 7.json"
         sample.write_text(json.dumps(SAMPLE), encoding="utf-8")
@@ -135,167 +396,20 @@ class HopTests(Project):
         run_tool(self.root, "--name", "Second One", "--out", str(self.tmp / "elsewhere"))
         self.assertTrue((self.tmp / "elsewhere/chat-second-one.md").is_file())
 
+    def test_an_unknown_brick_and_bad_input_are_usage_errors(self) -> None:
+        done = subprocess.run([sys.executable, TOOL, "nothing", "--root", str(self.root)], input="{}", capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("no brick named 'nothing'", done.stderr)
+        done = subprocess.run([sys.executable, TOOL, "chat", "--root", str(self.root)], input="{nope", capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("cannot read the JSON input", done.stderr)
 
-class ModeTests(Project):
-    def test_fresh_goes_to_the_named_source_only_and_says_no_take_was_used(self) -> None:
-        before = self.takes()
-        done = run_tool(self.root, "--fresh", "assistant.xai")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        markdown, document = self.report()
-        sources = [h for h in document["hops"] if h["kind"] == "source"]
-        self.assertEqual([h["take"] for h in sources], ["bricks/chat/input/tapes/history/turns.json", None])
-        self.assertIn("fresh (no take used)", sources[1]["how"])
-        self.assertEqual(document["mode"], {"fresh": ["assistant.xai"], "record": []})
-        self.assertIn("- Mode: fresh: assistant.xai (everything else replayed)", markdown)
-        self.assertEqual(before, self.takes())
+    def test_the_project_still_lints_clean_after_a_report(self) -> None:
+        from tools import lint_bricks
 
-    def test_record_rewrites_the_named_take_and_names_it(self) -> None:
-        (self.root / "bricks/assistant/input/tapes/xai/reply.json").unlink()
-        done = run_tool(self.root, "--record", "assistant.xai")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        _, document = self.report()
-        source = [h for h in document["hops"] if h["to"] == "assistant.xai"][0]
-        self.assertEqual(source["take"], "bricks/assistant/input/tapes/xai/reply.json")
-        self.assertIn("recorded", source["how"])
-        self.assertTrue((self.root / source["take"]).is_file())
-        self.assertEqual(document["mode"], {"fresh": [], "record": ["assistant.xai"]})
-
-    def test_an_unknown_port_is_an_error_and_a_report_of_the_failure_is_still_written(self) -> None:
-        done = run_tool(self.root, "--fresh", "nothing")
-        self.assertEqual(done.returncode, 1)
-        self.assertIn("error: the run failed: ValueError: fresh= names 'nothing'", done.stderr)
-        _, document = self.report()
-        self.assertEqual(document["hops"], [])
-
-
-class FailureTests(Project):
-    def test_a_missing_take_is_reported_at_the_hop_where_it_failed(self) -> None:
-        (self.root / "bricks/assistant/input/tapes/xai/reply.json").unlink()
-        done = run_tool(self.root)
-        self.assertEqual(done.returncode, 1)
-        self.assertIn("error: the run failed: TapeError: take does not exist", done.stderr)
-        _, document = self.report()
-        kinds = [h["kind"] for h in document["hops"]]
-        self.assertEqual(kinds, ["input", "source", "joint", "return", "joint", "source", "error", "error"])
-        self.assertEqual(document["hops"][5]["value"]["error"]["type"], "TapeError")
-        self.assertEqual(document["hops"][-1]["how"], "raised")
-        self.assertEqual(document["hops"][-1]["where"], "chat (entry)")
-
-
-class VariantTests(Project):
-    def rewrite(self, brick: str, file: str, text: str) -> None:
-        (self.root / "bricks" / brick / "input/adapters" / file).write_text(text, encoding="utf-8")
-
-    def test_a_direct_load_of_a_take_is_a_hop_too(self) -> None:
-        self.rewrite("chat", "history.py", (
-            "from ..tape import load\n\n\ndef fetch(ctx, user):\n"
-            "    return load('history', 'turns', {'user': user})['response']['turns']\n"
-        ))
         run_tool(self.root)
-        _, document = self.report()
-        source = document["hops"][1]
-        self.assertEqual((source["kind"], source["value"], source["take"]), ("source", {"turns": 3}, "bricks/chat/input/tapes/history/turns.json"))
-
-    def test_every_operation_of_a_session_is_a_hop_with_its_window_and_take(self) -> None:
-        self.rewrite("assistant", "xai.py", (
-            "from ..tape import session\n\n\ndef complete(ctx, user, steps):\n"
-            "    talk = session(ctx, 'xai', 'chat')\n    talk.take('w0', {'user': user})\n"
-            "    first = talk.call('ask', {'steps': steps}, lambda: {'text': 'hi ' + user})\n"
-            "    second = talk.call('more', {}, lambda: {'text': 'again'})\n    talk.close()\n"
-            "    return first['text'] + '/' + second['text']\n"
-        ))
-        shutil.rmtree(self.root / "bricks/assistant/input/tapes/xai")
-        sample_project.record_takes(self.root)
-        done = run_tool(self.root)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        _, document = self.report()
-        sources = [h for h in document["hops"] if h["to"] == "assistant.xai"]
-        self.assertEqual([h["value"] for h in sources], [{"text": "hi ada"}, {"text": "again"}])
-        self.assertEqual([h["request"] for h in sources], [{"steps": ["ship-one", "ship-two"]}, {}])
-        self.assertTrue(all(h["take"] == "bricks/assistant/input/tapes/xai/chat-w0.json" for h in sources))
-        self.assertEqual(sources[0]["how"], "source epoch 2 label model=grok-4, session chat, window w0, ask")
-        self.assertEqual(sources[1]["how"].rsplit(", ", 1)[1], "more")
-        self.assertEqual(document["hops"][-1]["value"]["greeting"], "hi ada/again")
-
-
-class ValueTests(Project):
-    def test_values_are_shown_in_full_never_truncated(self) -> None:
-        long = "x" * 700
-        sample = {"user": "ada", "goal": long}
-        run_tool(self.root, "--record", "*", sample=sample)
-        done = run_tool(self.root, sample=sample)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        markdown, document = self.report()
-        self.assertEqual(document["hops"][0]["value"]["goal"], long)
-        self.assertEqual(document["hops"][-1]["value"]["steps"], [long + "-one", long + "-two"])
-        self.assertIn(long + "-two", markdown)
-        self.assertNotIn("…", markdown)
-        self.assertNotIn("sha256", markdown)
-
-    def test_a_short_value_is_inline_and_a_long_one_is_pretty_printed_in_details(self) -> None:
-        run_tool(self.root)
-        markdown, _ = self.report()
-        self.assertIn('| 1 | chat (entry) | sample input | none | <code>{"goal": "ship", "user": "ada"}</code> |', markdown)
-        self.assertIn('<details><summary>8 lines</summary><pre>{&#10;  "greeting": "hello ada, ship-one, ship-two",&#10;  "steps": [&#10;    "ship-one",&#10;    "ship-two"&#10;  ],&#10;  "turns": 3&#10;}</pre></details>', markdown)
-
-    def test_keys_are_in_a_fixed_order_whatever_order_the_value_was_built_in(self) -> None:
-        self.assertEqual(
-            transcript_brick.value_cell({"b": 1, "a": 2}),
-            '<code>{"a": 2, "b": 1}</code>',
-        )
-        self.assertEqual(transcript_brick.plain({"z": (1, 2), "y": b"\x00\x01"}), {"z": [1, 2], "y": {"base64": "AAE="}})
-
-    def test_html_and_table_characters_in_a_value_cannot_break_the_row(self) -> None:
-        cell = transcript_brick.value_cell({"k": "a|b <i>&</i>"})
-        self.assertEqual(cell, '<code>{"k": "a&#124;b &lt;i&gt;&amp;&lt;/i&gt;"}</code>')
-        self.assertNotIn("|", cell)
-        self.assertNotIn("\n", transcript_brick.value_cell({"k": "line\nbreak" * 20}))
-
-
-class DiagramTests(Project):
-    def test_the_sequence_diagram_has_a_participant_per_brick_in_first_touched_order_then_per_source(self) -> None:
-        run_tool(self.root)
-        markdown, _ = self.report()
-        diagram = markdown.split("```mermaid\n", 1)[1].split("\n```", 1)[0]
-        self.assertEqual(
-            diagram.splitlines(),
-            [
-                "sequenceDiagram",
-                "    participant p1 as chat (entry)",
-                "    participant p2 as planner (sealed)",
-                "    participant p3 as assistant (open)",
-                "    participant s1 as chat.history (source)",
-                "    participant s2 as assistant.xai (source)",
-                "    Note over p1: 1 sample input",
-                "    p1->>s1: 2 history: epoch 1 label store=v1, take bricks/chat/input/tapes/history/turns.json",
-                "    p1->>p2: 3 joint planner: eventual, pin v1",
-                "    p2-->>p1: 4 returned",
-                "    p1->>p3: 5 joint assistant: orchestrated, pin v2, follows xai",
-                "    p3->>s2: 6 xai: epoch 2 label model=grok-4, take bricks/assistant/input/tapes/xai/reply.json",
-                "    p3-->>p1: 7 returned",
-                "    Note over p1: 8 output",
-            ],
-        )
-
-    def test_the_hop_table_has_the_agreed_columns(self) -> None:
-        run_tool(self.root)
-        markdown, _ = self.report()
-        self.assertIn("| # | where | how it got here | tape take | value |\n|---|---|---|---|---|\n", markdown)
-        self.assertEqual(sum(1 for line in markdown.splitlines() if line.startswith("| ") and line[2].isdigit()), 8)
-
-    def test_participants_labels_and_messages_are_escaped(self) -> None:
-        hops = [
-            {"n": 1, "kind": "input", "where": "", "from": "a;b", "to": "a;b", "how": 'sample "input"; #1', "take": None, "value": {}},
-            {"n": 2, "kind": "source", "where": "", "from": "a;b", "to": "a;b.p<q>", "how": "source epoch 1 label k=v|w", "take": "t;1/x.json", "value": {}},
-        ]
-        diagram = transcript_brick.sequence(hops, {"a;b": "open"})
-        self.assertIn("participant p1 as a#59;b (open)", diagram)
-        self.assertIn("participant s1 as a#59;b.p#lt;q#gt; (source)", diagram)
-        self.assertIn("Note over p1: 1 sample #quot;input#quot;#59; #35;1", diagram)
-        self.assertIn("take t#59;1/x.json", diagram)
-        self.assertIn("k=v#124;w", diagram)
-        for line in diagram.splitlines()[1:]:
-            self.assertEqual(line.count(";"), line.count("#59;") + sum(1 for part in line.split("#") if part.startswith(("quot;", "lt;", "gt;", "124;", "35;"))))
+        lint = lint_bricks.lint_repo(self.root)
+        self.assertEqual((lint.errors, lint.warnings), ([], []))
 
 
 class DeterminismTests(Project):
@@ -314,67 +428,31 @@ class DeterminismTests(Project):
         for name in ("chat-stdin.md", "chat-stdin.json"):
             self.assertEqual((self.root / "reports/transcripts" / name).read_bytes(), (copy / "reports/transcripts" / name).read_bytes(), name)
 
+    def test_the_report_has_no_run_id_timestamp_or_local_path(self) -> None:
+        run_tool(self.root)
+        markdown, document = self.report()
+        text = markdown + json.dumps(document)
+        self.assertNotIn(str(self.root), text)
+        self.assertNotIn(str(self.tmp), text)
+        self.assertNotRegex(text, r"\d{8}-\d{6}-\d{6}")
+        self.assertNotRegex(text, r"\d{4}-\d{2}-\d{2}")
+
+    def test_the_markdown_and_the_json_say_the_same_things(self) -> None:
+        run_tool(self.root)
+        markdown, document = self.report()
+        for brick in document["bricks"]:
+            self.assertIn(f"## {brick['name']} ({brick['shape']})", markdown)
+            for port in brick["ports"]:
+                for sample in port["samples"]:
+                    self.assertIn(f"`{sample['take']}`", markdown)
+        self.assertEqual(markdown.count("**input**"), 3)
+        self.assertEqual(markdown.count("**crossed**"), 2)
+        self.assertEqual(markdown.count("**request**"), 2)
+
     def test_the_sample_report_is_exactly_this(self) -> None:
         run_tool(self.root, "--name", "ada")
         markdown, _ = self.report("ada")
-        self.assertEqual(markdown, SAMPLE_REPORT)
-
-
-SAMPLE_REPORT = '''# Transcript report: `chat` / `ada`
-
-- Entry brick: `chat` (entry)
-- Mode: replay (every source answered from its tape; nothing went to a live source)
-- Hops: 8
-
-## Sequence
-
-```mermaid
-sequenceDiagram
-    participant p1 as chat (entry)
-    participant p2 as planner (sealed)
-    participant p3 as assistant (open)
-    participant s1 as chat.history (source)
-    participant s2 as assistant.xai (source)
-    Note over p1: 1 sample input
-    p1->>s1: 2 history: epoch 1 label store=v1, take bricks/chat/input/tapes/history/turns.json
-    p1->>p2: 3 joint planner: eventual, pin v1
-    p2-->>p1: 4 returned
-    p1->>p3: 5 joint assistant: orchestrated, pin v2, follows xai
-    p3->>s2: 6 xai: epoch 2 label model=grok-4, take bricks/assistant/input/tapes/xai/reply.json
-    p3-->>p1: 7 returned
-    Note over p1: 8 output
-```
-
-## Hops
-
-| # | where | how it got here | tape take | value |
-|---|---|---|---|---|
-| 1 | chat (entry) | sample input | none | <code>{"goal": "ship", "user": "ada"}</code> |
-| 2 | chat (entry) → history | source epoch 1 label store=v1 | <code>bricks/chat/input/tapes/history/turns.json</code> | request: <code>{"user": "ada"}</code><br>response: <code>{"turns": 3}</code> |
-| 3 | chat (entry) → planner (sealed) | joint from chat, eventual, pin v1 | none | <code>{"goal": "ship"}</code> |
-| 4 | planner (sealed) → chat (entry) | returned | none | <code>{"steps": ["ship-one", "ship-two"]}</code> |
-| 5 | chat (entry) → assistant (open) | joint from chat, orchestrated, pin v2, follows xai | none | <code>{"steps": ["ship-one", "ship-two"], "user": "ada"}</code> |
-| 6 | assistant (open) → xai | source epoch 2 label model=grok-4 | <code>bricks/assistant/input/tapes/xai/reply.json</code> | request: <code>{"steps": ["ship-one", "ship-two"], "user": "ada"}</code><br>response: <code>{"text": "hello ada, ship-one, ship-two"}</code> |
-| 7 | assistant (open) → chat (entry) | returned | none | <code>{"text": "hello ada, ship-one, ship-two"}</code> |
-| 8 | chat (entry) | output | none | <details><summary>8 lines</summary><pre>{&#10;  "greeting": "hello ada, ship-one, ship-two",&#10;  "steps": [&#10;    "ship-one",&#10;    "ship-two"&#10;  ],&#10;  "turns": 3&#10;}</pre></details> |
-'''
-
-
-class CommandTests(Project):
-    def test_an_unknown_brick_and_bad_input_are_usage_errors(self) -> None:
-        done = subprocess.run([sys.executable, TOOL, "nothing", "--root", str(self.root)], input="{}", capture_output=True, text=True)
-        self.assertEqual(done.returncode, 2)
-        self.assertIn("no brick named 'nothing'", done.stderr)
-        done = subprocess.run([sys.executable, TOOL, "chat", "--root", str(self.root)], input="{nope", capture_output=True, text=True)
-        self.assertEqual(done.returncode, 2)
-        self.assertIn("cannot read the JSON input", done.stderr)
-
-    def test_the_tool_does_not_leave_the_project_in_a_state_the_lint_rejects(self) -> None:
-        from tools import lint_bricks
-
-        run_tool(self.root)
-        lint = lint_bricks.lint_repo(self.root)
-        self.assertEqual((lint.errors, lint.warnings), ([], []))
+        self.assertEqual(markdown, (ROOT / "tools/tests/expected_transcript.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
