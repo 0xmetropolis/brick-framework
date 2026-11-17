@@ -17,7 +17,7 @@ This folder owns orchestration, brick-local run identity, the run ledger, and sm
 
 - Write one ledger entry per run under `ledger/`, using its brick-local run ID.
 - A **tracked** entry (`<run id>.json`) is written only for a run that touched a source fresh or recorded, followed one fresh, or failed. Every other run, and every run with `BRICK_TEST=1`, writes a local `<run id>.local.json`: still bounded (its own retention), but gitignored by `ledger/.gitignore`, so replays and tests do not churn tracked history.
-- Each entry includes the run ID, the brick's own `fresh` and `record` sources, the `followed` sources passed down (`<joint>.<source>`), the input, the output or error, and the timestamp.
+- Each entry includes the run ID, the brick's own `fresh` and `record` sources, the `followed` sources passed down (`<joint>.<source>`), the input, the output or error, and the timestamp. When a session opted out of a recording its port was asked for (`tape.session(..., record=False)`), the entry also lists it under `unrecorded` (`<source>.<session>`), so it does not overstate what was recorded.
 - Takes recorded by an explicit record operation carry the same run ID (`recorded_in`) and can be joined outside the runner.
 - `run` may be called from several threads at once (an entry brick's threads calling one sibling). Writing and pruning must tolerate an entry another call already removed.
 - Retain only the configured number of recent entries (`retention.entries`), tracked and local separately. Prune after writing the new entry.

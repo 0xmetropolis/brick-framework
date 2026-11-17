@@ -218,6 +218,25 @@ class VariantTests(Project):
         self.assertEqual(document["hops"][-1]["value"]["greeting"], "hi ada/again")
 
 
+class OptOutTests(Project):
+    def test_a_session_that_opted_out_of_recording_is_a_fresh_hop_with_no_take(self) -> None:
+        (self.root / "bricks/assistant/input/adapters/xai.py").write_text(
+            "from ..tape import session\n\n\ndef complete(ctx, user, steps):\n"
+            "    talk = session(ctx, 'xai', 'chat', record=False)\n    talk.take('w0', {'user': user})\n"
+            "    first = talk.call('ask', {'steps': steps}, lambda: {'text': 'hi ' + user})\n    talk.close()\n"
+            "    return first['text']\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(self.root / "bricks/assistant/input/tapes/xai")
+        done = run_tool(self.root, "--record", "assistant.xai")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        _, document = self.report()
+        source = [h for h in document["hops"] if h["to"] == "assistant.xai"][0]
+        self.assertIsNone(source["take"])
+        self.assertEqual(source["how"], "source epoch 2 label model=grok-4, fresh (no take used), session chat, window w0, ask")
+        self.assertFalse((self.root / "bricks/assistant/input/tapes/xai").exists())
+
+
 class ValueTests(Project):
     def test_values_are_shown_in_full_never_truncated(self) -> None:
         long = "x" * 700

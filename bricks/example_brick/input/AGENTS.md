@@ -51,6 +51,7 @@ A source port drives a live source, records it on its tape, and replays by defau
 
 - A missing or mismatched take is an error. Only `fresh` reaches the live source.
 - A session goes through `tape.session(ctx, "<source>", name)`: one take per window, operations replayed in order. The port's `label` names what the source is (a game version, a build, a protocol) and is merged into every window request; a session needs one to go fresh or record. After connecting in `fresh` or `record`, call `session.verify(seen)` with what the source reports; it refuses to continue on a mismatch. One call goes through `tape.once`.
+- Recording is decided per port by the run, never by the adapter. An adapter may only turn it off for one session: `tape.session(ctx, source, name, record=False)` keeps that session fresh when the run records the port (nothing is written, an existing take is left alone, the ledger entry lists it under `unrecorded`). `record=True`, the default, is accepted and cannot turn recording on.
 - The adapter connects to a source the launcher started. It does not start or stop the process, and it checks the source's version on connect.
 - A session-shaped source (hundreds of interleaved calls, state held in a process) belongs to the brick that drives it, because a sibling's `run` is one request and one answer.
 - A caller reaches a followable source only by following it, never with a hard-coded flag; the caller's ledger entry lists the sources it followed.

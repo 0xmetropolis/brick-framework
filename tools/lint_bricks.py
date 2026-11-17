@@ -77,8 +77,8 @@ IN_MEMORY = {"BytesIO", "StringIO"}
 # carries ``# BOILERPLATE: <id>@<n>`` in its first lines; a test keeps this table in step with the
 # template's markers, so changing a template file means bumping its marker and this table together.
 BOILERPLATE = {
-    "tape": ("input/tape.py", 1),
-    "runner.run": ("runner/run.py", 5),
+    "tape": ("input/tape.py", 2),
+    "runner.run": ("runner/run.py", 6),
     "runner.rng": ("runner/rng.py", 1),
 }
 BOILERPLATE_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")

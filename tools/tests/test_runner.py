@@ -152,6 +152,26 @@ class RunnerTests(unittest.TestCase):
         (record,) = self.records()
         self.assertEqual((record["fresh"], record["record"], record["followed"]), (["rates"], ["rates"], ["model.xai"]))
 
+    def test_sessions_that_opted_out_of_a_recording_are_listed_in_the_entry_once_and_sorted(self) -> None:
+        def execute(inputs, context):
+            context["unrecorded"] = ["game.side", "game.again", "game.side"]
+            if inputs.get("boom"):
+                raise ValueError("boom")
+            return {}
+
+        self.module.execute = execute
+        self.module.run({}, fresh=True)
+        with self.assertRaises(ValueError):
+            self.module.run({"boom": True})
+        succeeded, failed = self.records()
+        self.assertEqual(succeeded["unrecorded"], ["game.again", "game.side"])
+        self.assertEqual(failed["unrecorded"], ["game.again", "game.side"])
+
+    def test_an_entry_has_no_unrecorded_field_when_no_session_opted_out(self) -> None:
+        self.module.run({}, fresh=True)
+        (entry,) = self.records()
+        self.assertNotIn("unrecorded", entry)
+
     def test_the_run_closes_what_the_context_registered_even_when_it_fails(self) -> None:
         closed = []
 

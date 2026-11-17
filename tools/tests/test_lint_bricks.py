@@ -887,29 +887,31 @@ class BoilerplateVersionTests(Fixture):
         self.assertClean()
 
     def test_a_brick_upgraded_ahead_of_the_others_is_not_blamed_whichever_sorts_first(self) -> None:
+        current = lint_bricks.BOILERPLATE["tape"][1]
         for upgraded, stale in (("a", "b"), ("b", "a")):
             with self.subTest(upgraded=upgraded):
                 shutil.rmtree(self.root / "bricks", ignore_errors=True)
                 (self.root / "bricks").mkdir()
                 shutil.copy(ROOT / "bricks/AGENTS.md", self.root / "bricks/AGENTS.md")
                 shutil.copy(ROOT / "bricks/__init__.py", self.root / "bricks/__init__.py")
-                self.mark(self.brick(upgraded), "tape", 2)
+                self.mark(self.brick(upgraded), "tape", current + 1)
                 self.brick(stale)
-                with self.framework_at(tape=2):
+                with self.framework_at(tape=current + 1):
                     warnings = self.boilerplate_warnings()
                 self.assertEqual(
                     warnings,
-                    [f"bricks/{stale}/input/tape.py: boilerplate 'tape' is at @1, behind the framework's @2; copy input/tape.py from bricks/example_brick"],
+                    [f"bricks/{stale}/input/tape.py: boilerplate 'tape' is at @{current}, behind the framework's @{current + 1}; copy input/tape.py from bricks/example_brick"],
                 )
 
     def test_copies_that_are_all_equally_stale_still_warn(self) -> None:
+        tape, run = lint_bricks.BOILERPLATE["tape"][1], lint_bricks.BOILERPLATE["runner.run"][1]
         self.brick("a")
         self.brick("b")
-        with self.framework_at(tape=2, **{"runner.run": 6}):
+        with self.framework_at(tape=tape + 1, **{"runner.run": run + 1}):
             warnings = self.boilerplate_warnings()
         self.assertEqual(len(warnings), 4)
         self.assertTrue(all("behind the framework's" in w for w in warnings))
-        self.assertTrue(any("bricks/a/runner/run.py: boilerplate 'runner.run' is at @5, behind the framework's @6" in w for w in warnings))
+        self.assertTrue(any(f"bricks/a/runner/run.py: boilerplate 'runner.run' is at @{run}, behind the framework's @{run + 1}" in w for w in warnings))
         self.assertEqual(self.errors(), [])
 
     def test_a_copy_newer_than_the_framework_says_the_framework_is_the_older_one(self) -> None:

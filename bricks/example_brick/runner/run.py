@@ -1,4 +1,4 @@
-# BOILERPLATE: runner.run@5
+# BOILERPLATE: runner.run@6
 """The brick's repository-internal entry point.
 
 A working runner, copied with the brick like ``input/tape.py``: it creates
@@ -99,17 +99,27 @@ def run(inputs: BrickInput, *, fresh: Any = False, record: Any = False) -> Brick
         failed = False
     except Exception as exc:
         entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        _note_unrecorded(entry, context)
         _write_entry(entry, config)
         raise
     finally:
         problems = _close(context, failed)
     if problems:
         entry["error"] = {"type": type(problems[0]).__name__, "message": str(problems[0])}
+        _note_unrecorded(entry, context)
         _write_entry(entry, config)
         raise problems[0]
     entry["output"] = output
+    _note_unrecorded(entry, context)
     _write_entry(entry, config)
     return output
+
+
+def _note_unrecorded(entry: dict[str, Any], context: dict[str, Any]) -> None:
+    """List the sessions that opted out of a recording their port was asked for, so the entry does not overstate it."""
+    names = sorted(set(context.get("unrecorded", ())))
+    if names:
+        entry["unrecorded"] = names
 
 
 def make_plan(fresh: Any, record: Any) -> dict[str, tuple[str, ...]]:

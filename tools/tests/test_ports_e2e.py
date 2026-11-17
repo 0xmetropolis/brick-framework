@@ -212,6 +212,25 @@ class PortsEndToEnd(unittest.TestCase):
         self.assertEqual(result["error"], "LabelMismatch")
         self.assertFalse((self.root / "bricks/game/input/tapes/source").exists())
 
+    def test_a_session_that_opts_out_of_recording_writes_no_take_and_the_ledger_says_so(self) -> None:
+        adapter = self.root / "bricks/game/input/adapters/source.py"
+        adapter.write_text(
+            adapter.read_text(encoding="utf-8").replace(
+                "    return {**answer, **stamp}",
+                "    side = session(ctx, 'source', 'side', record=False)\n"
+                "    side.take('w0', {'days': days})\n    side.call('peek', {}, lambda: {'side': True})\n    side.close()\n"
+                "    return {**answer, **stamp}",
+            ),
+            encoding="utf-8",
+        )
+        out = self.go({"record": ["game.source"]})["ok"]
+        self.assertEqual(out["day"], 2)
+        self.assertEqual(sorted(p.name for p in (self.root / "bricks/game/input/tapes/source").glob("*.json")), ["run-w0.json"])
+        (entry,) = self.records("game")
+        self.assertEqual((entry["record"], entry["unrecorded"]), (["source"], ["source.side"]))
+        lint = lint_bricks.lint_repo(self.root)
+        self.assertEqual((lint.errors, lint.warnings), ([], []))
+
     def test_a_pin_that_falls_behind_the_interface_version_is_a_lint_error(self) -> None:
         game = self.root / "bricks/game/contract.py"
         game.write_text(game.read_text(encoding="utf-8").replace("CONTRACT_VERSION = 1", "CONTRACT_VERSION = 2"), encoding="utf-8")

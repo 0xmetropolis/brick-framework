@@ -1,4 +1,4 @@
-# BOILERPLATE: tape@1
+# BOILERPLATE: tape@2
 """Takes and the replay / fresh / record contract for this brick's source ports.
 
 Copy this file with the brick boilerplate. It has no dependency outside the
@@ -291,13 +291,19 @@ def once(
     return response, stamp()
 
 
-def session(run_context: dict[str, Any], source: str, name: str) -> "Session":
+def session(run_context: dict[str, Any], source: str, name: str, *, record: bool = True) -> "Session":
     """A chatty source as takes: one take per window, operations replayed in order.
 
     The runner closes any session still open when the run ends, so a failed run
     leaves no half-written window behind.
+
+    Whether a session records is the run's decision, made per port: it records when the plan
+    records its source. ``record=False`` can only turn that off for this one session, which then
+    goes fresh and writes nothing, so a run can record one session of a port and keep another
+    fresh. ``record=True``, the default, is accepted and means "as the plan says"; it never
+    turns recording on for a port the plan does not record.
     """
-    return Session(run_context, source, name)
+    return Session(run_context, source, name, record=record)
 
 
 class Session:
@@ -312,11 +318,20 @@ class Session:
     version, a build, a protocol). It is merged into every window's request, so a window
     recorded against another version is stale and the error names the field. After
     connecting in fresh or record, call ``verify(seen)``.
+
+    ``record=False`` keeps this session at fresh when the run records its port (see ``session``).
+    A session that opts out writes no take, so an existing take of that name, its epoch and its
+    label are left exactly as they were, and the run's ledger entry lists it under ``unrecorded``.
     """
 
-    def __init__(self, run_context: dict[str, Any], source: str, name: str) -> None:
+    def __init__(self, run_context: dict[str, Any], source: str, name: str, *, record: bool = True) -> None:
         port = _port(source)
-        self.mode = mode(run_context, source)
+        if not isinstance(record, bool):
+            raise TapeError("record must be True or False")
+        planned = mode(run_context, source)
+        self.mode = "fresh" if planned == "record" and not record else planned
+        if self.mode != planned:
+            run_context.setdefault("unrecorded", []).append(f"{source}.{name}")
         if self.mode != "replay" and not port.get("label"):
             raise TapeError(
                 f"a session on source {source!r} needs a label in PORTS to go fresh or record: "

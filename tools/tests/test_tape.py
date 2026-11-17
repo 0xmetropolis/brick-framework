@@ -348,6 +348,86 @@ class SessionTests(TapeCase):
             script.take("w0", {"label": {"x": 1}})
 
 
+class SessionRecordOptOutTests(TapeCase):
+    """``record=False`` can turn recording off for one session of a recording port; it can never turn it on."""
+
+    def play(self, context: dict, name: str, **options) -> tape.Session:
+        script = tape.session(context, "game", name, **options)
+        script.take("w0", {})
+        script.call("call", {}, lambda: {"n": name})
+        script.close()
+        return script
+
+    def takes(self) -> list[str]:
+        return sorted(path.stem for path in tape.TAPE_DIR.glob("game/*.json"))
+
+    def test_one_session_records_and_another_of_the_same_port_stays_fresh_in_one_run(self) -> None:
+        context = ctx(record=("game",))
+        kept = self.play(context, "main")
+        side = self.play(context, "side", record=False)
+        self.assertEqual((kept.mode, side.mode), ("record", "fresh"))
+        self.assertEqual(self.takes(), ["main-w0"])
+
+    def test_the_opted_out_session_still_answers_live_and_leaves_an_existing_take_untouched(self) -> None:
+        self.play(ctx(record=("game",)), "side")
+        path = tape.TAPE_DIR / "game/side-w0.json"
+        before = path.read_bytes()
+        context = ctx(record=("game",), run_id="run-3")
+        script = tape.session(context, "game", "side", record=False)
+        script.take("w0", {})
+        self.assertEqual(script.call("call", {}, lambda: {"n": "newer"}), {"n": "newer"})
+        script.close()
+        for closer in context["closers"]:
+            closer(False)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(json.loads(before)["epoch"], 3)
+
+    def test_it_still_needs_the_label_because_it_still_goes_to_the_source(self) -> None:
+        with mock.patch.object(tape, "PORTS", {**PORTS, "game": {"kind": "source", "epoch": 1}}):
+            with self.assertRaises(tape.TapeError) as caught:
+                tape.session(ctx(record=("game",)), "game", "side", record=False)
+        self.assertIn("needs a label in PORTS", str(caught.exception))
+
+    def test_verify_still_checks_the_source_for_an_opted_out_session(self) -> None:
+        script = tape.session(ctx(record=("game",)), "game", "side", record=False)
+        with self.assertRaises(tape.LabelMismatch):
+            script.verify({"game": "9.9"})
+
+    def test_a_downgrade_is_listed_for_the_ledger_and_nothing_else_is(self) -> None:
+        context = ctx(record=("game",))
+        tape.session(context, "game", "kept")
+        tape.session(context, "game", "side", record=False)
+        tape.session(context, "game", "again", record=True)
+        self.assertEqual(context["unrecorded"], ["game.side"])
+
+    def test_it_cannot_turn_recording_on_for_a_port_the_plan_does_not_record(self) -> None:
+        for plan, expected in (({}, "replay"), ({"fresh": ("game",)}, "fresh")):
+            for option in (True, False):
+                with self.subTest(plan=plan, record=option):
+                    context = ctx(**plan)
+                    script = tape.session(context, "game", "x", record=option)
+                    self.assertEqual(script.mode, expected)
+                    self.assertNotIn("unrecorded", context)
+
+    def test_record_true_is_accepted_and_means_as_the_plan_says(self) -> None:
+        explicit = self.play(ctx(record=("game",)), "a", record=True)
+        default = self.play(ctx(record=("game",)), "b")
+        self.assertEqual((explicit.mode, default.mode), ("record", "record"))
+        self.assertEqual(self.takes(), ["a-w0", "b-w0"])
+
+    def test_replay_of_an_opted_out_session_is_ordinary_replay(self) -> None:
+        self.play(ctx(record=("game",)), "main")
+        script = tape.session(ctx(), "game", "main", record=False)
+        script.take("w0", {})
+        self.assertEqual(script.call("call", {}, lambda: 1 / 0), {"n": "main"})
+
+    def test_record_must_be_a_bool(self) -> None:
+        for bad in (None, 0, 1, "no"):
+            with self.assertRaises(tape.TapeError) as caught:
+                tape.session(ctx(record=("game",)), "game", "x", record=bad)
+            self.assertIn("record must be True or False", str(caught.exception))
+
+
 class VerifyTests(TapeCase):
     def test_replay_connects_to_nothing_so_nothing_is_checked(self) -> None:
         tape.verify(ctx(), "game", {"game": "9.9"})
