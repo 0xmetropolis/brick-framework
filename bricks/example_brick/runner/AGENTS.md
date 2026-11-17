@@ -9,7 +9,7 @@ This folder owns orchestration, brick-local run identity, the run ledger, and sm
 - `run` accepts ordinary inputs plus keyword-only `fresh` and `record` options. Each takes `False`, `True` (every source port of this brick), or port names (`"rates"`, `"assistant.xai"`, `"*"`); `record` implies fresh for the same names, and an unknown name is an error.
 - `run` creates a run ID through `rng.py`, resolves configuration, turns `fresh` and `record` into the run's plan, builds a plain run context, calls `src/`, closes whatever the run left open, writes the ledger entry, and returns the result.
 - `run` passes its caller-supplied brick input unchanged into `src` with the run context.
-- `runner/` does not call input adapters directly and does not collect adapter-result references. Adapter calls and takes belong to `src/` and `input/`. The one thing it calls on their behalf is a close function an adapter registered in `run_context["closers"]` (a session), in a `finally`, so a failed run leaves no half-written window.
+- `runner/` does not call input adapters directly and does not collect adapter-result references. Adapter calls and takes belong to `src/` and `input/`. The one thing it calls on their behalf is a close function an adapter registered in `run_context["closers"]` (a session), in a `finally`, so a failed run leaves no half-written window. It calls each as `closer(failed, error)`: `failed` says whether the run failed, `error` is the exception that ended it (None when the run succeeded or was interrupted by something that is not an `Exception`), so a session can tell whether its own fetch caused the failure; a closer that raises never hides the run's own error.
 - Run identity and the plan are brick-local. They are not forwarded when an adapter invokes a sibling brick, except the part of the plan a joint follows, through `tape.follow`.
 - Do not expose adapters or `src/` functions to sibling bricks.
 
@@ -17,7 +17,7 @@ This folder owns orchestration, brick-local run identity, the run ledger, and sm
 
 - Write one ledger entry per run under `ledger/`, using its brick-local run ID.
 - A **tracked** entry (`<run id>.json`) is written only for a run that touched a source fresh or recorded, followed one fresh, or failed. Every other run, and every run with `BRICK_TEST=1`, writes a local `<run id>.local.json`: still bounded (its own retention), but gitignored by `ledger/.gitignore`, so replays and tests do not churn tracked history.
-- Each entry includes the run ID, the brick's own `fresh` and `record` sources, the `followed` sources passed down (`<joint>.<source>`), the input, the output or error, and the timestamp.
+- Each entry includes the run ID, the brick's own `fresh` and `record` sources, the `followed` sources passed down (`<joint>.<source>`), the input, the output or error, and the timestamp. When a session opted out of a recording its port was asked for (`tape.session(..., record=False)`), the entry also lists it under `unrecorded` (`<source>.<session>`), so it does not overstate what was recorded.
 - Takes recorded by an explicit record operation carry the same run ID (`recorded_in`) and can be joined outside the runner.
 - `run` may be called from several threads at once (an entry brick's threads calling one sibling). Writing and pruning must tolerate an entry another call already removed.
 - Retain only the configured number of recent entries (`retention.entries`), tracked and local separately. Prune after writing the new entry.

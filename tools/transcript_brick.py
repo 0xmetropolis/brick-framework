@@ -173,9 +173,14 @@ class Tracer:
                 tracer.suppress -= 1
 
         def session_call(self: Any, kind: str, request: Any, fetch: Any) -> Any:
-            response = real_call(self, kind, request, fetch)
             take = f"{self.name}-{self.window}"
-            tracer.source(brick, module, self.source, take, request, response, self.mode, f", session {self.name}, window {self.window}, {kind}")
+            detail = f", session {self.name}, window {self.window}, {kind}"
+            try:
+                response = real_call(self, kind, request, fetch)
+            except BaseException as exc:
+                tracer.source(brick, module, self.source, take, request, {"error": {"type": type(exc).__name__, "message": str(exc)}}, self.mode, detail + ", raised")
+                raise
+            tracer.source(brick, module, self.source, take, request, response, self.mode, detail)
             return response
 
         module.once, module.load = once, load

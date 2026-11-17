@@ -784,6 +784,55 @@ class TakeLintTests(Fixture):
         self.contract(brick, PORTS='{"example_source": {"kind": "source", "epoch": 1, "label": {"api": "v2"}}}')
         self.assertError("take label differs from port 'example_source' (api: recorded \"nothing\", port \"v2\")")
 
+    def transcript_take(self, brick: Path, transcript: object) -> Path:
+        return self.take(brick, "year-w0", response={"transcript": transcript})
+
+    def transcript_errors(self) -> list[str]:
+        return [e for e in self.errors() if "transcript" in e]
+
+    def test_a_session_take_whose_operations_succeeded_is_clean(self) -> None:
+        brick = self.brick()
+        self.transcript_take(brick, [{"op": "a", "request": {}, "response": {"x": 1}}, {"op": "b", "request": {}, "response": 2}])
+        self.assertClean()
+
+    def test_a_failed_session_take_may_end_with_the_operation_that_failed(self) -> None:
+        brick = self.brick()
+        self.transcript_take(brick, [{"op": "a", "request": {}, "response": 1}, {"op": "b", "request": {"i": 1}, "error": {"type": "OSError"}}])
+        self.assertClean()
+
+    def test_an_error_in_the_middle_of_a_session_take_is_an_error(self) -> None:
+        brick = self.brick()
+        self.transcript_take(brick, [{"op": "a", "request": {}, "error": {"type": "X"}}, {"op": "b", "request": {}, "response": 1}])
+        self.assertEqual(len(self.transcript_errors()), 1)
+        self.assertIn("transcript operation 1 carries an error but is not the last", self.transcript_errors()[0])
+
+    def test_an_operation_needs_an_op_a_request_and_exactly_one_of_response_or_error(self) -> None:
+        brick = self.brick()
+        for index, entry in enumerate((
+            {"request": {}, "response": 1},
+            {"op": "a", "response": 1},
+            {"op": "a", "request": {}},
+            {"op": "a", "request": {}, "response": 1, "error": {"type": "X"}},
+            "not an operation",
+        )):
+            with self.subTest(entry=entry):
+                self.transcript_take(brick, [entry])
+                self.assertEqual(len(self.transcript_errors()), 1, (index, self.transcript_errors()))
+                self.assertIn("transcript operation 1 needs an op, a request and exactly one of response or error", self.transcript_errors()[0])
+
+    def test_a_recorded_error_needs_a_type(self) -> None:
+        brick = self.brick()
+        for error in ("boom", {}, {"type": 3}):
+            with self.subTest(error=error):
+                self.transcript_take(brick, [{"op": "a", "request": {}, "error": error}])
+                self.assertIn("transcript operation 1 has an error without a type", self.transcript_errors()[0])
+
+    def test_a_response_that_is_not_a_transcript_is_not_checked(self) -> None:
+        brick = self.brick()
+        self.take(brick, "plain", response={"value": 1})
+        self.take(brick, "other", response={"transcript": "not a list"})
+        self.assertClean()
+
     def test_the_old_take_format_and_paths_say_what_the_new_ones_are(self) -> None:
         brick = self.brick()
         old = brick / "input/data/example_source"
@@ -887,29 +936,31 @@ class BoilerplateVersionTests(Fixture):
         self.assertClean()
 
     def test_a_brick_upgraded_ahead_of_the_others_is_not_blamed_whichever_sorts_first(self) -> None:
+        current = lint_bricks.BOILERPLATE["tape"][1]
         for upgraded, stale in (("a", "b"), ("b", "a")):
             with self.subTest(upgraded=upgraded):
                 shutil.rmtree(self.root / "bricks", ignore_errors=True)
                 (self.root / "bricks").mkdir()
                 shutil.copy(ROOT / "bricks/AGENTS.md", self.root / "bricks/AGENTS.md")
                 shutil.copy(ROOT / "bricks/__init__.py", self.root / "bricks/__init__.py")
-                self.mark(self.brick(upgraded), "tape", 2)
+                self.mark(self.brick(upgraded), "tape", current + 1)
                 self.brick(stale)
-                with self.framework_at(tape=2):
+                with self.framework_at(tape=current + 1):
                     warnings = self.boilerplate_warnings()
                 self.assertEqual(
                     warnings,
-                    [f"bricks/{stale}/input/tape.py: boilerplate 'tape' is at @1, behind the framework's @2; copy input/tape.py from bricks/example_brick"],
+                    [f"bricks/{stale}/input/tape.py: boilerplate 'tape' is at @{current}, behind the framework's @{current + 1}; copy input/tape.py from bricks/example_brick"],
                 )
 
     def test_copies_that_are_all_equally_stale_still_warn(self) -> None:
+        tape, run = lint_bricks.BOILERPLATE["tape"][1], lint_bricks.BOILERPLATE["runner.run"][1]
         self.brick("a")
         self.brick("b")
-        with self.framework_at(tape=2, **{"runner.run": 6}):
+        with self.framework_at(tape=tape + 1, **{"runner.run": run + 1}):
             warnings = self.boilerplate_warnings()
         self.assertEqual(len(warnings), 4)
         self.assertTrue(all("behind the framework's" in w for w in warnings))
-        self.assertTrue(any("bricks/a/runner/run.py: boilerplate 'runner.run' is at @5, behind the framework's @6" in w for w in warnings))
+        self.assertTrue(any(f"bricks/a/runner/run.py: boilerplate 'runner.run' is at @{run}, behind the framework's @{run + 1}" in w for w in warnings))
         self.assertEqual(self.errors(), [])
 
     def test_a_copy_newer_than_the_framework_says_the_framework_is_the_older_one(self) -> None:

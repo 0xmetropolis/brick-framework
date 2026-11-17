@@ -152,12 +152,32 @@ class RunnerTests(unittest.TestCase):
         (record,) = self.records()
         self.assertEqual((record["fresh"], record["record"], record["followed"]), (["rates"], ["rates"], ["model.xai"]))
 
+    def test_sessions_that_opted_out_of_a_recording_are_listed_in_the_entry_once_and_sorted(self) -> None:
+        def execute(inputs, context):
+            context["unrecorded"] = ["game.side", "game.again", "game.side"]
+            if inputs.get("boom"):
+                raise ValueError("boom")
+            return {}
+
+        self.module.execute = execute
+        self.module.run({}, fresh=True)
+        with self.assertRaises(ValueError):
+            self.module.run({"boom": True})
+        succeeded, failed = self.records()
+        self.assertEqual(succeeded["unrecorded"], ["game.again", "game.side"])
+        self.assertEqual(failed["unrecorded"], ["game.again", "game.side"])
+
+    def test_an_entry_has_no_unrecorded_field_when_no_session_opted_out(self) -> None:
+        self.module.run({}, fresh=True)
+        (entry,) = self.records()
+        self.assertNotIn("unrecorded", entry)
+
     def test_the_run_closes_what_the_context_registered_even_when_it_fails(self) -> None:
         closed = []
 
         def execute(inputs, context):
-            context["closers"].append(lambda failed: closed.append(("a", failed)))
-            context["closers"].append(lambda failed: closed.append(("b", failed)))
+            context["closers"].append(lambda failed, error: closed.append(("a", failed, type(error).__name__)))
+            context["closers"].append(lambda failed, error: closed.append(("b", failed, type(error).__name__)))
             if inputs.get("boom"):
                 raise ValueError("boom")
             return {}
@@ -166,15 +186,42 @@ class RunnerTests(unittest.TestCase):
         self.module.run({})
         with self.assertRaises(ValueError):
             self.module.run({"boom": True})
-        self.assertEqual(closed, [("b", False), ("a", False), ("b", True), ("a", True)])
+        self.assertEqual(
+            closed,
+            [("b", False, "NoneType"), ("a", False, "NoneType"), ("b", True, "ValueError"), ("a", True, "ValueError")],
+        )
+
+    def test_a_closer_gets_the_very_exception_that_ended_the_run(self) -> None:
+        seen = []
+
+        def execute(inputs, context):
+            context["closers"].append(lambda failed, error: seen.append(error))
+            raise ValueError("the one")
+
+        self.module.execute = execute
+        with self.assertRaises(ValueError) as caught:
+            self.module.run({})
+        self.assertIs(seen[0], caught.exception)
+
+    def test_a_closer_gets_no_error_when_the_run_was_interrupted(self) -> None:
+        seen = []
+
+        def execute(inputs, context):
+            context["closers"].append(lambda failed, error: seen.append((failed, error)))
+            raise KeyboardInterrupt
+
+        self.module.execute = execute
+        with self.assertRaises(KeyboardInterrupt):
+            self.module.run({})
+        self.assertEqual(seen, [(True, None)])
 
     def test_a_failing_close_is_reported_and_does_not_stop_the_others(self) -> None:
         closed = []
 
         def execute(inputs, context):
-            context["closers"].append(lambda failed: closed.append("first"))
+            context["closers"].append(lambda failed, error: closed.append("first"))
 
-            def bad(failed):
+            def bad(failed, error):
                 raise OSError("disk full")
 
             context["closers"].append(bad)
@@ -189,7 +236,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_a_failure_hides_nothing_when_a_close_fails_too(self) -> None:
         def execute(inputs, context):
-            def bad(failed):
+            def bad(failed, error):
                 raise OSError("disk full")
 
             context["closers"].append(bad)
