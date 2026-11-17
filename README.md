@@ -176,7 +176,8 @@ It prints Mermaid (which GitHub renders in a Markdown file) by default, or Graph
 - Every source port is a cylinder with its epoch, its label (as sorted `key=value` pairs) and `followable` when it is.
 - A joint is an arrow to the sibling labelled with its policy and pin: solid for `orchestrated`, dashed for `eventual`.
 - A follow is a thick arrow from the brick to each source its joint follows.
-- Bricks that no sibling depends on get a thicker border: those are the top-level flows. A joint to a brick that does not exist is drawn as a dashed `missing` box.
+- Bricks that no sibling depends on get a thicker border (`stroke-width` in Mermaid, `penwidth=3` in DOT): those are the top-level flows. A joint to a brick that does not exist is drawn as a dashed `missing` box.
+- **A legend** closes every diagram, in both formats: a `Legend` subgraph (Mermaid) or cluster (DOT) drawn with the very same node shapes, arrows and styles, explaining the shape line (`sealed`, `entry`, `open`), the owned-state and `nondeterministic` lines, the source cylinder with `epoch N`, `label k=v` and `followable`, the plain arrow that joins a brick to its source, the solid (`orchestrated`) and dashed (`eventual`) joint arrows with their pin, the thick `follows` arrow, the thick border, and the dashed `missing` box. The legend lists exactly what the renderers use and is the same for every project; a test extracts every node shape, arrow, class and attribute from the diagram and from the legend and fails if the two sets differ.
 
 Names and labels are escaped for Mermaid, and ids are prefixed and cleaned, so a brick called `end` or `a-b.c` cannot break the diagram.
 
