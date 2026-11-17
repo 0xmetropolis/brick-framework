@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import brick_contract, lint_bricks
 
@@ -50,6 +52,11 @@ class Fixture(unittest.TestCase):
                 lines.append(f"{name} = {value}\n")
             text = "".join(lines)
         path.write_text(text, encoding="utf-8")
+
+    def example(self) -> Path:
+        """The template brick under its own name, created on first use and reused after."""
+        existing = self.root / "bricks/example_brick"
+        return existing if existing.is_dir() else self.brick()
 
     def declare(self, brick: Path, name: str, kind: str = "source", **fields: object) -> None:
         """Add one port to the brick's PORTS (or replace it)."""
@@ -833,32 +840,605 @@ class LedgerTests(Fixture):
         self.assertIn("*.local.json", (ROOT / "bricks/example_brick/runner/ledger/.gitignore").read_text(encoding="utf-8"))
 
 
-class CopyDriftTests(Fixture):
-    def marked(self, brick: Path, name: str, version: int, body: str = "x = 1\n") -> Path:
-        path = brick / "input" / f"{name}.py"
-        path.write_text(f"# BOILERPLATE: {name}@{version}\n{body}", encoding="utf-8")
-        return path
+class CopiesAreNotComparedTests(Fixture):
+    """What is inside one brick's files is not compared with another brick's: the framework has no check between bricks."""
 
-    def test_identical_copies_are_clean(self) -> None:
-        self.marked(self.brick("a"), "shared", 1)
-        self.marked(self.brick("b"), "shared", 1)
+    def test_the_same_file_differing_between_bricks_is_clean_even_when_marked(self) -> None:
+        for name, body in (("a", "x = 1\n"), ("b", "x = 2\n")):
+            (self.brick(name) / "src/helpers.py").write_text(f"# BOILERPLATE: shared@1\n{body}", encoding="utf-8")
         self.assertClean()
 
-    def test_same_version_with_different_content_warns(self) -> None:
-        self.marked(self.brick("a"), "shared", 1)
-        self.marked(self.brick("b"), "shared", 1, "x = 2\n")
-        self.assertTrue(any("copy of 'shared'@1 differs" in w for w in self.warnings()))
+
+class BoilerplateVersionTests(Fixture):
+    """Each brick's template files are compared with the framework's version table, never with each other."""
+
+    def framework_at(self, **versions: int):
+        table = {name: (path, versions.get(name, version)) for name, (path, version) in lint_bricks.BOILERPLATE.items()}
+        return mock.patch.dict(lint_bricks.BOILERPLATE, table)
+
+    def mark(self, brick: Path, name: str, version: int) -> None:
+        path = brick / lint_bricks.BOILERPLATE[name][0]
+        text = path.read_text(encoding="utf-8")
+        path.write_text(re.sub(rf"(# BOILERPLATE: {re.escape(name)})@\d+", rf"\g<1>@{version}", text, count=1), encoding="utf-8")
+
+    def boilerplate_warnings(self) -> list[str]:
+        return [w for w in self.warnings() if "boilerplate" in w]
+
+    def test_the_table_matches_the_templates_markers_exactly(self) -> None:
+        found = {}
+        for path in sorted((ROOT / "bricks/example_brick").rglob("*.py")):
+            for line in path.read_text(encoding="utf-8").splitlines()[:5]:
+                match = lint_bricks.BOILERPLATE_MARKER.match(line.strip())
+                if match:
+                    found[match.group(1)] = (path.relative_to(ROOT / "bricks/example_brick").as_posix(), int(match.group(2)))
+        self.assertEqual(found, lint_bricks.BOILERPLATE)
+
+    def test_a_brick_at_the_frameworks_version_is_clean(self) -> None:
+        self.brick("a")
+        self.brick("b")
+        self.assertClean()
+
+    def test_editing_one_bricks_copy_does_not_make_another_brick_warn(self) -> None:
+        first, second = self.brick("a"), self.brick("b")
+        for brick in (first, second):
+            path = brick / "input/tape.py"
+            path.write_text(path.read_text(encoding="utf-8") + f"\n# local change in {brick.name}\n", encoding="utf-8")
+        (first / "runner/run.py").write_text((first / "runner/run.py").read_text(encoding="utf-8") + "\n# more\n", encoding="utf-8")
+        self.assertClean()
+
+    def test_a_brick_upgraded_ahead_of_the_others_is_not_blamed_whichever_sorts_first(self) -> None:
+        for upgraded, stale in (("a", "b"), ("b", "a")):
+            with self.subTest(upgraded=upgraded):
+                shutil.rmtree(self.root / "bricks", ignore_errors=True)
+                (self.root / "bricks").mkdir()
+                shutil.copy(ROOT / "bricks/AGENTS.md", self.root / "bricks/AGENTS.md")
+                shutil.copy(ROOT / "bricks/__init__.py", self.root / "bricks/__init__.py")
+                self.mark(self.brick(upgraded), "tape", 2)
+                self.brick(stale)
+                with self.framework_at(tape=2):
+                    warnings = self.boilerplate_warnings()
+                self.assertEqual(
+                    warnings,
+                    [f"bricks/{stale}/input/tape.py: boilerplate 'tape' is at @1, behind the framework's @2; copy input/tape.py from bricks/example_brick"],
+                )
+
+    def test_copies_that_are_all_equally_stale_still_warn(self) -> None:
+        self.brick("a")
+        self.brick("b")
+        with self.framework_at(tape=2, **{"runner.run": 6}):
+            warnings = self.boilerplate_warnings()
+        self.assertEqual(len(warnings), 4)
+        self.assertTrue(all("behind the framework's" in w for w in warnings))
+        self.assertTrue(any("bricks/a/runner/run.py: boilerplate 'runner.run' is at @5, behind the framework's @6" in w for w in warnings))
         self.assertEqual(self.errors(), [])
 
-    def test_different_versions_name_the_older_copy(self) -> None:
-        self.marked(self.brick("a"), "shared", 2)
-        self.marked(self.brick("b"), "shared", 1, "x = 2\n")
-        self.assertTrue(any("bricks/b/input/shared.py: copy of 'shared' is at @1" in w for w in self.warnings()))
+    def test_a_copy_newer_than_the_framework_says_the_framework_is_the_older_one(self) -> None:
+        self.mark(self.brick("a"), "runner.rng", 9)
+        self.assertEqual(
+            self.boilerplate_warnings(),
+            ["bricks/a/runner/rng.py: boilerplate 'runner.rng' is at @9, newer than the @1 this framework knows; update the framework's tools"],
+        )
 
-    def test_unmarked_files_are_not_compared(self) -> None:
-        (self.brick("a") / "input/loose.py").write_text("x = 1\n", encoding="utf-8")
-        (self.brick("b") / "input/loose.py").write_text("x = 2\n", encoding="utf-8")
+    def test_only_the_framework_boilerplate_ids_at_their_own_paths_are_checked(self) -> None:
+        brick = self.brick("a")
+        (brick / "src/helpers.py").write_text("# BOILERPLATE: tape@0\nx = 1\n", encoding="utf-8")
+        (brick / "src/other.py").write_text("# BOILERPLATE: mine@0\nx = 1\n", encoding="utf-8")
+        rng = brick / "runner/rng.py"
+        rng.write_text(rng.read_text(encoding="utf-8").replace("runner.rng@1", "my.rng@0"), encoding="utf-8")
         self.assertClean()
+
+    def test_a_file_without_a_marker_or_a_sealed_brick_without_the_file_is_not_the_frameworks_to_check(self) -> None:
+        brick = self.brick("a")
+        run = brick / "runner/run.py"
+        run.write_text("".join(run.read_text(encoding="utf-8").splitlines(keepends=True)[1:]), encoding="utf-8")
+        self.sealed_brick("b")
+        self.assertClean()
+
+    def test_a_marker_beyond_the_first_lines_is_not_read(self) -> None:
+        brick = self.brick("a")
+        rng = brick / "runner/rng.py"
+        rng.write_text("\n" * 6 + rng.read_text(encoding="utf-8"), encoding="utf-8")
+        with self.framework_at(**{"runner.rng": 3}):
+            self.assertEqual(self.boilerplate_warnings(), [])
+
+    def test_the_marker_is_for_the_framework_not_a_lint_between_bricks(self) -> None:
+        self.assertFalse(hasattr(lint_bricks, "lint_copies"))
+
+
+class SiblingImportFormTests(Fixture):
+    """Every way of writing an import that reaches another brick is the same crossing."""
+
+    FORMS = {
+        "import bricks.other.src.logic": "import bricks.other.src.logic\n",
+        "from bricks.other import run": "from bricks.other import run\n",
+        "from bricks import other": "from bricks import other\n",
+        "from bricks.other.src import logic": "from bricks.other.src import logic\n",
+    }
+
+    def test_all_four_forms_are_errors_in_src(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        for index, (name, line) in enumerate(self.FORMS.items()):
+            with self.subTest(form=name):
+                (brick / "src" / f"form{index}.py").write_text(line, encoding="utf-8")
+                self.assertError(f"form{index}.py: only an input adapter may import a sibling brick")
+
+    def test_all_four_forms_are_caught_in_the_runner_and_the_main_too(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        for index, line in enumerate(self.FORMS.values()):
+            (brick / "runner" / f"form{index}.py").write_text(line, encoding="utf-8")
+        errors = [e for e in self.errors() if "only an input adapter may import a sibling brick" in e]
+        self.assertEqual(len(errors), 4, errors)
+
+    def test_in_an_adapter_only_the_run_form_is_allowed(self) -> None:
+        self.brick("other")
+        for index, (name, line) in enumerate(self.FORMS.items()):
+            with self.subTest(form=name):
+                brick = self.brick(f"b{index}")
+                self.adapter(brick, "other", line + "\n\ndef fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
+                errors = [e for e in self.errors() if f"bricks/b{index}/" in e and "sibling adapter may import only run" in e]
+                self.assertEqual(len(errors), 0 if name == "from bricks.other import run" else 1, errors)
+
+    def test_from_bricks_import_names_each_sibling_it_reaches(self) -> None:
+        self.brick("other")
+        self.brick("third")
+        brick = self.brick()
+        (brick / "src/many.py").write_text("from bricks import other as o, third\n", encoding="utf-8")
+        errors = [e for e in self.errors() if "many.py: only an input adapter may import a sibling brick" in e]
+        self.assertEqual(len(errors), 2, errors)
+
+    def test_from_bricks_import_of_a_joint_in_an_adapter_is_a_missing_declaration_not_a_free_pass(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "link", "from bricks import other\n\n\ndef fetch(request, ctx):\n    return request\n")
+        self.assertError("joint 'other' is not declared in PORTS")
+
+    def test_a_brick_may_name_itself(self) -> None:
+        brick = self.brick()
+        (brick / "src/me.py").write_text("from bricks import example_brick\nimport bricks.example_brick.contract as contract\n", encoding="utf-8")
+        self.assertEqual([e for e in self.errors() if "me.py" in e], [])
+
+    def test_a_declared_joint_imported_the_new_way_counts_as_imported(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        self.adapter(brick, "other", "from bricks import other\n\n\ndef fetch(request, ctx):\n    return request\n", "joint", policy="eventual", pin=1)
+        self.assertFalse([w for w in self.warnings() if "has no static adapter import" in w])
+
+
+class BricksPackageBindingTests(Fixture):
+    """Binding the ``bricks`` package itself reaches every sibling by attribute, so it is refused."""
+
+    MESSAGE = "binds the bricks package itself, which reaches every sibling by attribute"
+
+    def test_every_form_that_binds_the_package_is_an_error_in_src(self) -> None:
+        brick = self.brick()
+        forms = {
+            "import bricks": "bare",
+            "import bricks as b": "alias",
+            "import os, bricks": "second",
+            "import bricks.example_brick.contract": "own",
+            "import bricks.example_brick": "ownpkg",
+        }
+        for line, name in forms.items():
+            with self.subTest(form=line):
+                (brick / "src" / f"bind_{name}.py").write_text(line + "\n", encoding="utf-8")
+                self.assertTrue(
+                    any(f"bind_{name}.py:" in e and self.MESSAGE in e for e in self.errors()), (line, self.errors())
+                )
+
+    def test_the_alias_does_not_hide_it_and_use_of_the_name_is_not_needed_to_flag_it(self) -> None:
+        brick = self.brick("chat")
+        self.brick("assistant")
+        (brick / "src/reach.py").write_text("import bricks as b\n\n\ndef go():\n    return b.assistant.run({})\n", encoding="utf-8")
+        errors = [e for e in self.errors() if "reach.py" in e]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("'bricks' binds the bricks package itself", errors[0])
+
+    def test_forms_that_bind_a_submodule_or_a_name_are_not_this_rule(self) -> None:
+        brick = self.brick()
+        (brick / "src/ok.py").write_text(
+            "import bricks.example_brick.contract as c\nimport bricks.example_brick as me\n"
+            "from bricks import example_brick\nfrom bricks.example_brick import contract\n",
+            encoding="utf-8",
+        )
+        self.assertEqual([e for e in self.errors() if "ok.py" in e], [])
+
+    def test_a_sibling_in_the_path_is_reported_by_the_sibling_rule_not_this_one(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        (brick / "src/sib.py").write_text("import bricks.other.src.logic\n", encoding="utf-8")
+        errors = [e for e in self.errors() if "sib.py" in e]
+        self.assertEqual(len([e for e in errors if "only an input adapter may import a sibling brick" in e]), 1)
+        self.assertFalse([e for e in errors if self.MESSAGE in e])
+
+    def test_it_is_an_error_in_an_adapter_the_runner_and_a_sealed_brick_too(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/example_source.py").write_text(
+            "import bricks\n" + (brick / "input/adapters/example_source.py").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (brick / "runner/helper.py").write_text("import bricks as b\n", encoding="utf-8")
+        (self.sealed_brick("calc") / "src/x.py").write_text("import bricks\n", encoding="utf-8")
+        errors = [e for e in self.errors() if self.MESSAGE in e]
+        self.assertEqual(sorted(e.split(":")[0] for e in errors), [
+            "bricks/calc/src/x.py", "bricks/example_brick/input/adapters/example_source.py", "bricks/example_brick/runner/helper.py",
+        ])
+
+    def test_smoke_tests_and_main_keep_their_own_narrower_rules(self) -> None:
+        brick = self.brick()
+        (brick / "__main__.py").write_text("import bricks\n", encoding="utf-8")
+        tests = brick / "runner/tests"
+        tests.mkdir()
+        (tests / "__init__.py").write_text("", encoding="utf-8")
+        (tests / "test_smoke.py").write_text("import bricks\n", encoding="utf-8")
+        errors = self.errors()
+        self.assertFalse([e for e in errors if self.MESSAGE in e], errors)
+        self.assertTrue(any("__main__.py: __main__ may import only this brick's run" in e for e in errors))
+        self.assertTrue(any("smoke test must use from bricks.<name> import run" in e for e in errors))
+
+    def test_dynamic_ways_to_name_a_sibling_by_string_are_already_banned_in_src(self) -> None:
+        brick = self.brick()
+        forms = {
+            "importlib": "import importlib\nimportlib.import_module('bricks.other')\n",
+            "fromimportlib": "from importlib import import_module\nimport_module('bricks.other')\n",
+            "dunder": "__import__('bricks.other')\n",
+            "builtins": "import builtins\nbuiltins.__import__('bricks.other')\n",
+            "eval": "eval('__import__(\"bricks.other\")')\n",
+            "modules": "import sys\nsys.modules['bricks.other']\n",
+        }
+        for name, text in forms.items():
+            with self.subTest(form=name):
+                (brick / "src" / f"dyn_{name}.py").write_text(text, encoding="utf-8")
+                self.assertTrue([e for e in self.errors() if f"dyn_{name}.py" in e])
+
+
+class RepoCodeOutsideBricksTests(Fixture):
+    """``src/`` may not import code from elsewhere in the repository: a brick's code lives in the brick."""
+
+    MESSAGE = "code in this repository outside bricks/; a brick's code lives in the brick, and code shared by several bricks is a sealed brick reached over a joint"
+
+    def repo_package(self, name: str = "helpers") -> None:
+        (self.root / name).mkdir()
+        (self.root / name / "__init__.py").write_text("", encoding="utf-8")
+        (self.root / name / "answer.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
+
+    def src(self, brick: Path, text: str, name: str = "helpers_user.py") -> None:
+        (brick / "src" / name).write_text(text, encoding="utf-8")
+
+    def test_every_import_form_of_a_repo_package_is_an_error_in_src(self) -> None:
+        self.repo_package()
+        brick = self.brick()
+        for index, line in enumerate((
+            "import helpers",
+            "import helpers.answer",
+            "from helpers import answer",
+            "from helpers.answer import parse",
+            "import helpers.answer as a",
+        )):
+            with self.subTest(line=line):
+                self.src(brick, line + "\n", f"user{index}.py")
+                self.assertError(f"user{index}.py: src imports 'helpers' (helpers/), {self.MESSAGE}")
+
+    def test_a_top_level_file_in_the_repo_is_caught_too(self) -> None:
+        (self.root / "shared.py").write_text("X = 1\n", encoding="utf-8")
+        self.src(self.brick(), "from shared import X\n")
+        self.assertError(f"src imports 'shared' (shared.py), {self.MESSAGE}")
+
+    def test_a_folder_of_python_files_without_an_init_is_caught(self) -> None:
+        (self.root / "lib/deep").mkdir(parents=True)
+        (self.root / "lib/deep/x.py").write_text("", encoding="utf-8")
+        self.src(self.brick(), "import lib\n")
+        self.assertError(f"src imports 'lib' (lib/), {self.MESSAGE}")
+
+    def test_it_is_an_error_in_a_sealed_brick_too(self) -> None:
+        self.repo_package()
+        self.src(self.sealed_brick(), "from helpers.answer import parse\n")
+        self.assertError(f"src imports 'helpers' (helpers/), {self.MESSAGE}")
+
+    def test_a_helper_that_does_io_is_not_a_way_around_the_bans(self) -> None:
+        (self.root / "helpers").mkdir()
+        (self.root / "helpers/__init__.py").write_text("", encoding="utf-8")
+        (self.root / "helpers/shared.py").write_text("import os, socket\nfrom bricks.example_brick.src import logic\n", encoding="utf-8")
+        brick = self.sealed_brick()
+        (brick / "src/logic.py").write_text("from helpers.shared import peek\n\n\ndef execute(inputs, ctx):\n    return {}\n", encoding="utf-8")
+        self.assertError("src imports 'helpers'")
+
+    def test_the_brick_own_files_by_relative_import_are_fine_even_when_the_name_is_a_repo_folder(self) -> None:
+        self.repo_package()
+        brick = self.brick()
+        (brick / "src/helpers.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
+        self.src(brick, "from .helpers import parse\nfrom . import helpers\nfrom .. import contract\n")
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+
+    def test_the_standard_library_a_folder_without_python_and_an_installed_package_are_fine(self) -> None:
+        (self.root / "docs").mkdir()
+        (self.root / "docs/readme.md").write_text("notes\n", encoding="utf-8")
+        (self.root / "json").mkdir()
+        (self.root / "json/__init__.py").write_text("", encoding="utf-8")
+        brick = self.brick()
+        self.src(brick, "import json\nimport docs\nimport numpy\nfrom collections import OrderedDict\n")
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+
+    def test_bricks_itself_is_the_siblings_rule_not_this_one(self) -> None:
+        self.brick("other")
+        self.src(self.brick(), "import bricks.other.src.logic\n")
+        errors = self.errors()
+        self.assertTrue(any("only an input adapter may import a sibling brick" in e for e in errors))
+        self.assertEqual([e for e in errors if "outside bricks/" in e], [])
+
+    def test_adapters_are_left_as_they_were(self) -> None:
+        self.repo_package()
+        brick = self.brick()
+        (brick / "input/adapters/example_source.py").write_text(
+            "from helpers.answer import parse\nfrom ..tape import once\n\n\n"
+            "def fetch(request, ctx, *, take='default'):\n    return once(ctx, 'example_source', take, request, lambda: parse(request))[0]\n",
+            encoding="utf-8",
+        )
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+
+    def test_a_repo_module_is_found_from_the_root_being_linted_not_from_where_the_tool_lives(self) -> None:
+        brick = self.brick()
+        self.src(brick, "import helpers\n")
+        self.assertEqual([e for e in self.errors() if "outside bricks/" in e], [])
+        self.repo_package()
+        self.assertTrue([e for e in self.errors() if "outside bricks/" in e])
+
+    def test_repo_module_says_what_it_resolves_to(self) -> None:
+        self.repo_package()
+        (self.root / "shared.py").write_text("", encoding="utf-8")
+        self.assertEqual(lint_bricks.repo_module(self.root, "helpers"), self.root / "helpers")
+        self.assertEqual(lint_bricks.repo_module(self.root, "shared"), self.root / "shared.py")
+        for name in ("bricks", "json", "numpy", "nothing"):
+            self.assertIsNone(lint_bricks.repo_module(self.root, name), name)
+
+
+class NestedRepoCodeTests(Fixture):
+    """Where in the repository code outside bricks/ is found: the root, and one level into a folder that is not a package."""
+
+    def put(self, relative: str, text: str = "") -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def outside(self, line: str) -> list[str]:
+        brick = self.example()
+        (brick / "src/probe.py").write_text(line + "\n", encoding="utf-8")
+        return [e for e in self.errors() if "probe.py" in e and "outside bricks/" in e]
+
+    def test_a_package_inside_a_folder_that_is_not_a_package_is_found(self) -> None:
+        self.put("lib/shared/__init__.py")
+        self.assertEqual(len(self.outside("import shared")), 1)
+        self.assertIn("src imports 'shared' (lib/shared/), code in this repository outside bricks/", self.outside("from shared.sub import x")[0])
+
+    def test_a_module_file_inside_such_a_folder_is_found(self) -> None:
+        self.put("lib/util.py")
+        self.assertIn("src imports 'util' (lib/util.py)", self.outside("import util")[0])
+        self.assertTrue(self.outside("from util import x"))
+
+    def test_the_conventional_src_layout_is_found(self) -> None:
+        self.put("src/mypkg/__init__.py")
+        self.assertIn("(src/mypkg/)", self.outside("import mypkg")[0])
+
+    def test_dotted_imports_of_a_root_folder_are_found_whatever_the_submodule(self) -> None:
+        self.put("lib/util.py")
+        self.put("pkg/__init__.py")
+        self.put("pkg/sub/__init__.py")
+        self.assertTrue(self.outside("import lib.util"))
+        self.assertTrue(self.outside("import lib.not_there"))
+        self.assertTrue(self.outside("from pkg.sub import x"))
+        self.assertTrue(self.outside("from pkg import sub"))
+
+    def test_a_package_inside_a_package_is_that_packages_submodule_not_a_top_level_name(self) -> None:
+        self.put("pkg/__init__.py")
+        self.put("pkg/sub/__init__.py")
+        self.assertEqual(self.outside("import sub"), [])
+        self.assertTrue(self.outside("import pkg.sub"))
+
+    EXTENSIONS = (
+        "ext1.so",
+        "ext2.cpython-310-x86_64-linux-gnu.so",
+        "ext3.cpython-313-darwin.so",
+        "ext4.cp311-win_amd64.pyd",
+        "ext5.abi3.so",
+        "ext6.pypy39-pp73-x86_64-linux-gnu.so",
+        "ext7.cp312-win32.pyd",
+        "ext8.pyd",
+    )
+
+    def test_extension_modules_of_any_python_version_or_platform_are_found(self) -> None:
+        for filename in self.EXTENSIONS:
+            self.put(filename)
+        for filename in self.EXTENSIONS:
+            name = filename.split(".")[0]
+            with self.subTest(filename=filename):
+                found = self.outside(f"import {name}")
+                self.assertEqual(len(found), 1, found)
+                self.assertIn(f"({filename})", found[0])
+
+    def test_extension_modules_are_found_one_folder_down_too(self) -> None:
+        self.put("lib/nested.cp311-win_amd64.pyd")
+        self.put("lib/nested2.abi3.so")
+        self.assertTrue(self.outside("import nested"))
+        self.assertTrue(self.outside("import nested2"))
+
+    def test_compiled_and_windowed_python_files_are_found(self) -> None:
+        self.put("lib/slow.pyc")
+        self.put("lib/windowed.pyw")
+        self.assertTrue(self.outside("import slow"))
+        self.assertTrue(self.outside("import windowed"))
+
+    def test_module_names_do_not_depend_on_the_running_interpreter(self) -> None:
+        names = {
+            "fast.so": "fast",
+            "fast.cpython-39-x86_64-linux-gnu.so": "fast",
+            "fast.cpython-314t-aarch64-linux-gnu.so": "fast",
+            "fast.abi3.so": "fast",
+            "fast.cp38-win32.pyd": "fast",
+            "fast.pyd": "fast",
+            "util.py": "util",
+            "util.pyc": "util",
+        }
+        for filename, expected in names.items():
+            with self.subTest(filename=filename):
+                self.put(f"probe/{filename}")
+                self.assertEqual(lint_bricks.module_name_of(self.root / "probe" / filename), expected)
+
+    def test_files_that_only_look_like_extension_modules_are_not_found(self) -> None:
+        for filename in ("libx.so.1", "data.so.bak", "thing.sox", "dash-ed.so", "dash-ed.cp311-win_amd64.pyd", "notes.txt", "twice.py.bak", "x.pyd.old"):
+            self.put(f"probe/{filename}")
+            self.assertIsNone(lint_bricks.module_name_of(self.root / "probe" / filename), filename)
+        self.put(".hidden.so")
+        self.assertIsNone(lint_bricks.module_name_of(self.root / ".hidden.so"))
+
+    def test_the_root_wins_over_a_nested_place_and_both_are_reported_by_their_real_path(self) -> None:
+        self.put("lib/thing.py")
+        self.put("thing.py")
+        self.assertIn("(thing.py)", self.outside("import thing")[0])
+
+    def test_hidden_vendored_and_non_importable_folders_are_not_repository_code(self) -> None:
+        for relative in (".venv/lib/hidden.py", "node_modules/vendored.py", "venv/env.py", "build/built.py", "lib/dash-ed.py", "lib/.cache/inner.py"):
+            self.put(relative)
+        for name in ("hidden", "vendored", "env", "built", "inner"):
+            self.assertEqual(self.outside(f"import {name}"), [], name)
+        self.assertIsNone(lint_bricks.module_name_of(self.root / "lib/dash-ed.py"))
+
+    def test_a_folder_without_python_is_not_importable_code(self) -> None:
+        self.put("docs/notes.md", "notes\n")
+        self.put("lib/data/readme.txt", "x\n")
+        self.assertEqual(self.outside("import docs"), [])
+        self.assertEqual(self.outside("import data"), [])
+
+    def test_what_is_not_seen_is_pinned_so_the_documented_limits_stay_true(self) -> None:
+        self.put("a/b/deep/__init__.py")
+        self.put("json/__init__.py")
+        self.assertEqual(self.outside("import deep"), [], "two levels below a root folder is not looked at")
+        self.assertEqual(self.outside("import json"), [], "a repository file that shadows the standard library is not seen")
+        self.assertEqual(self.outside("import numpy"), [], "an installed package is not seen")
+
+    def test_the_index_is_read_once_per_run(self) -> None:
+        self.put("lib/util.py")
+        lint = lint_bricks.Lint(self.root)
+        self.assertEqual(lint.repo_module("util"), self.root / "lib/util.py")
+        (self.root / "lib/util.py").unlink()
+        self.assertEqual(lint.repo_module("util"), self.root / "lib/util.py")
+        self.assertIsNone(lint_bricks.repo_module(self.root, "util"))
+
+
+class RelativeImportsClimbingOutTests(Fixture):
+    """A relative import may climb as far as the brick's own package and no further, from any file in the brick."""
+
+    def test_the_allowed_depth_depends_on_where_the_file_is(self) -> None:
+        brick = self.brick()
+        (brick / "src/sub").mkdir()
+        cases = {
+            "extra.py": 1,
+            "src/x.py": 2,
+            "src/sub/x.py": 3,
+            "input/helper.py": 2,
+            "runner/x.py": 2,
+        }
+        for relative, allowed in cases.items():
+            for dots, fails in ((allowed, False), (allowed + 1, True), (allowed + 2, True)):
+                with self.subTest(file=relative, dots=dots):
+                    (brick / relative).write_text(f"from {'.' * dots} import something\n", encoding="utf-8")
+                    hits = [e for e in self.errors() if relative in e and "relative import may not escape the brick" in e]
+                    self.assertEqual(bool(hits), fails, hits)
+
+    def test_a_named_sibling_through_dots_is_caught_the_same_way(self) -> None:
+        self.brick("other")
+        brick = self.brick()
+        (brick / "src/up.py").write_text("from ...other.src import logic\nfrom ....bricks import other\n", encoding="utf-8")
+        hits = [e for e in self.errors() if "src/up.py" in e and "relative import may not escape the brick" in e]
+        self.assertEqual(len(hits), 2)
+
+    def test_dots_within_the_brick_reach_only_the_bricks_own_files(self) -> None:
+        brick = self.brick()
+        (brick / "src/ok.py").write_text("from .. import contract\nfrom ..contract import BrickInput\nfrom . import logic\n", encoding="utf-8")
+        self.assertEqual([e for e in self.errors() if "ok.py" in e], [])
+
+
+class IndirectImportTests(Fixture):
+    """Modules and parts of sys that import by name or redirect where imports resolve are refused in src/."""
+
+    def src(self, text: str, brick: Path | None = None) -> list[str]:
+        brick = brick or self.example()
+        (brick / "src/probe.py").write_text(text, encoding="utf-8")
+        return [e for e in self.errors() if "probe.py" in e]
+
+    def test_the_standard_library_modules_that_import_by_name_are_errors(self) -> None:
+        for name in ("runpy", "pkgutil", "pydoc", "zipimport", "imp", "site"):
+            with self.subTest(module=name):
+                errors = self.src(f"import {name}\n")
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f"src imports '{name}', which imports modules by name or changes where imports resolve", errors[0])
+        self.assertTrue(self.src("from pkgutil import resolve_name\n"))
+        self.assertTrue(self.src("import runpy.x\n"))
+
+    def test_a_brick_own_file_with_one_of_those_names_by_relative_import_is_fine(self) -> None:
+        brick = self.brick()
+        (brick / "src/site.py").write_text("X = 1\n", encoding="utf-8")
+        self.assertEqual(self.src("from .site import X\nfrom . import site\n", brick), [])
+
+    def test_changing_sys_path_in_any_spelling_is_an_error(self) -> None:
+        forms = (
+            "import sys\nsys.path.append('lib')\n",
+            "import sys\nsys.path.insert(0, 'lib')\n",
+            "import sys\nsys.path = []\n",
+            "import sys\nsys.path[:] = []\n",
+            "import sys as s\ns.path.append('lib')\n",
+            "import sys\nalias = sys\nalias.path.append('lib')\n",
+            "import sys\nsys.meta_path.append(None)\n",
+            "import sys\nsys.path_hooks.append(None)\n",
+            "import sys\nsys.path_importer_cache.clear()\n",
+        )
+        for text in forms:
+            with self.subTest(text=text):
+                self.assertTrue([e for e in self.src(text) if "may not use sys." in e], text)
+
+    def test_reaching_sys_modules_through_an_alias_or_a_literal_is_an_error(self) -> None:
+        forms = (
+            "import sys as s\ns.modules\n",
+            "import sys\nm = sys.modules\n",
+            "import sys\ngetattr(sys, 'modules')\n",
+            "import sys\ngetattr(sys, 'path', None)\n",
+            "import sys\nvars(sys)\n",
+            "import sys\nsys.__dict__\n",
+            "from sys import modules\n",
+            "from sys import path as p, version\n",
+        )
+        for text in forms:
+            with self.subTest(text=text):
+                errors = self.src(text)
+                self.assertTrue([e for e in errors if "sys." in e or "vars(sys)" in e], (text, errors))
+
+    def test_ordinary_uses_of_sys_and_of_names_called_path_are_fine(self) -> None:
+        text = (
+            "import sys\n\n\ndef f(inputs, thing):\n"
+            "    return sys.maxsize, sys.version_info, inputs['path'], inputs['modules'], thing.path, getattr(thing, 'path')\n"
+        )
+        self.assertEqual(self.src(text), [])
+        self.assertEqual(self.src("from sys import maxsize, version\n"), [])
+
+    def test_the_old_message_for_sys_modules_is_unchanged_at_its_start(self) -> None:
+        self.assertIn("src may not use sys.modules; it reaches or redirects modules the import rules cannot see", self.src("import sys\nsys.modules\n")[0])
+
+    def test_a_sealed_brick_is_held_to_it_outside_src_too(self) -> None:
+        brick = self.sealed_brick()
+        (brick / "input/loader.py").write_text("import sys as s\ns.path.append('x')\n", encoding="utf-8")
+        self.assertError("loader.py: sealed brick may not use sys.path")
+
+    def test_what_a_parser_cannot_follow_is_pinned_so_the_documented_limits_stay_true(self) -> None:
+        self.assertEqual([e for e in self.src("import sys\nname = 'mod' + 'ules'\ngetattr(sys, name)\n") if "sys." in e], [], "a computed attribute name")
+        self.assertEqual(self.src("import pickle\n"), [], "pickle imports by name when it loads")
+        self.assertEqual(self.src("from unittest import mock\n"), [], "mock.patch imports by string")
+
+    def test_adapters_keep_their_own_rules(self) -> None:
+        brick = self.brick()
+        (brick / "input/adapters/example_source.py").write_text(
+            "import runpy\nimport sys\nsys.path.append('lib')\n" + (brick / "input/adapters/example_source.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        self.assertEqual([e for e in self.errors() if "example_source.py" in e and ("runpy" in e or "sys." in e)], [])
 
 
 class DeterminismTests(Fixture):

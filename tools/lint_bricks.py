@@ -7,6 +7,7 @@ import argparse
 import ast
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -47,6 +48,11 @@ DIRECT_IO = {
 DIRECT_IO_DOTTED = {"logging.handlers", "logging.config"}
 # Ways to reach a banned module without importing it by name.
 ESCAPE_CALLS = {"__import__", "eval", "exec"}
+# Standard-library modules that import by name (runpy, pkgutil, pydoc, zipimport, imp) or change where
+# imports resolve (site): src/ may not use them, for the reason importlib is banned there.
+IMPORT_BY_NAME = {"imp", "pkgutil", "pydoc", "runpy", "site", "zipimport"}
+# What on ``sys`` reaches modules, or redirects where an import looks.
+SYS_REACH = {"__dict__", "meta_path", "modules", "path", "path_hooks", "path_importer_cache"}
 # The standard-library modules a sealed brick may import: no I/O, clock, randomness, threads or process state.
 SEALED_STDLIB = {
     "__future__", "abc", "array", "ast", "base64", "binascii", "bisect", "calendar", "cmath", "codecs",
@@ -67,6 +73,15 @@ CONTEXT_NAMES = {"ctx", "context", "run_context"}
 # An environment variable that switches behavior is a mode the run does not record.
 ENV_SWITCH = re.compile(r"(?i)replay|fresh|record|mode|live|offline")
 IN_MEMORY = {"BytesIO", "StringIO"}
+# The files every brick copies from the template, and the version of each the framework is at. A copy
+# carries ``# BOILERPLATE: <id>@<n>`` in its first lines; a test keeps this table in step with the
+# template's markers, so changing a template file means bumping its marker and this table together.
+BOILERPLATE = {
+    "tape": ("input/tape.py", 1),
+    "runner.run": ("runner/run.py", 5),
+    "runner.rng": ("runner/rng.py", 1),
+}
+BOILERPLATE_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
 PORT_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 SOURCE_FIELDS = {"kind", "epoch", "label", "followable"}
 JOINT_FIELDS = {"kind", "policy", "pin", "follow"}
@@ -107,6 +122,13 @@ class Lint:
         self.root = root
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        self._repo_index: dict[str, Path] | None = None
+
+    def repo_module(self, name: str) -> Path | None:
+        """``repo_module`` for this run's root, reading the repository once per run."""
+        if self._repo_index is None:
+            self._repo_index = repo_modules(self.root)
+        return repo_module(self.root, name, self._repo_index)
 
     def add(self, path: Path, message: str, *, warning: bool = False) -> None:
         try:
@@ -140,23 +162,182 @@ def imported_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     return ["." * node.level + (node.module or "")]
 
 
+def binds_bricks_package(alias: ast.alias, own: str) -> bool:
+    """True when ``import <alias>`` leaves the ``bricks`` package itself bound to a name.
+
+    ``import bricks`` and ``import bricks as b`` do; so does ``import bricks.<own brick>`` without
+    ``as``, which binds ``bricks``. With ``as`` the name is the submodule, and a sibling named in
+    the path is the sibling rule's business, so neither is reported here. Following attribute access
+    on the bound name (``b.assistant``) would need alias and escape analysis that is never complete;
+    the binding has no use inside a brick, so it is the thing to refuse.
+    """
+    if alias.name == "bricks":
+        return True
+    parts = alias.name.split(".")
+    return parts[0] == "bricks" and len(parts) > 1 and alias.asname is None and parts[1] == own
+
+
+def has_own_import_rules(relative: tuple[str, ...]) -> bool:
+    """Files whose imports are checked by their own, narrower rules: smoke tests and ``__main__.py``."""
+    return relative[:2] == ("runner", "tests") or relative == ("__main__.py",)
+
+
+def import_targets(node: ast.Import | ast.ImportFrom) -> list[str]:
+    """The modules an import statement reaches, with ``from bricks import x`` read as ``bricks.x``.
+
+    ``imported_modules`` gives ``bricks`` for that form, which names no sibling; the names it imports
+    are the bricks it reaches.
+    """
+    if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "bricks":
+        return [f"bricks.{alias.name}" for alias in node.names]
+    return imported_modules(node)
+
+
+# Folders that are never repository code to import: the bricks themselves, and the usual homes of other people's.
+REPO_SKIP = {"bricks", "node_modules", "site-packages", "venv", "dist", "build", "__pycache__"}
+
+
+def holds_python(folder: Path) -> bool:
+    """True when the folder, or one below it, holds a ``.py`` file (hidden and vendored folders are not looked into)."""
+    for _, folders, files in os.walk(folder):
+        folders[:] = [name for name in folders if not name.startswith(".") and name not in REPO_SKIP]
+        if any(name.endswith(".py") for name in files):
+            return True
+    return False
+
+
+# Source and compiled Python files, whose module name is the whole stem.
+PYTHON_SUFFIXES = (".py", ".pyw", ".pyc")
+# Extension modules for any Python version or platform: ``fast.so``, ``fast.cpython-312-x86_64-linux-gnu.so``,
+# ``fast.abi3.so``, ``fast.cp311-win_amd64.pyd``. The module name is what comes before the first dot, so
+# this does not depend on which interpreter runs the linter.
+EXTENSION_SUFFIXES = (".so", ".pyd")
+
+
+def module_name_of(path: Path) -> str | None:
+    """The name ``import`` would use for this file or folder, or None when it is not importable Python."""
+    if path.name.startswith(".") or path.name in REPO_SKIP:
+        return None
+    if path.is_file():
+        for suffix in PYTHON_SUFFIXES:
+            if path.name.endswith(suffix):
+                name = path.name[: -len(suffix)]
+                return name if name.isidentifier() else None
+        for suffix in EXTENSION_SUFFIXES:
+            if path.name.endswith(suffix):
+                name = path.name.split(".", 1)[0]
+                return name if name.isidentifier() else None
+        return None
+    if path.is_dir() and path.name.isidentifier() and ((path / "__init__.py").is_file() or holds_python(path)):
+        return path.name
+    return None
+
+
+def repo_modules(root: Path) -> dict[str, Path]:
+    """Every top-level name that ``import`` could find in the repository, outside ``bricks/``, and where.
+
+    Three places are read: the repository root (a ``<name>.py`` file, a compiled ``.pyc``, an extension module
+    ``<name>.so`` or ``<name>.pyd`` of any Python version or platform, or a folder that is a package or
+    holds Python files); and one level inside each root folder that is
+    not itself a package (``lib/util.py``, ``src/mypkg/``), because a project often puts such a
+    folder on the import path. The root wins over a nested place.
+    """
+    found: dict[str, Path] = {}
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        name = module_name_of(entry)
+        if name:
+            found.setdefault(name, entry)
+    for entry in entries:
+        if entry.is_dir() and not entry.name.startswith(".") and entry.name not in REPO_SKIP and not (entry / "__init__.py").is_file():
+            for child in sorted(entry.iterdir()):
+                name = module_name_of(child)
+                if name:
+                    found.setdefault(name, child)
+    return found
+
+
+def repo_module(root: Path, name: str, index: dict[str, Path] | None = None) -> Path | None:
+    """Where in the repository ``import <name>`` would find code outside ``bricks/``, or None.
+
+    ``bricks`` and the standard library are not repository code here. What this cannot see: an
+    installed third-party package (allowed, as before); a module that is on the import path only
+    through ``PYTHONPATH``, a ``.pth`` file, or project configuration, unless it sits where
+    ``repo_modules`` looks; code more than one level below a root folder; and a repository file that
+    shadows a standard-library name. A name that matches code in the repository is flagged even
+    when the project would actually import an installed package of the same name; the message
+    names the path, so the author can judge.
+    """
+    stdlib = stdlib_names()
+    if name == "bricks" or (stdlib is not None and name in stdlib):
+        return None
+    return (repo_modules(root) if index is None else index).get(name)
+
+
 def stdlib_names() -> frozenset[str] | None:
     """The standard library's top-level module names (Python 3.10+), or None where unknown."""
     return getattr(sys, "stdlib_module_names", None)
 
 
+def sys_names(tree: ast.Module) -> set[str]:
+    """The names a file binds to the ``sys`` module: ``sys``, ``import sys as s``, and ``t = s``."""
+    names = {"sys"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names |= {alias.asname for alias in node.names if alias.name == "sys" and alias.asname}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in names:
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in names:
+                        names.add(target.id)
+                        changed = True
+    return names
+
+
 def escape_hatches(path: Path, tree: ast.Module, lint: Lint, label: str) -> None:
-    """Dynamic import, eval/exec and ``sys.modules`` reach banned modules without naming them."""
+    """Dynamic import, eval/exec and the parts of ``sys`` that reach or redirect modules, reaching banned modules without naming them.
+
+    ``sys`` is followed through ``import sys as s`` and ``t = s``, and through ``getattr(sys, "modules")``
+    with a literal name, ``vars(sys)`` and ``from sys import modules``. A computed attribute name, or
+    ``sys`` reached through some other module's attributes, is beyond what a parser can follow.
+    """
+    reach = "it reaches or redirects modules the import rules cannot see"
+    names = sys_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and called_name(node) in ESCAPE_CALLS and isinstance(node.func, ast.Name):
             lint.add(path, f"{label} may not call {called_name(node)}(); it reaches modules the import rules cannot see")
+        if isinstance(node, ast.Attribute) and node.attr in SYS_REACH and isinstance(node.value, ast.Name) and node.value.id in names:
+            lint.add(path, f"{label} may not use sys.{node.attr}; {reach}")
         if (
-            isinstance(node, ast.Attribute)
-            and node.attr == "modules"
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "sys"
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in names
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in SYS_REACH
         ):
-            lint.add(path, f"{label} may not use sys.modules; it reaches modules the import rules cannot see")
+            lint.add(path, f"{label} may not use sys.{node.args[1].value}; {reach}")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "vars"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in names
+        ):
+            lint.add(path, f"{label} may not use vars(sys); {reach}")
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "sys":
+            for alias in node.names:
+                if alias.name in SYS_REACH:
+                    lint.add(path, f"{label} may not import sys.{alias.name}; {reach}")
         if isinstance(node, ast.Name) and node.id == "__builtins__":
             lint.add(path, f"{label} may not use __builtins__; it reaches open() and __import__ unseen")
 
@@ -455,7 +636,16 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                     package_depth = len(relative[:-1])
                     if node.level > package_depth + 1:
                         lint.add(path, "relative import may not escape the brick")
-                for module in imported_modules(node):
+                if isinstance(node, ast.Import) and not has_own_import_rules(relative):
+                    for alias in node.names:
+                        if binds_bricks_package(alias, brick.name):
+                            lint.add(
+                                path,
+                                f"{alias.name!r} binds the bricks package itself, which reaches every sibling by attribute "
+                                "and cannot be followed statically; a brick's own files are imported relatively, and a "
+                                "sibling only through its joint adapter (from bricks.<sibling> import run)",
+                            )
+                for module in import_targets(node):
                     parts = module.lstrip(".").split(".")
                     if role == "runner" and "input" in parts:
                         lint.add(path, "runner may not import input")
@@ -468,6 +658,20 @@ def lint_python(brick: Path, contract: Contract, lint: Lint) -> None:
                             lint.add(path, f"src imports direct-I/O module {parts[0]!r}")
                         elif ".".join(parts[:2]) in DIRECT_IO_DOTTED:
                             lint.add(path, f"src imports direct-I/O module {'.'.join(parts[:2])!r}")
+                        if parts[0] in IMPORT_BY_NAME and not module.startswith("."):
+                            lint.add(
+                                path,
+                                f"src imports {parts[0]!r}, which imports modules by name or changes where imports resolve; "
+                                "it reaches code the import rules cannot see",
+                            )
+                        found = None if module.startswith(".") else lint.repo_module(parts[0])
+                        if found:
+                            where = found.relative_to(lint.root).as_posix() + ("/" if found.is_dir() else "")
+                            lint.add(
+                                path,
+                                f"src imports {parts[0]!r} ({where}), code in this repository outside bricks/; a brick's code "
+                                "lives in the brick, and code shared by several bricks is a sealed brick reached over a joint",
+                            )
                     elif role != "runner" and parts[0] == "importlib":
                         lint.add(path, "dynamic imports hide brick boundaries")
                     if len(parts) > 1 and parts[0] == "bricks" and parts[1] != brick.name:
@@ -826,6 +1030,42 @@ def lint_entry(brick: Path, contract: Contract, lint: Lint) -> None:
                 lint.add(brick / "__main__.py", "__main__ may import only this brick's run")
 
 
+def lint_boilerplate(brick: Path, lint: Lint) -> None:
+    """Warn when one of the brick's framework boilerplate files is not at the framework's version.
+
+    Each file in ``BOILERPLATE`` carries ``# BOILERPLATE: <id>@<n>`` in its first lines. The one
+    thing compared is that ``n`` against the version the framework is at: never another brick's
+    copy, and not the file's content, so an edit at the same ``@n`` is the brick's own business.
+    A file with no marker, with another id, or that does not exist (a sealed brick has no
+    ``tape.py``) is not the framework's to check.
+    """
+    for name, (relative, current) in sorted(BOILERPLATE.items()):
+        path = brick / relative
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:5]
+        except OSError:
+            continue
+        for line in lines:
+            match = BOILERPLATE_MARKER.match(line.strip())
+            if match and match.group(1) == name:
+                version = int(match.group(2))
+                if version < current:
+                    lint.add(
+                        path,
+                        f"boilerplate {name!r} is at @{version}, behind the framework's @{current}; "
+                        f"copy {relative} from bricks/example_brick",
+                        warning=True,
+                    )
+                elif version > current:
+                    lint.add(
+                        path,
+                        f"boilerplate {name!r} is at @{version}, newer than the @{current} this framework knows; "
+                        "update the framework's tools",
+                        warning=True,
+                    )
+                break
+
+
 def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     required = list(REQUIRED)
     if contract.ports:
@@ -841,55 +1081,13 @@ def lint_brick(brick: Path, contract: Contract, lint: Lint) -> None:
     lint_python(brick, contract, lint)
     lint_records(brick, contract, limits, lint)
     lint_smokes(brick, contract, lint)
+    lint_boilerplate(brick, lint)
     lint_adapter_functions(brick, lint)
     lint_deterministic(brick, contract, lint)
     if contract.sealed:
         lint_sealed(brick, contract, lint)
     if (brick / "__main__.py").is_file():
         lint_entry(brick, contract, lint)
-
-
-COPY_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
-
-
-def lint_copies(bricks: list[Path], lint: Lint) -> None:
-    """Warn when copies of one boilerplate file have drifted apart.
-
-    Some files are copied into every brick on purpose (``input/tape.py``,
-    the runner files). A copy carries ``# BOILERPLATE: <id>@<n>`` in its first
-    lines. Copies with the same id and version must be byte-identical; copies
-    with different versions say which brick is behind. A deliberate fork bumps
-    ``@n`` or takes a new id, and the warning then names it instead of hiding it.
-    """
-    copies: dict[str, list[tuple[Path, int, bytes]]] = {}
-    for brick in bricks:
-        for path in sorted(brick.rglob("*.py")):
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
-            for line in data.decode("utf-8", errors="replace").splitlines()[:5]:
-                match = COPY_MARKER.match(line.strip())
-                if match:
-                    copies.setdefault(match.group(1), []).append((path, int(match.group(2)), data))
-                    break
-    for name, found in sorted(copies.items()):
-        first_path, first_version, first_data = found[0]
-        for path, version, data in found[1:]:
-            if version != first_version:
-                lint.add(
-                    path,
-                    f"copy of {name!r} is at @{version} but {first_path.relative_to(lint.root)} is at "
-                    f"@{first_version}; bring the older copy up to date",
-                    warning=True,
-                )
-            elif data != first_data:
-                lint.add(
-                    path,
-                    f"copy of {name!r}@{version} differs from {first_path.relative_to(lint.root)}; "
-                    "sync the copies, or bump @n here to record a deliberate fork",
-                    warning=True,
-                )
 
 
 def tape_source(node: ast.Call) -> str:
@@ -1123,7 +1321,6 @@ def lint_repo(root: Path) -> Lint:
         )
         contracts = {brick.name: lint_contract(brick, lint) for brick in brick_paths}
         lint_graph(brick_paths, contracts, lint)
-        lint_copies(brick_paths, lint)
         for brick in brick_paths:
             lint_brick(brick, contracts[brick.name], lint)
     else:

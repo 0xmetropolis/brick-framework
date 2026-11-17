@@ -9,15 +9,19 @@ judge whether the brick is still a composition and not a domain in disguise.
 
 Criteria 1–10 of the open shape, then:
 
-11. **An entry brick composes; it does not compute.** `runner/run.py` and `__main__.py`
+11. **An entry brick composes; it does not decide.** `runner/run.py` and `__main__.py`
     create the run context, call `src/`, and write the ledger entry. `src/` of an entry
-    brick sequences joint and adapter calls and assembles their results; a rule, a
-    validation, a checklist, a parser or a scoring function in it is a domain decision
-    that belongs in a brick the entry brick calls. A diff that puts a decision, a
-    calculation, a retry policy or a data transformation into the runner or the
-    `__main__` — anything a focused test would want to reach — has moved domain logic
-    to the one place the shape's rules do not follow it. Block. The same in the entry
-    brick's `src/` is advisory: raise it with the brick it should move to.
+    brick sequences joint and adapter calls and assembles their results. A business
+    rule, a validation of what the data may be, a checklist, a scoring or eligibility
+    function, a retry policy: each is a domain decision, and it belongs in a brick the
+    entry brick calls. Plain handling of data to serve the sequencing (reading a field
+    out of an answer, reshaping or parsing one call's result into the next call's
+    input) is not a domain decision and is fine in `src/`; do not raise it. A diff that
+    puts a decision, a calculation, a retry policy or a data transformation into the
+    runner or the `__main__` — anything a focused test would want to reach — has moved
+    domain logic to the one place the shape's rules do not follow it. Block. A domain
+    decision in the entry brick's `src/` is advisory: name the decision, and say which
+    brick it could live in.
 
 12. **Orchestration is real.** An entry brick is where `orchestrated` joints are
     honoured: it sequences the sibling calls and compensates when a later one fails. A

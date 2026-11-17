@@ -19,7 +19,7 @@ This repository uses Python file boilerplate to organize one codebase as discret
 - A brick may be complex inside `src/`, but its inputs and recent runs must make its behavior understandable.
 - Keep this repository as boilerplate. Do not add shared runtimes, generators, dependencies, or heavier enforcement unless the user explicitly requests them.
 - Keep enforcement in `tools/lint_bricks.py` lightweight and standard-library-only. Experience checks there are warnings: they say what to do instead.
-- A file copied into every brick (`input/tape.py`, `runner/run.py`, `runner/rng.py`) is boilerplate, not a shared runtime: it carries `# BOILERPLATE: <id>@<n>` and each brick owns its copy.
+- A file copied into every brick (`input/tape.py`, `runner/run.py`, `runner/rng.py`) is boilerplate, not a shared runtime: each brick owns its copy and nothing compares one brick's copy with another's. Each carries `# BOILERPLATE: <id>@<n>`, and the linter warns when `n` is behind the version the framework is at (`BOILERPLATE` in `tools/lint_bricks.py`; a test keeps it in step with the template). Changing a template file means bumping its marker and that table together.
 
 ## Non-negotiable rules
 
