@@ -176,8 +176,8 @@ class RunnerTests(unittest.TestCase):
         closed = []
 
         def execute(inputs, context):
-            context["closers"].append(lambda failed: closed.append(("a", failed)))
-            context["closers"].append(lambda failed: closed.append(("b", failed)))
+            context["closers"].append(lambda failed, error: closed.append(("a", failed, type(error).__name__)))
+            context["closers"].append(lambda failed, error: closed.append(("b", failed, type(error).__name__)))
             if inputs.get("boom"):
                 raise ValueError("boom")
             return {}
@@ -186,15 +186,42 @@ class RunnerTests(unittest.TestCase):
         self.module.run({})
         with self.assertRaises(ValueError):
             self.module.run({"boom": True})
-        self.assertEqual(closed, [("b", False), ("a", False), ("b", True), ("a", True)])
+        self.assertEqual(
+            closed,
+            [("b", False, "NoneType"), ("a", False, "NoneType"), ("b", True, "ValueError"), ("a", True, "ValueError")],
+        )
+
+    def test_a_closer_gets_the_very_exception_that_ended_the_run(self) -> None:
+        seen = []
+
+        def execute(inputs, context):
+            context["closers"].append(lambda failed, error: seen.append(error))
+            raise ValueError("the one")
+
+        self.module.execute = execute
+        with self.assertRaises(ValueError) as caught:
+            self.module.run({})
+        self.assertIs(seen[0], caught.exception)
+
+    def test_a_closer_gets_no_error_when_the_run_was_interrupted(self) -> None:
+        seen = []
+
+        def execute(inputs, context):
+            context["closers"].append(lambda failed, error: seen.append((failed, error)))
+            raise KeyboardInterrupt
+
+        self.module.execute = execute
+        with self.assertRaises(KeyboardInterrupt):
+            self.module.run({})
+        self.assertEqual(seen, [(True, None)])
 
     def test_a_failing_close_is_reported_and_does_not_stop_the_others(self) -> None:
         closed = []
 
         def execute(inputs, context):
-            context["closers"].append(lambda failed: closed.append("first"))
+            context["closers"].append(lambda failed, error: closed.append("first"))
 
-            def bad(failed):
+            def bad(failed, error):
                 raise OSError("disk full")
 
             context["closers"].append(bad)
@@ -209,7 +236,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_a_failure_hides_nothing_when_a_close_fails_too(self) -> None:
         def execute(inputs, context):
-            def bad(failed):
+            def bad(failed, error):
                 raise OSError("disk full")
 
             context["closers"].append(bad)

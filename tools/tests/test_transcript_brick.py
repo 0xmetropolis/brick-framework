@@ -237,6 +237,29 @@ class OptOutTests(Project):
         self.assertFalse((self.root / "bricks/assistant/input/tapes/xai").exists())
 
 
+class FailedSessionTests(Project):
+    def test_a_failed_take_replays_as_hops_up_to_the_recorded_error(self) -> None:
+        (self.root / "bricks/assistant/input/adapters/xai.py").write_text(
+            "from ..tape import session\n\n\ndef complete(ctx, user, steps):\n"
+            "    talk = session(ctx, 'xai', 'chat')\n    talk.take('w0', {'user': user})\n"
+            "    first = talk.call('ask', {'steps': steps}, lambda: {'text': 'hi'})\n"
+            "    def down():\n        raise OSError('gone')\n"
+            "    talk.call('more', {}, down)\n    talk.close()\n    return first['text']\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(self.root / "bricks/assistant/input/tapes/xai")
+        failed = run_tool(self.root, "--record", "assistant.xai")
+        self.assertEqual(failed.returncode, 1)
+        replay = run_tool(self.root)
+        self.assertEqual(replay.returncode, 1)
+        self.assertIn("recorded adapter error: {'type': 'OSError'}", replay.stderr)
+        _, document = self.report()
+        sources = [h for h in document["hops"] if h["to"] == "assistant.xai"]
+        self.assertEqual([h["value"] for h in sources], [{"text": "hi"}, {"error": {"type": "RuntimeError", "message": "recorded adapter error: {'type': 'OSError'}"}}])
+        self.assertTrue(sources[1]["how"].endswith(", more, raised"))
+        self.assertEqual(document["hops"][-1]["kind"], "error")
+
+
 class ValueTests(Project):
     def test_values_are_shown_in_full_never_truncated(self) -> None:
         long = "x" * 700

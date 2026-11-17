@@ -1,4 +1,4 @@
-# BOILERPLATE: runner.run@6
+# BOILERPLATE: runner.run@7
 """The brick's repository-internal entry point.
 
 A working runner, copied with the brick like ``input/tape.py``: it creates
@@ -94,16 +94,18 @@ def run(inputs: BrickInput, *, fresh: Any = False, record: Any = False) -> Brick
     }
     context: dict[str, Any] = {"run_id": run_id, "plan": plan, "config": config, "closers": []}
     failed = True
+    error: Exception | None = None
     try:
         output = execute(inputs, context)
         failed = False
     except Exception as exc:
+        error = exc
         entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
         _note_unrecorded(entry, context)
         _write_entry(entry, config)
         raise
     finally:
-        problems = _close(context, failed)
+        problems = _close(context, failed, error)
     if problems:
         entry["error"] = {"type": type(problems[0]).__name__, "message": str(problems[0])}
         _note_unrecorded(entry, context)
@@ -159,12 +161,15 @@ def make_plan(fresh: Any, record: Any) -> dict[str, tuple[str, ...]]:
     return {"fresh": tuple(sorted(went_fresh)), "record": tuple(sorted(recorded))}
 
 
-def _close(context: dict[str, Any], failed: bool) -> list[Exception]:
-    """Close what the run left open, newest first. A failing close never hides another."""
+def _close(context: dict[str, Any], failed: bool, error: Exception | None) -> list[Exception]:
+    """Close what the run left open, newest first, telling each closer whether the run failed and with what.
+
+    A failing close never hides another, nor the run's own error.
+    """
     problems: list[Exception] = []
     for closer in reversed(context.get("closers", [])):
         try:
-            closer(failed)
+            closer(failed, error)
         except Exception as exc:  # noqa: BLE001
             problems.append(exc)
     return problems

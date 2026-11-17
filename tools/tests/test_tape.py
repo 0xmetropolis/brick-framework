@@ -428,6 +428,198 @@ class SessionRecordOptOutTests(TapeCase):
             self.assertIn("record must be True or False", str(caught.exception))
 
 
+class FailedSessionTests(TapeCase):
+    """A session whose fetch raised, and whose exception ended the run, is written as a failed take."""
+
+    class Source(Exception):
+        """What a live source raises."""
+
+    def run_session(self, fetches: list, *, name: str = "year", plan=None, wrap=None, after=None) -> list:
+        """Run one window the way a brick would, then let the runner's closers see the run end."""
+        context = ctx(record=("game",)) if plan is None else plan
+        outcome: Exception | None = None
+        try:
+            script = tape.session(context, "game", name)
+            script.take("w0", {"after": "d0"})
+            for index, fetch in enumerate(fetches):
+                script.call("op", {"i": index}, fetch)
+            if after:
+                raise after
+        except Exception as exc:  # noqa: BLE001
+            outcome = wrap(exc) if wrap else exc
+        for closer in reversed(context["closers"]):
+            closer(outcome is not None, outcome)
+        return [path.stem for path in sorted(tape.TAPE_DIR.glob("game/*.json"))]
+
+    def boom(self):
+        raise self.Source("the source went away")
+
+    def transcript(self, take: str = "year-w0") -> list:
+        return json.loads((tape.TAPE_DIR / f"game/{take}.json").read_text(encoding="utf-8"))["response"]["transcript"]
+
+    def test_the_fetch_that_raised_ends_the_take_with_its_error(self) -> None:
+        self.assertEqual(self.run_session([lambda: {"n": 1}, lambda: {"n": 2}, self.boom]), ["year-w0"])
+        self.assertEqual(
+            self.transcript(),
+            [
+                {"op": "op", "request": {"i": 0}, "response": {"n": 1}},
+                {"op": "op", "request": {"i": 1}, "response": {"n": 2}},
+                {"op": "op", "request": {"i": 2}, "error": {"type": "Source"}},
+            ],
+        )
+
+    def test_replay_plays_the_recorded_operations_then_raises_the_recorded_error(self) -> None:
+        self.run_session([lambda: {"n": 1}, self.boom])
+        script = tape.session(ctx(), "game", "year")
+        script.take("w0", {"after": "d0"})
+        self.assertEqual(script.call("op", {"i": 0}, lambda: 1 / 0), {"n": 1})
+        with self.assertRaises(RuntimeError) as caught:
+            script.call("op", {"i": 1}, lambda: 1 / 0)
+        self.assertEqual(str(caught.exception), "recorded adapter error: {'type': 'Source'}")
+
+    def test_the_failed_take_is_a_valid_take_and_goes_stale_like_any_other(self) -> None:
+        self.run_session([self.boom])
+        record = json.loads((tape.TAPE_DIR / "game/year-w0.json").read_text(encoding="utf-8"))
+        self.assertEqual((record["schema_version"], record["epoch"], record["source"], "response" in record), (2, 3, "game", True))
+        self.assertEqual(record["request"]["label"], LABEL)
+        with mock.patch.object(tape, "PORTS", {**PORTS, "game": {**PORTS["game"], "epoch": 4}}):
+            script = tape.session(ctx(), "game", "year")
+            with self.assertRaises(tape.TapeError) as caught:
+                script.take("w0", {"after": "d0"})
+        self.assertIn("take recorded at epoch 3, port 'game' is at epoch 4", str(caught.exception))
+
+    def test_an_exception_the_brick_wrapped_still_counts_when_the_fetch_failure_is_its_cause(self) -> None:
+        class Wrapped(Exception):
+            pass
+
+        def wrap(exc):
+            try:
+                raise Wrapped("brick says no") from exc
+            except Wrapped as wrapped:
+                return wrapped
+
+        self.assertEqual(self.run_session([self.boom], wrap=wrap), ["year-w0"])
+
+    def test_an_exception_raised_while_handling_the_fetch_failure_counts_through_its_context(self) -> None:
+        def wrap(exc):
+            try:
+                try:
+                    raise exc
+                except Exception:
+                    raise KeyError("while handling")
+            except KeyError as inner:
+                return inner
+
+        self.assertEqual(self.run_session([self.boom], wrap=wrap), ["year-w0"])
+
+    def test_nothing_is_written_for_a_failure_that_is_not_the_fetch(self) -> None:
+        self.assertEqual(self.run_session([lambda: {"n": 1}], after=ValueError("a bug in the brick after the fetch")), [])
+
+    def test_nothing_is_written_when_the_brick_caught_the_fetch_failure_and_then_failed_otherwise(self) -> None:
+        context = ctx(record=("game",))
+        script = tape.session(context, "game", "year")
+        script.take("w0", {"after": "d0"})
+        with self.assertRaises(self.Source):
+            script.call("op", {"i": 0}, self.boom)
+        script.call("op", {"i": 1}, lambda: {"n": 1})
+        for closer in context["closers"]:
+            closer(True, ValueError("something else"))
+        self.assertEqual(list(tape.TAPE_DIR.glob("game/*.json")), [])
+
+    def test_a_brick_that_catches_the_failure_and_finishes_writes_an_ordinary_take_without_the_failed_op(self) -> None:
+        context = ctx(record=("game",))
+        script = tape.session(context, "game", "year")
+        script.take("w0", {"after": "d0"})
+        try:
+            script.call("op", {"i": 0}, self.boom)
+        except self.Source:
+            pass
+        script.call("op", {"i": 1}, lambda: {"n": 1})
+        for closer in context["closers"]:
+            closer(False, None)
+        self.assertEqual(self.transcript(), [{"op": "op", "request": {"i": 1}, "response": {"n": 1}}])
+
+    def test_nothing_is_written_when_the_run_was_interrupted_or_only_failed_without_an_error(self) -> None:
+        context = ctx(record=("game",))
+        script = tape.session(context, "game", "year")
+        script.take("w0", {"after": "d0"})
+        with self.assertRaises(self.Source):
+            script.call("op", {"i": 0}, self.boom)
+        for closer in context["closers"]:
+            closer(True, None)
+        self.assertEqual(list(tape.TAPE_DIR.glob("game/*.json")), [])
+
+    def test_fresh_and_replay_and_an_opted_out_session_never_write_a_failed_take(self) -> None:
+        self.assertEqual(self.run_session([self.boom], plan=ctx(fresh=("game",))), [])
+        context = ctx(record=("game",))
+        out: Exception | None = None
+        try:
+            script = tape.session(context, "game", "side", record=False)
+            script.take("w0", {})
+            script.call("op", {}, self.boom)
+        except self.Source as exc:
+            out = exc
+        for closer in context["closers"]:
+            closer(True, out)
+        self.assertEqual(list(tape.TAPE_DIR.glob("game/*.json")), [])
+
+    def test_it_never_replaces_an_existing_complete_take(self) -> None:
+        self.run_session([lambda: {"n": "good"}])
+        path = tape.TAPE_DIR / "game/year-w0.json"
+        before = path.read_bytes()
+        # The same request, so the take is current; this time the source fails at the first operation.
+        self.run_session([self.boom])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_it_does_replace_an_earlier_failed_take_and_a_missing_or_unreadable_one(self) -> None:
+        self.run_session([lambda: {"n": 1}, self.boom])
+        self.assertEqual(len(self.transcript()), 2)
+        self.run_session([self.boom])
+        self.assertEqual(len(self.transcript()), 1)
+        (tape.TAPE_DIR / "game/year-w0.json").write_text("not json", encoding="utf-8")
+        self.run_session([lambda: {"n": 1}, self.boom])
+        self.assertEqual(len(self.transcript()), 2)
+
+    def test_earlier_windows_of_the_session_are_already_complete_takes(self) -> None:
+        context = ctx(record=("game",))
+        script = tape.session(context, "game", "year")
+        script.take("w0", {})
+        script.call("op", {}, lambda: {"n": 1})
+        script.take("w1", {})
+        out = None
+        try:
+            script.call("op", {}, self.boom)
+        except self.Source as exc:
+            out = exc
+        for closer in context["closers"]:
+            closer(True, out)
+        self.assertEqual(sorted(p.stem for p in tape.TAPE_DIR.glob("game/*.json")), ["year-w0", "year-w1"])
+        self.assertNotIn("error", json.dumps(self.transcript("year-w0")))
+        self.assertEqual(self.transcript("year-w1"), [{"op": "op", "request": {}, "error": {"type": "Source"}}])
+
+    def test_a_failed_take_too_big_to_write_raises_from_the_closer_and_the_runner_keeps_the_run_error(self) -> None:
+        context = ctx(record=("game",), max_bytes=200)
+        script = tape.session(context, "game", "year")
+        script.take("w0", {})
+        script.call("op", {}, lambda: {"pad": "x" * 10})
+        out = None
+        try:
+            script.call("op", {}, self.boom)
+        except self.Source as exc:
+            out = exc
+        with self.assertRaises(tape.TapeError):
+            for closer in context["closers"]:
+                closer(True, out)
+
+    def test_the_old_one_argument_closer_call_still_means_a_clean_close_or_a_drop(self) -> None:
+        context = ctx(record=("game",))
+        script = tape.session(context, "game", "year")
+        script.take("w0", {})
+        script.call("op", {}, lambda: {"n": 1})
+        context["closers"][0](False)
+        self.assertEqual(len(self.transcript()), 1)
+
+
 class VerifyTests(TapeCase):
     def test_replay_connects_to_nothing_so_nothing_is_checked(self) -> None:
         tape.verify(ctx(), "game", {"game": "9.9"})

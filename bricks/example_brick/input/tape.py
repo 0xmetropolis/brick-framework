@@ -1,4 +1,4 @@
-# BOILERPLATE: tape@2
+# BOILERPLATE: tape@3
 """Takes and the replay / fresh / record contract for this brick's source ports.
 
 Copy this file with the brick boilerplate. It has no dependency outside the
@@ -294,8 +294,10 @@ def once(
 def session(run_context: dict[str, Any], source: str, name: str, *, record: bool = True) -> "Session":
     """A chatty source as takes: one take per window, operations replayed in order.
 
-    The runner closes any session still open when the run ends, so a failed run
-    leaves no half-written window behind.
+    The runner closes any session still open when the run ends. A window the run's failure cut
+    short is dropped, with one exception: when the failure is an exception that a ``fetch`` of
+    this session raised, the window is written as a failed take (see ``Session``), so the failure
+    can be replayed. Nothing else leaves a half-written window behind.
 
     Whether a session records is the run's decision, made per port: it records when the plan
     records its source. ``record=False`` can only turn that off for this one session, which then
@@ -322,6 +324,16 @@ class Session:
     ``record=False`` keeps this session at fresh when the run records its port (see ``session``).
     A session that opts out writes no take, so an existing take of that name, its epoch and its
     label are left exactly as they were, and the run's ledger entry lists it under ``unrecorded``.
+
+    A failed session. When recording, if a ``fetch`` raises inside ``call`` and that exception is
+    what ends the run (it, or an exception it caused or was raised during, reaches the runner), the
+    open window is written as a failed take: the operations that succeeded, then the failing one
+    last, carrying ``{"error": {"type": ...}}`` instead of a response. Replay plays the recorded
+    operations in order and then raises ``RuntimeError("recorded adapter error: ...")`` at that
+    one, as ``once`` does for a recorded error; it goes stale like any take. Nothing is written for
+    any other failure (a bug in the brick after the fetch returned, an interrupt), for a fetch
+    whose failure the brick caught and went on from, or in fresh or replay; and a failed take never
+    replaces an existing complete one.
     """
 
     def __init__(self, run_context: dict[str, Any], source: str, name: str, *, record: bool = True) -> None:
@@ -342,6 +354,7 @@ class Session:
         self.request: dict[str, Any] = {}
         self.entries: list[dict[str, Any]] = []
         self.cursor = 0
+        self._raised: tuple[Exception, dict[str, Any]] | None = None
         run_context.setdefault("closers", []).append(self._finish)
 
     def verify(self, seen: dict[str, Any]) -> None:
@@ -355,6 +368,7 @@ class Session:
         self.request = _normalize({"window": window, **request})
         _with_label(self.source, self.request)
         self.entries, self.cursor = [], 0
+        self._raised = None
         if self.mode == "replay":
             record = load(self.source, f"{self.name}-{window}", self.request)
             if "error" in record:
@@ -386,8 +400,17 @@ class Session:
                     f"recorded window {where} mismatch at operation {self.cursor} ({kind}): {'; '.join(differences)}; "
                     "re-record the window"
                 )
+            if "error" in entry:
+                raise RuntimeError(f"recorded adapter error: {entry['error']}")
             return entry["response"]
-        response = _normalize(fetch())
+        try:
+            value = fetch()
+        except Exception as exc:
+            if self.mode == "record":
+                self._raised = (exc, {"op": kind, "request": request, "error": {"type": type(exc).__name__}})
+            raise
+        response = _normalize(value)
+        self._raised = None
         if self.mode == "record":
             self.entries.append({"op": kind, "request": request, "response": response})
         return response
@@ -401,12 +424,54 @@ class Session:
             )
         self.window = ""
 
-    def _finish(self, failed: bool) -> None:
-        """Called by the runner when the run ends: write a finished window, drop one a failure cut short."""
+    def _finish(self, failed: bool, error: BaseException | None = None) -> None:
+        """Called by the runner when the run ends: write a finished window, drop one a failure cut short.
+
+        ``error`` is the exception that ended a failed run. If it was raised by this session's own
+        ``fetch`` the window is kept as a failed take instead of dropped.
+        """
         if failed:
+            if self.window and self.mode == "record" and self._raised and _caused_by(error, self._raised[0]):
+                self._write_failed()
             self.window = ""
         else:
             self.close()
+
+    def _write_failed(self) -> None:
+        """Write the open window with the failing operation last, unless a complete take is already there."""
+        take = f"{self.name}-{self.window}"
+        if _is_complete(self.source, take):
+            return
+        write(
+            self.source, take, self.context["run_id"], self.request,
+            response={"transcript": [*self.entries, self._raised[1]]}, max_bytes=_max_bytes(self.context),
+        )
+
+
+def _caused_by(error: BaseException | None, raised: BaseException) -> bool:
+    """True when ``raised`` is ``error`` or is anywhere in its chain of causes and contexts."""
+    seen: set[int] = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if current is raised:
+            return True
+        seen.add(id(current))
+        pending += [current.__cause__, current.__context__]
+    return False
+
+
+def _is_complete(source: str, take: str) -> bool:
+    """True when a take of this name exists and is not a failed one (a response with no error in its transcript)."""
+    path = _take_path(source, take)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        transcript = record["response"]["transcript"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return isinstance(transcript, list) and not any(isinstance(entry, dict) and "error" in entry for entry in transcript)
 
 
 def _take_path(source: str, take: str) -> Path:

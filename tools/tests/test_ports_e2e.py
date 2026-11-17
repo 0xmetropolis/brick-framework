@@ -38,6 +38,8 @@ class FakeSource:
         return {"version": self.version}
 
     def advance(self, days):
+        if os.environ.get("FAKE_SOURCE_FAILS"):
+            raise RuntimeError("the source went away")
         self.day += days
         return {"day": self.day}
 
@@ -230,6 +232,39 @@ class PortsEndToEnd(unittest.TestCase):
         self.assertEqual((entry["record"], entry["unrecorded"]), (["source"], ["source.side"]))
         lint = lint_bricks.lint_repo(self.root)
         self.assertEqual((lint.errors, lint.warnings), ([], []))
+
+    def test_a_source_that_fails_mid_session_leaves_a_failed_take_that_replays_the_failure(self) -> None:
+        result = self.go({"record": ["game.source"]}, FAKE_SOURCE_FAILS="1")
+        self.assertEqual((result["error"], result["message"]), ("RuntimeError", "the source went away"))
+        record = json.loads(self.take().read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["response"]["transcript"],
+            [{"op": "advance", "request": {"days": 2}, "error": {"type": "RuntimeError"}}],
+        )
+        (entry,) = self.records("game")
+        self.assertEqual((entry["error"]["type"], entry["record"]), ("RuntimeError", ["source"]))
+        lint = lint_bricks.lint_repo(self.root)
+        self.assertEqual((lint.errors, lint.warnings), ([], []))
+        replay = self.go({})
+        self.assertEqual((replay["error"], replay["message"]), ("RuntimeError", "recorded adapter error: {'type': 'RuntimeError'}"))
+
+    def test_a_failing_record_does_not_replace_a_complete_take(self) -> None:
+        self.go({"record": ["game.source"]})
+        before = self.take().read_bytes()
+        result = self.go({"record": ["game.source"]}, FAKE_SOURCE_FAILS="1")
+        self.assertEqual(result["error"], "RuntimeError")
+        self.assertEqual(self.take().read_bytes(), before)
+        self.assertEqual(self.go({})["ok"]["day"], 2)
+
+    def test_a_failure_that_is_not_the_source_leaves_no_take(self) -> None:
+        adapter = self.root / "bricks/game/input/adapters/source.py"
+        adapter.write_text(
+            adapter.read_text(encoding="utf-8").replace("    script.close()", "    raise KeyError('a bug after the fetch')"),
+            encoding="utf-8",
+        )
+        result = self.go({"record": ["game.source"]})
+        self.assertEqual(result["error"], "KeyError")
+        self.assertFalse(self.take().exists())
 
     def test_a_pin_that_falls_behind_the_interface_version_is_a_lint_error(self) -> None:
         game = self.root / "bricks/game/contract.py"

@@ -77,8 +77,8 @@ IN_MEMORY = {"BytesIO", "StringIO"}
 # carries ``# BOILERPLATE: <id>@<n>`` in its first lines; a test keeps this table in step with the
 # template's markers, so changing a template file means bumping its marker and this table together.
 BOILERPLATE = {
-    "tape": ("input/tape.py", 2),
-    "runner.run": ("runner/run.py", 6),
+    "tape": ("input/tape.py", 3),
+    "runner.run": ("runner/run.py", 7),
     "runner.rng": ("runner/rng.py", 1),
 }
 BOILERPLATE_MARKER = re.compile(r"^#\s*BOILERPLATE:\s*([a-z0-9_.-]+)@(\d+)\s*$")
@@ -766,6 +766,27 @@ def label_differences(recorded: Any, wanted: Any) -> list[str]:
     ]
 
 
+def lint_transcript(path: Path, response: Any, lint: Lint) -> None:
+    """A session take's response is ``{"transcript": [...]}``: each operation has an ``op``, a ``request`` and
+    exactly one of ``response`` or ``error``. ``error`` (``{"type": ...}``) is the operation a failed
+    session ended at, so only the last operation may carry one."""
+    transcript = response.get("transcript") if isinstance(response, dict) else None
+    if not isinstance(transcript, list):
+        return
+    for index, entry in enumerate(transcript, start=1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("op"), str) or "request" not in entry or ("response" in entry) == ("error" in entry):
+            lint.add(path, f"transcript operation {index} needs an op, a request and exactly one of response or error")
+        elif "error" in entry:
+            if index != len(transcript):
+                lint.add(
+                    path,
+                    f"transcript operation {index} carries an error but is not the last: a failed session ends at "
+                    "the operation that failed, and nothing runs after it",
+                )
+            elif not isinstance(entry["error"], dict) or not isinstance(entry["error"].get("type"), str):
+                lint.add(path, f"transcript operation {index} has an error without a type")
+
+
 def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: Lint) -> None:
     for old, advice in (
         ("input/data", "the old takes folder: takes now live in input/tapes/<source>/<take>.json (schema 2)"),
@@ -819,6 +840,7 @@ def lint_records(brick: Path, contract: Contract, limits: dict[str, int], lint: 
         if path.read_bytes() != canonical:
             lint.add(path, "take JSON is not canonical")
         check_secrets(path, record, lint)
+        lint_transcript(path, record.get("response"), lint)
         if port is not None and isinstance(port.get("epoch"), int) and record.get("epoch") != port["epoch"]:
             lint.add(
                 path,
